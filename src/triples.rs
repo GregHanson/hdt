@@ -58,6 +58,20 @@ impl TryFrom<u32> for Order {
     }
 }
 
+impl Order {
+    pub fn to_int(&self) -> u8 {
+        return match self {
+            Order::Unknown => 0,
+            Order::SPO => 1,
+            Order::SOP => 2,
+            Order::PSO => 3,
+            Order::POS => 4,
+            Order::OSP => 5,
+            Order::OPS => 6,
+        };
+    }
+}
+
 /// Inverse index from object id to positions in the object adjacency list.
 /// Used for logarithmic (?) time access instead of linear time sequential search.
 pub struct OpIndex {
@@ -236,7 +250,7 @@ impl TriplesBitmap {
     }
     pub fn load_cache<R: BufRead>(reader: &mut R, info: ControlInfo) -> Result<Self> {
         match &info.format[..] {
-            "<http://purl.org/HDT/hdt#triplesBitmap>" => TriplesBitmap::load(reader),
+            "<http://purl.org/HDT/hdt#triplesBitmap>" => Ok(TriplesBitmap::read_bytes(reader).unwrap()),
             "<http://purl.org/HDT/hdt#triplesList>" => Err(eyre!("Triples Lists are not supported yet.")),
             _ => Err(eyre!("Unknown triples listing format.")),
         }
@@ -245,6 +259,180 @@ impl TriplesBitmap {
     pub fn load<R: BufRead>(reader: &mut R) -> Result<Self> {
         let triples: TriplesBitmap = bincode::deserialize_from(reader).expect("msg");
         Ok(triples)
+    }
+
+    pub fn write_bytes<R: std::io::Write>(&self, mut writer: R) -> Result<()> {
+        // ORDER
+        let order_tag: u8 = match self.order {
+            Order::Unknown => 0,
+            Order::SPO => 1,
+            Order::SOP => 2,
+            Order::PSO => 3,
+            Order::POS => 4,
+            Order::OSP => 5,
+            Order::OPS => 6,
+        };
+        writer.write_all(&[order_tag])?;
+        // println!("order: {:?}", self.order);
+
+        // BITMAP_Y
+        let v = self.bitmap_y.size_in_bytes() as u32;
+        writer.write_all(&v.to_le_bytes())?;
+        self.bitmap_y.dict.serialize_into(&mut writer).map_err(|err| eyre!(Box::new(err)))?;
+        // println!("bitmap_y: {:?}", self.bitmap_y);
+
+        // ADJLIST_Z
+        // sequence.bits_per_entry
+        // writer.write_all(&self.adjlist_z.sequence.bits_per_entry.size_in_bytes().to_le_bytes())?;
+        writer.write_all(&self.adjlist_z.sequence.bits_per_entry.to_le_bytes())?;
+        // sequence.entries
+        // writer.write_all(&self.adjlist_z.sequence.entries.size_in_bytes().to_le_bytes())?;
+        writer.write_all(&self.adjlist_z.sequence.entries.to_le_bytes())?;
+        // sequence.data
+        let data_len = self.adjlist_z.sequence.data.len() as u32;
+        writer.write_all(&data_len.to_le_bytes())?;
+        for &d in &self.adjlist_z.sequence.data {
+            writer.write_all(&d.to_le_bytes())?;
+        }
+        // bitmap
+        {
+            let b_size = self.adjlist_z.bitmap.size_in_bytes() as u32;
+            writer.write_all(&b_size.to_le_bytes())?;
+            self.adjlist_z.bitmap.dict.serialize_into(&mut writer).map_err(|err| eyre!(Box::new(err)))?;
+        };
+        // println!("adj.sequence: {:?}", self.adjlist_z.sequence);
+        // println!("adj.bitmap: {:?}", self.adjlist_z.bitmap);
+
+        // OP_INDEX
+        // sequence
+        let op_size = self.op_index.sequence.size_in_bytes() as u32;
+        writer.write_all(&op_size.to_le_bytes())?;
+        self.op_index.sequence.serialize_into(&mut writer).map_err(|err| eyre!(Box::new(err)))?;
+        // bitmap
+        let b_size = self.op_index.bitmap.size_in_bytes() as u32;
+        writer.write_all(&b_size.to_le_bytes())?;
+        self.op_index.bitmap.dict.serialize_into(&mut writer).map_err(|err| eyre!(Box::new(err)))?;
+        // println!("op_index.sequence: {:?}", self.op_index.sequence.len());
+        // println!("op_index.bitmap: {:?}", self.op_index.bitmap);
+
+        // WAVELET_Y
+        let w_size = self.wavelet_y.size_in_bytes() as u32;
+        writer.write_all(&w_size.to_le_bytes())?;
+        self.wavelet_y.serialize_into(&mut writer).map_err(|err| eyre!(Box::new(err)))?;
+        // println!("wavelet size: {}", w_size as u32);
+
+        return Ok(());
+    }
+
+    pub fn read_bytes<R: std::io::BufRead>(mut reader: R) -> Result<Self> {
+        // ORDER
+        let o = {
+            let mut order_tag = [0u8; 1];
+            reader.read_exact(&mut order_tag)?;
+            match order_tag[0] {
+                0 => Order::Unknown,
+                1 => Order::SPO,
+                2 => Order::SOP,
+                3 => Order::PSO,
+                4 => Order::POS,
+                5 => Order::OSP,
+                6 => Order::OPS,
+                _ => Order::Unknown,
+            }
+        };
+        // println!("Order {:?}", o);
+
+        // BITMAP_Y
+        let bitmap_y = {
+            let mut bitmap_y_len_bytes = [0u8; 4];
+            reader.read_exact(&mut bitmap_y_len_bytes)?;
+            let bitmap_y_len = u32::from_le_bytes(bitmap_y_len_bytes) as usize;
+            let mut bitmap_y_bytes = vec![0u8; bitmap_y_len];
+            reader.read_exact(&mut bitmap_y_bytes)?;
+            let mut bitmap_reader = BufReader::new(&bitmap_y_bytes[..]);
+            let rank9sel = Rank9Sel::deserialize_from(&mut bitmap_reader).map_err(|err| eyre!(Box::new(err)))?;
+            Bitmap { dict: rank9sel }
+        };
+        // println!("bitmap_y: {:?}", bitmap_y);
+
+        // ADJLIST_Z
+        let adj = {
+            // bits_per_entry
+            let mut bit_per_entry_bytes = [0u8; std::mem::size_of::<usize>()];
+            reader.read_exact(&mut bit_per_entry_bytes)?;
+            let bits_per_entry = usize::from_le_bytes(bit_per_entry_bytes);
+            //println!("bits_per_entry: {}", bits_per_entry);
+            // entries
+            let mut entries_bytes = [0u8; std::mem::size_of::<usize>()];
+            reader.read_exact(&mut entries_bytes)?;
+            let entries = usize::from_le_bytes(entries_bytes);
+            //println!("entries: {}", entries);
+            // data
+            let mut data_len_bytes = [0u8; 4];
+            reader.read_exact(&mut data_len_bytes)?;
+            let data_len = u32::from_le_bytes(data_len_bytes) as usize;
+            let mut data = Vec::with_capacity(data_len);
+            for _ in 0..data_len {
+                let mut num_bytes = [0u8; std::mem::size_of::<usize>()];
+                reader.read_exact(&mut num_bytes)?;
+                data.push(usize::from_le_bytes(num_bytes));
+            }
+            //println!("loaded data");
+            // bitmap
+            let mut bitmap_len_bytes = [0u8; 4];
+            reader.read_exact(&mut bitmap_len_bytes)?;
+            let bitmap_len = u32::from_le_bytes(bitmap_len_bytes) as usize;
+            let mut bitmap_bytes = vec![0u8; bitmap_len];
+            reader.read_exact(&mut bitmap_bytes)?;
+            //println!("bitmap_len: {}", bitmap_len as u32);
+            let mut bitmap_reader = BufReader::new(&bitmap_bytes[..]);
+            let rank9sel = Rank9Sel::deserialize_from(&mut bitmap_reader).map_err(|err| eyre!(Box::new(err)))?;
+            let bitmap = Bitmap { dict: rank9sel };
+            AdjList { sequence: Sequence { entries, bits_per_entry, data, crc_handle: None }, bitmap }
+        };
+        // println!("adj.sequence: {:?}", adj.sequence);
+        // println!("adj.bitmap: {:?}", adj.bitmap);
+
+        // OP_INDEX
+        let op_index = {
+            // sequence
+            let mut seq_len_bytes = [0u8; 4];
+            reader.read_exact(&mut seq_len_bytes)?;
+            let seq_len = u32::from_le_bytes(seq_len_bytes) as usize;
+            let mut seq_bytes = vec![0u8; seq_len];
+            reader.read_exact(&mut seq_bytes)?;
+            let mut seq_reader = BufReader::new(&seq_bytes[..]);
+            let compact_vector =
+                CompactVector::deserialize_from(&mut seq_reader).map_err(|err| eyre!(Box::new(err)))?;
+            // println!("loaded sequence");
+            // bitmap
+
+            let mut bitmap_y_len_bytes = [0u8; 4];
+            reader.read_exact(&mut bitmap_y_len_bytes)?;
+            let bitmap_y_len = u32::from_le_bytes(bitmap_y_len_bytes) as usize;
+            let mut bitmap_y_bytes = vec![0u8; bitmap_y_len];
+            reader.read_exact(&mut bitmap_y_bytes)?;
+            let mut bitmap_reader = BufReader::new(&bitmap_y_bytes[..]);
+            let rank9sel = Rank9Sel::deserialize_from(&mut bitmap_reader).map_err(|err| eyre!(Box::new(err)))?;
+            let op_bitmap = Bitmap { dict: rank9sel };
+            //let op_bitmap = Bitmap { dict: rank9sel };
+            OpIndex { sequence: compact_vector, bitmap: op_bitmap }
+        };
+        // println!("op_index.sequence: {:?}", op_index.sequence.len());
+        // println!("op_index.bitmap: {:?}", op_index.bitmap);
+
+        // WAVELET_Y
+        let wavelet = {
+            let mut wavelet_len_bytes = [0u8; 4];
+            reader.read_exact(&mut wavelet_len_bytes)?;
+            let wavelet_len = u32::from_le_bytes(wavelet_len_bytes) as usize;
+            let mut wavelet_bytes = vec![0u8; wavelet_len];
+            reader.read_exact(&mut wavelet_bytes)?;
+            let mut wavelet_reader = BufReader::new(&wavelet_bytes[..]);
+            WaveletMatrix::<Rank9Sel>::deserialize_from(&mut wavelet_reader).map_err(|err| eyre!(Box::new(err)))?
+        };
+        // println!("loaded wavelet_y");
+        return Ok(TriplesBitmap { order: o, bitmap_y, adjlist_z: adj, op_index, wavelet_y: wavelet });
     }
 
     /// Size in bytes on the heap.

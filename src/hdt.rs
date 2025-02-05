@@ -60,6 +60,7 @@ impl Hdt {
     }
 
     pub fn new_from_file(f: &Path) -> Result<Self, Box<dyn Error>> {
+        let start_load = std::time::Instant::now();
         let source = std::fs::File::open(f)?;
         let mut reader = std::io::BufReader::new(source);
         ControlInfo::read(&mut reader).wrap_err("Failed to read HDT control info")?;
@@ -67,7 +68,7 @@ impl Hdt {
         let unvalidated_dict = FourSectDict::read(&mut reader).wrap_err("Failed to read HDT dictionary")?;
         let abs_path = fs::canonicalize(f)?;
         let index_file = format!(
-            "{}/{}.index.v1-rust-cache",
+            "{}/{}.index.v2-rust-cache",
             abs_path.parent().unwrap().display(),
             f.file_name().unwrap().to_str().unwrap().to_string()
         );
@@ -77,15 +78,21 @@ impl Hdt {
             let index_source = std::fs::File::open(index_file)?;
             let mut index_reader = std::io::BufReader::new(index_source);
             let triples_ci = ControlInfo::read(&mut reader)?;
-            TriplesBitmap::load_cache(&mut index_reader, triples_ci)?
+            let start_read = std::time::Instant::now();
+            let triples = TriplesBitmap::load_cache(&mut index_reader, triples_ci)?;
+            debug!("cache read Time: {:?}", start_read.elapsed());
+            triples
         } else {
             debug!("no cache detected, generating index");
             let triples = TriplesBitmap::read_sect(&mut reader).wrap_err("Failed to read HDT triples section")?;
             debug!("index generated, saving cache to {index_file}");
             let new_index_file = std::fs::File::create(index_file)?;
             let mut writer = BufWriter::new(new_index_file);
-            bincode::serialize_into(&mut writer, &triples).expect("Serialization failed");
+            let start_write = std::time::Instant::now();
+            //bincode::serialize_into(&mut writer, &triples).expect("Serialization failed");
+            triples.write_bytes(&mut writer)?;
             writer.flush()?;
+            debug!("cache Time: {:?}", start_write.elapsed());
             triples
         };
 
@@ -93,6 +100,7 @@ impl Hdt {
         let hdt = Hdt { dict, triples };
         debug!("HDT size in memory {}, details:", ByteSize(hdt.size_in_bytes() as u64));
         debug!("{hdt:#?}");
+        debug!("total HDT load time: {:?}", start_load.elapsed());
         Ok(hdt)
     }
 
