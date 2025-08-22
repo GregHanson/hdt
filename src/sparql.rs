@@ -103,8 +103,8 @@ impl QueryableDataset for HdtDataset {
     }
 }
 
-pub fn query(q: &str, ds: HdtDataset) -> Result<spareval::QueryResults, QueryEvaluationError> {
-    let query = Query::parse(q, None).unwrap_or_else(|_| panic!("error processing query {q}"));
+pub fn query(q: &str, ds: HdtDataset, base: Option<&str>) -> Result<spareval::QueryResults, QueryEvaluationError> {
+    let query = Query::parse(q, base).unwrap_or_else(|_| panic!("error processing query {q}"));
     QueryEvaluator::new().execute(ds, &query)
 }
 
@@ -136,7 +136,7 @@ mod tests {
             format!("{base} SELECT ?x {{ {{?s {p} ?x }} UNION {{<a> <b> ?x}} }} ORDER BY ?x LIMIT 1"),
         ];
         for i in 0..queries.len() {
-            let res = query(&queries[i], ds.clone())?;
+            let res = query(&queries[i], ds.clone(), None)?;
 
             match res {
                 spareval::QueryResults::Solutions(solutions) => {
