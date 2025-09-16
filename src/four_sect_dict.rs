@@ -166,9 +166,10 @@ impl FourSectDict {
     pub fn read_nt<R: BufRead>(r: &mut R, block_size: usize) -> Result<(Self, Vec<crate::triples::TripleId>)> {
         use crate::triples::TripleId;
         use log::warn;
+        use rayon::prelude::*;
         use sophia::api::prelude::TripleSource;
         use sophia::turtle::parser::nt;
-        use std::collections::BTreeSet;
+        use std::collections::{BTreeSet, HashSet};
 
         let mut raw_triples = Vec::new(); // Store raw triples
 
@@ -178,20 +179,17 @@ impl FourSectDict {
         let mut predicate_terms = Vec::<String>::new();
         nt::parse_bufread(r)
             .for_each_triple(|q| {
-                // HDT does not have angled brackets around IRIs
-                let clean = |s: &mut String| {
-                    let mut chars = s.chars();
-                    if chars.nth(0) == Some('<') && chars.nth_back(0) == Some('>') {
-                        s.remove(0);
-                        s.pop();
+                // HDT does not have angled brackets around IRIs - clean more efficiently
+                let clean_string = |s: &str| -> String {
+                    if s.len() >= 2 && s.starts_with('<') && s.ends_with('>') {
+                        s[1..s.len() - 1].to_string()
+                    } else {
+                        s.to_string()
                     }
                 };
-                let mut subj_str = q.subject.to_string();
-                clean(&mut subj_str);
-                let mut pred_str = q.predicate.to_string();
-                clean(&mut pred_str);
-                let mut obj_str = q.object.to_string();
-                clean(&mut obj_str);
+                let subj_str = clean_string(&q.subject.to_string());
+                let pred_str = clean_string(&q.predicate.to_string());
+                let obj_str = clean_string(&q.object.to_string());
 
                 subject_terms.insert(subj_str.clone());
                 predicate_terms.push(pred_str.clone());
@@ -214,15 +212,26 @@ impl FourSectDict {
         let unique_object_terms: BTreeSet<&str> =
             object_terms.difference(&subject_terms).map(std::ops::Deref::deref).collect();
 
-        let dict = FourSectDict {
-            shared: DictSectPFC::compress(&shared_terms, block_size),
-            predicates: DictSectPFC::compress(&predicate_terms_ref, block_size),
-            subjects: DictSectPFC::compress(&unique_subject_terms, block_size),
-            objects: DictSectPFC::compress(&unique_object_terms, block_size),
-        };
+        // Parallelize dictionary compression using rayon
+        let ((shared, pred), (subjects, objects)) = rayon::join(
+            || {
+                rayon::join(
+                    || DictSectPFC::compress(&shared_terms, block_size),
+                    || DictSectPFC::compress(&predicate_terms_ref, block_size),
+                )
+            },
+            || {
+                rayon::join(
+                    || DictSectPFC::compress(&unique_subject_terms, block_size),
+                    || DictSectPFC::compress(&unique_object_terms, block_size),
+                )
+            },
+        );
+
+        let dict = FourSectDict { shared, predicates: pred, subjects, objects };
 
         let encoded_triples: Vec<TripleId> = raw_triples
-            .into_iter()
+            .into_par_iter()
             .map(|(s, p, o)| {
                 let triple = [
                     dict.string_to_id(&s, IdKind::Subject),
