@@ -18,6 +18,9 @@ mod predicate_object_iter;
 pub use predicate_object_iter::PredicateObjectIter;
 mod object_iter;
 pub use object_iter::ObjectIter;
+
+mod triples_streaming;
+pub use triples_streaming::StreamingTriplesBitmap;
 #[cfg(feature = "cache")]
 use serde::ser::SerializeStruct;
 
@@ -188,6 +191,16 @@ pub enum Error {
     #[error("cache decode error")]
     #[cfg(feature = "cache")]
     Decode(#[from] bincode::error::DecodeError),
+    #[error("IO error")]
+    Io(#[from] std::io::Error),
+    #[error("Header error")]
+    Header(#[from] crate::header::Error),
+    #[error("Four section dictionary error")]
+    FourSectDict(#[from] crate::four_sect_dict::Error),
+    #[error("Bitmap error")]
+    BitmapError(#[from] bitmap::Error),
+    #[error("Sequence error")]
+    SequenceError(#[from] sequence::Error),
 }
 
 impl fmt::Debug for TriplesBitmap {
