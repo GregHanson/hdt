@@ -15,7 +15,7 @@ pub type Result<T> = core::result::Result<T, Error>;
 /// 3. Performing on-demand reads during query operations
 pub struct StreamingTriplesBitmap {
     /// Triple ordering
-    order: Order,
+    pub order: Order,
     /// File path for reading (we'll reopen as needed)
     file_path: std::path::PathBuf,
     /// File offset where bitmap_y section starts
@@ -53,7 +53,7 @@ impl StreamingTriplesBitmap {
         let mut reader = BufReader::new(file);
 
         // Skip to triples section by reading through the file structure
-        // In a real implementation, we'd parse the control info properly
+        // In a real implementation, we'd parse the control info proper1ly
         // For now, we'll use hardcoded offsets based on the test file structure
 
         // Read control info

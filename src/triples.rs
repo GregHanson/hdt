@@ -21,6 +21,15 @@ pub use object_iter::ObjectIter;
 
 mod triples_streaming;
 pub use triples_streaming::StreamingTriplesBitmap;
+
+mod streaming_indexed;
+pub use streaming_indexed::{StreamingIndexedTriplesBitmap, IndexConfig, TriplesMetadata};
+
+mod triple_access;
+pub use triple_access::{TripleAccess, AdvancedTripleAccess, QueryCost, TimeComplexity, QueryStrategy, TripleStatistics, TripleAccessIterator, SubjectIterator};
+
+mod bitmap_triple_access;
+mod streaming_triple_access;
 #[cfg(feature = "cache")]
 use serde::ser::SerializeStruct;
 
