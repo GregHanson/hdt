@@ -32,6 +32,8 @@ mod bitmap_triple_access;
 mod streaming_triple_access;
 mod file_based_triple_access;
 pub use file_based_triple_access::FileBasedTripleAccess;
+mod hybrid_triple_access;
+pub use hybrid_triple_access::HybridTripleAccess;
 #[cfg(feature = "cache")]
 use serde::ser::SerializeStruct;
 
