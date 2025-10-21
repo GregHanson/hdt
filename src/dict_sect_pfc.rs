@@ -7,7 +7,7 @@ use crate::triples::Id;
 use bytesize::ByteSize;
 use log::error;
 use std::cmp::{Ordering, min};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::io::{BufRead, Write};
 use std::sync::Arc;
 use std::thread::{JoinHandle, spawn};

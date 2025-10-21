@@ -386,9 +386,10 @@ impl HybridTripleAccess {
         // We need to find the adjlist_z offset in the original HDT file
         // For now, we'll set a placeholder - in production, this would be calculated
         // by reading the HDT file structure
+        use crate::containers::SequenceAccess;
         let adjlist_z_offset = 0; // TODO: Calculate this properly
         let adjlist_z_entries = triples.adjlist_z.len();
-        let adjlist_z_bits_per_entry = triples.adjlist_z.sequence.bits_per_entry;
+        let adjlist_z_bits_per_entry = triples.adjlist_z.sequence.bits_per_entry();
 
         let cache = HybridCache::from_triples_bitmap(
             triples,

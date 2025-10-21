@@ -2,6 +2,7 @@ use crate::triples::triple_access::{
     AdvancedTripleAccess, QueryCost, QueryStrategy, Result, TimeComplexity, TripleAccess, TripleStatistics,
 };
 use crate::triples::{Error, Id, Order, TripleId, TriplesBitmap};
+use crate::containers::{SequenceAccess, CompactVectorAccess};
 use std::cmp::Ordering;
 use sucds::Serializable;
 
@@ -61,8 +62,8 @@ impl TripleAccess for TriplesBitmap {
         let mut positions = Vec::new();
         for i in start..=end {
             if i < self.op_index.sequence.len() {
-                // CompactVector's get method returns the value directly
-                positions.push(self.op_index.sequence.get_int(i).unwrap());
+                // Use CompactVectorAccess trait's get() method
+                positions.push(self.op_index.sequence.get(i));
             }
         }
         Ok(positions)
@@ -210,7 +211,14 @@ impl AdvancedTripleAccess for TriplesBitmap {
     fn get_statistics(&self) -> TripleStatistics {
         let num_subjects = self.bitmap_y.num_ones();
         let num_predicates = self.wavelet_y.iter().max().unwrap_or(0);
-        let num_objects = self.adjlist_z.sequence.into_iter().max().unwrap_or(0);
+        // Find max object by iterating through the sequence using SequenceAccess
+        let mut num_objects = 0;
+        for i in 0..self.adjlist_z.sequence.len() {
+            let obj = self.adjlist_z.sequence.get(i);
+            if obj > num_objects {
+                num_objects = obj;
+            }
+        }
         let num_triples = self.num_triples();
 
         // Calculate predicate frequencies

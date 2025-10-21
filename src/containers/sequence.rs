@@ -13,7 +13,7 @@ pub type Result<T> = core::result::Result<T, Error>;
 
 /// Integer sequence with a given number of bits, which means numbers may be represented along byte boundaries.
 /// Also called "array" in the HDT spec, only Log64 is supported.
-//#[derive(Clone)]
+#[derive(Clone)]
 #[cfg_attr(feature = "cache", derive(Deserialize, Serialize))]
 pub struct Sequence {
     /// Number of integers in the sequence.

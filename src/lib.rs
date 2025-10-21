@@ -105,14 +105,10 @@ pub mod hdt_graph;
 pub mod header;
 /// Types for representing and querying triples.
 pub mod triples;
-/// Generic HDT with configurable triple access strategies.
-pub mod generic_hdt;
 /// Constants for triple terms
 pub mod vocab;
 
 pub use crate::hdt::Hdt;
-pub use crate::generic_hdt::{GenericHdt, TraditionalHdt, StreamingHdt, IndexedStreamingHdt, TripleAccessStrategy, create_hdt, HdtTrait};
-pub use crate::triples::{TripleAccess, AdvancedTripleAccess, StreamingTriplesBitmap, StreamingIndexedTriplesBitmap, IndexConfig};
 use containers::ControlInfo;
 use dict_sect_pfc::DictSectPFC;
 use four_sect_dict::FourSectDict;

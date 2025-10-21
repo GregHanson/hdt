@@ -17,10 +17,10 @@
 //! [CRC32]               (4 bytes)
 //! ```
 
-use crate::triples::{Error, Order, TriplesBitmap};
 use crate::containers::Bitmap;
-use std::io::{Read, Write, BufReader, BufWriter};
+use crate::triples::{Order, TriplesBitmap};
 use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use sucds::Serializable;
 use sucds::bit_vectors::Rank9Sel;
@@ -50,7 +50,9 @@ pub struct HybridCache {
 
 impl HybridCache {
     /// Generate cache from TriplesBitmap
-    pub fn from_triples_bitmap(triples: &TriplesBitmap, adjlist_z_offset: u64, adjlist_z_entries: usize, adjlist_z_bits_per_entry: usize) -> Self {
+    pub fn from_triples_bitmap(
+        triples: &TriplesBitmap, adjlist_z_offset: u64, adjlist_z_entries: usize, adjlist_z_bits_per_entry: usize,
+    ) -> Self {
         Self {
             bitmap_y: triples.bitmap_y.clone(),
             bitmap_z: triples.adjlist_z.bitmap.clone(),
@@ -128,8 +130,7 @@ impl HybridCache {
         // Read order
         let mut order_byte = [0u8];
         reader.read_exact(&mut order_byte)?;
-        let order = Order::try_from(order_byte[0] as u32)
-            .map_err(|e| format!("Invalid order: {:?}", e))?;
+        let order = Order::try_from(order_byte[0] as u32).map_err(|e| format!("Invalid order: {:?}", e))?;
 
         // Read bitmap_y
         let bitmap_y_dict = Rank9Sel::deserialize_from(&mut reader)?;
@@ -168,12 +169,7 @@ impl HybridCache {
             bitmap_z,
             wavelet_y,
             op_index_bitmap,
-            metadata: CacheMetadata {
-                order,
-                adjlist_z_offset,
-                adjlist_z_entries,
-                adjlist_z_bits_per_entry,
-            },
+            metadata: CacheMetadata { order, adjlist_z_offset, adjlist_z_entries, adjlist_z_bits_per_entry },
         })
     }
 }

@@ -1,4 +1,5 @@
 use crate::triples::{Id, TripleId, TriplesBitmap};
+use crate::containers::SequenceAccess;
 
 /// Iterator over all triples with a given property ID, answering an (?S,P,?O) query.
 pub struct PredicateIter<'a> {

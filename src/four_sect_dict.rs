@@ -169,7 +169,7 @@ impl FourSectDict {
         use rayon::prelude::*;
         use sophia::api::prelude::TripleSource;
         use sophia::turtle::parser::nt;
-        use std::collections::{BTreeSet, HashSet};
+        use std::collections::BTreeSet;
 
         let mut raw_triples = Vec::new(); // Store raw triples
 
