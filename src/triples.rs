@@ -1,5 +1,8 @@
 use crate::ControlInfo;
-use crate::containers::{AdjListGeneric, Bitmap, Sequence, InMemorySequence, SequenceAccess, CompactVectorAccess, InMemoryCompactVector, bitmap, control_info, sequence};
+use crate::containers::{
+    AdjListGeneric, Bitmap, CompactVectorAccess, InMemoryCompactVector, InMemorySequence, Sequence,
+    SequenceAccess, bitmap, control_info, sequence,
+};
 use bytesize::ByteSize;
 use log::error;
 use std::cmp::Ordering;
@@ -20,7 +23,7 @@ mod object_iter;
 pub use object_iter::ObjectIter;
 
 mod hybrid_cache;
-pub use hybrid_cache::{HybridCache, CacheMetadata};
+pub use hybrid_cache::{CacheMetadata, HybridCache};
 #[cfg(feature = "cache")]
 use serde::ser::SerializeStruct;
 
@@ -279,11 +282,12 @@ impl<'de> serde::Deserialize<'de> for TriplesBitmap {
     where
         D: serde::de::Deserializer<'de>,
     {
+        use crate::containers::AdjList;
         #[derive(serde::Deserialize)]
         struct TriplesBitmapData {
             order: Order,
             pub bitmap_y: Bitmap,
-            pub adjlist_z: AdjList,  // Still uses old AdjList for backwards compatibility
+            pub adjlist_z: AdjList, // Still uses old AdjList for backwards compatibility
             pub op_index: OpIndex,
             pub wavelet_y: Vec<u8>,
         }
@@ -296,10 +300,7 @@ impl<'de> serde::Deserialize<'de> for TriplesBitmap {
             WaveletMatrix::<Rank9Sel>::deserialize_from(&mut bitmap_reader).map_err(serde::de::Error::custom)?;
 
         // Convert old AdjList to new generic form
-        let adjlist_z = AdjListGeneric::new(
-            InMemorySequence::new(data.adjlist_z.sequence),
-            data.adjlist_z.bitmap,
-        );
+        let adjlist_z = AdjListGeneric::new(InMemorySequence::new(data.adjlist_z.sequence), data.adjlist_z.bitmap);
 
         let bitmap = TriplesBitmap {
             order: data.order,
@@ -395,7 +396,9 @@ impl<S: SequenceAccess, CV: CompactVectorAccess> TriplesBitmapGeneric<S, CV> {
 impl TriplesBitmap {
     /// builds the necessary indexes and constructs TriplesBitmap
     /// Always uses InMemorySequence for adjlist_z and InMemoryCompactVector for op_index
-    pub fn new(order: Order, sequence_y: Sequence, bitmap_y: Bitmap, adjlist_z: AdjListGeneric<InMemorySequence>) -> Self {
+    pub fn new(
+        order: Order, sequence_y: Sequence, bitmap_y: Bitmap, adjlist_z: AdjListGeneric<InMemorySequence>,
+    ) -> Self {
         //let wavelet_thread = std::thread::spawn(|| Self::build_wavelet(sequence_y));
         let wavelet_y = Self::build_wavelet(sequence_y);
 
@@ -446,7 +449,6 @@ impl TriplesBitmap {
         let op_index = OpIndexGeneric::new(InMemoryCompactVector::new(cv), bitmap_index);
         Self { order, bitmap_y, adjlist_z, op_index, wavelet_y }
     }
-
 }
 
 // More specialized implementations for TriplesBitmap (InMemorySequence, InMemoryCompactVector)

@@ -5,6 +5,7 @@ use crate::dict_sect_pfc;
 use crate::triples::Id;
 use crate::{ControlInfo, DictSectPFC};
 use log::error;
+use std::collections::HashSet;
 use std::io::BufRead;
 use std::thread::JoinHandle;
 use thiserror::Error;
@@ -166,16 +167,17 @@ impl FourSectDict {
     pub fn read_nt<R: BufRead>(r: &mut R, block_size: usize) -> Result<(Self, Vec<crate::triples::TripleId>)> {
         use crate::triples::TripleId;
         use log::warn;
-        use rayon::prelude::*;
         use sophia::api::prelude::TripleSource;
         use sophia::turtle::parser::nt;
         use std::collections::BTreeSet;
+        use std::ops::Deref;
+        use std::thread;
 
         let mut raw_triples = Vec::new(); // Store raw triples
 
         // TODO: compare times with Vec followed by parallel sort vs times with BTreeSet
-        let mut subject_terms = BTreeSet::<String>::new();
-        let mut object_terms = BTreeSet::<String>::new();
+        let mut subject_terms = HashSet::<String>::new();
+        let mut object_terms = HashSet::<String>::new();
         let mut predicate_terms = Vec::<String>::new();
         nt::parse_bufread(r)
             .for_each_triple(|q| {
@@ -201,42 +203,49 @@ impl FourSectDict {
         if predicate_terms.is_empty() {
             warn!("no triples found in provided RDF");
         }
-        let predicate_terms_ref: BTreeSet<&str> = predicate_terms.iter().map(std::ops::Deref::deref).collect();
-        raw_triples.sort_unstable(); // Faster than stable sort
-        raw_triples.dedup();
+        let sorter = thread::Builder::new()
+            .name("sorter".to_owned())
+            .spawn(move || {
+                raw_triples.sort_unstable(); // Faster than stable sort
+                raw_triples.dedup();
+                raw_triples
+            })
+            .unwrap();
 
-        let shared_terms: BTreeSet<&str> =
-            subject_terms.intersection(&object_terms).map(std::ops::Deref::deref).collect();
-        let unique_subject_terms: BTreeSet<&str> =
-            subject_terms.difference(&object_terms).map(std::ops::Deref::deref).collect();
-        let unique_object_terms: BTreeSet<&str> =
-            object_terms.difference(&subject_terms).map(std::ops::Deref::deref).collect();
+        let [shared, subjects, predicates, objects]: [DictSectPFC; 4] = std::thread::scope(|s| {
+            [
+                s.spawn(|| {
+                    let shared_terms: BTreeSet<&str> =
+                        subject_terms.intersection(&object_terms).map(Deref::deref).collect();
+                    DictSectPFC::compress(&shared_terms, block_size)
+                }),
+                s.spawn(|| {
+                    let unique_subject_terms = subject_terms.difference(&object_terms).map(Deref::deref).collect();
+                    DictSectPFC::compress(&unique_subject_terms, block_size)
+                }),
+                s.spawn(|| {
+                    let predicate_terms_ref: BTreeSet<&str> = predicate_terms.iter().map(Deref::deref).collect();
+                    DictSectPFC::compress(&predicate_terms_ref, block_size)
+                }),
+                s.spawn(|| {
+                    let unique_object_terms = object_terms.difference(&subject_terms).map(Deref::deref).collect();
+                    DictSectPFC::compress(&unique_object_terms, block_size)
+                }),
+            ]
+            .map(|t| t.join().unwrap())
+        });
 
-        // Parallelize dictionary compression using rayon
-        let ((shared, pred), (subjects, objects)) = rayon::join(
-            || {
-                rayon::join(
-                    || DictSectPFC::compress(&shared_terms, block_size),
-                    || DictSectPFC::compress(&predicate_terms_ref, block_size),
-                )
-            },
-            || {
-                rayon::join(
-                    || DictSectPFC::compress(&unique_subject_terms, block_size),
-                    || DictSectPFC::compress(&unique_object_terms, block_size),
-                )
-            },
-        );
+        let dict = FourSectDict { shared, subjects, predicates, objects };
 
-        let dict = FourSectDict { shared, predicates: pred, subjects, objects };
-
-        let encoded_triples: Vec<TripleId> = raw_triples
-            .into_par_iter()
+        let sorted_triples = sorter.join().unwrap();
+        let slice: &[(String, String, String)] = &sorted_triples;
+        let encoded_triples: Vec<TripleId> = slice
+            .iter()
             .map(|(s, p, o)| {
                 let triple = [
-                    dict.string_to_id(&s, IdKind::Subject),
-                    dict.string_to_id(&p, IdKind::Predicate),
-                    dict.string_to_id(&o, IdKind::Object),
+                    dict.string_to_id(s, IdKind::Subject),
+                    dict.string_to_id(p, IdKind::Predicate),
+                    dict.string_to_id(o, IdKind::Object),
                 ];
                 if triple[0] == 0 || triple[1] == 0 || triple[2] == 0 {
                     error!("{triple:?} contains 0, part of ({s}, {p}, {o}) not found in the dictionary");

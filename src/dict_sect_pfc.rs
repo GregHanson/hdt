@@ -5,7 +5,6 @@ use crate::containers::vbyte::{decode_vbyte_delta, encode_vbyte, read_vbyte};
 use crate::containers::{Sequence, sequence};
 use crate::triples::Id;
 use bytesize::ByteSize;
-use log::error;
 use std::cmp::{Ordering, min};
 use std::collections::BTreeSet;
 use std::io::{BufRead, Write};
@@ -53,7 +52,7 @@ impl fmt::Debug for DictSectPFC {
             ByteSize(self.size_in_bytes() as u64),
             self.num_strings,
             self.sequence,
-            self.packed_data //ByteSize(self.packed_data.len() as u64)
+            ByteSize(self.packed_data.len() as u64)
         )
     }
 }
