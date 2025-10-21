@@ -34,6 +34,8 @@ mod file_based_triple_access;
 pub use file_based_triple_access::FileBasedTripleAccess;
 mod hybrid_triple_access;
 pub use hybrid_triple_access::HybridTripleAccess;
+mod hybrid_cache;
+pub use hybrid_cache::{HybridCache, CacheMetadata};
 #[cfg(feature = "cache")]
 use serde::ser::SerializeStruct;
 

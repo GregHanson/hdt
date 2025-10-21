@@ -75,11 +75,11 @@ pub struct HybridTripleAccess {
 
     // In-memory structures (lightweight)
     /// Subject bitmap for Y layer access (rank/select)
-    bitmap_y: Bitmap,
+    pub bitmap_y: Bitmap,
     /// Predicate bitmap for Z layer access (rank/select)
-    bitmap_z: Bitmap,
+    pub bitmap_z: Bitmap,
     /// Wavelet matrix for predicate IDs
-    wavelet_y: WaveletMatrix<Rank9Sel>,
+    pub wavelet_y: WaveletMatrix<Rank9Sel>,
 
     // File-based sequence metadata
     /// Metadata for adjlist_z sequence (object IDs)
@@ -106,8 +106,61 @@ impl std::fmt::Debug for HybridTripleAccess {
 }
 
 impl HybridTripleAccess {
-    /// Create a hybrid triple access from an HDT file
+    /// Create a hybrid triple access from an HDT file with optional cache
+    ///
+    /// If a cache file exists (filename.hdt.cache), it will be used to speed up loading.
+    /// Otherwise, structures are built from scratch.
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let hdt_path = path.as_ref();
+        let cache_path = format!("{}.cache", hdt_path.display());
+
+        // Try to load from cache first
+        if std::path::Path::new(&cache_path).exists() {
+            if let Ok(cached) = Self::from_cache(hdt_path, std::path::Path::new(&cache_path)) {
+                return Ok(cached);
+            }
+            // If cache load fails, fall through to build from scratch
+        }
+
+        Self::from_file_no_cache(hdt_path)
+    }
+
+    /// Create from cache file (fast initialization)
+    pub fn from_cache(hdt_path: &Path, cache_path: &Path) -> Result<Self> {
+        use crate::triples::hybrid_cache::HybridCache;
+
+        let cache = HybridCache::read_from_file(cache_path)
+            .map_err(|e| Error::External(format!("Failed to read cache: {}", e).into()))?;
+
+        let file = File::open(&hdt_path)?;
+        let reader = BufReader::new(file);
+
+        Ok(Self {
+            order: cache.metadata.order,
+            file_path: hdt_path.to_path_buf(),
+            bitmap_y: cache.bitmap_y,
+            bitmap_z: cache.bitmap_z,
+            wavelet_y: cache.wavelet_y,
+            adjlist_z_meta: SequenceFileMetadata {
+                data_offset: cache.metadata.adjlist_z_offset,
+                entries: cache.metadata.adjlist_z_entries,
+                bits_per_entry: cache.metadata.adjlist_z_bits_per_entry,
+            },
+            op_index_meta: OpIndexFileMetadata {
+                sequence_meta: SequenceFileMetadata {
+                    data_offset: 0,
+                    entries: 0,
+                    bits_per_entry: 1,
+                },
+                bitmap: cache.op_index_bitmap,
+            },
+            num_triples: cache.metadata.adjlist_z_entries,
+            file: Arc::new(Mutex::new(reader)),
+        })
+    }
+
+    /// Create from HDT file without cache (builds structures from scratch)
+    pub fn from_file_no_cache<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file_path = path.as_ref().to_path_buf();
         let file = File::open(&file_path)?;
         let mut reader = BufReader::new(file);
@@ -317,6 +370,37 @@ impl HybridTripleAccess {
         };
 
         Ok(result)
+    }
+
+    /// Generate and save cache file from a TriplesBitmap
+    ///
+    /// This allows you to pre-generate cache files from existing TriplesBitmap instances.
+    /// Useful for deployment pipelines where you build the cache once and reuse it.
+    pub fn generate_cache_from_triples<P: AsRef<Path>>(
+        triples: &crate::triples::TriplesBitmap,
+        hdt_path: P,
+        cache_path: P,
+    ) -> Result<()> {
+        use crate::triples::hybrid_cache::HybridCache;
+
+        // We need to find the adjlist_z offset in the original HDT file
+        // For now, we'll set a placeholder - in production, this would be calculated
+        // by reading the HDT file structure
+        let adjlist_z_offset = 0; // TODO: Calculate this properly
+        let adjlist_z_entries = triples.adjlist_z.len();
+        let adjlist_z_bits_per_entry = triples.adjlist_z.sequence.bits_per_entry;
+
+        let cache = HybridCache::from_triples_bitmap(
+            triples,
+            adjlist_z_offset,
+            adjlist_z_entries,
+            adjlist_z_bits_per_entry,
+        );
+
+        cache.write_to_file(cache_path)
+            .map_err(|e| Error::External(format!("Failed to write cache: {}", e).into()))?;
+
+        Ok(())
     }
 
     /// Get last Y position for subject
