@@ -1,13 +1,14 @@
-use hdt::triples::{StreamingTriplesBitmap, StreamingIndexedTriplesBitmap, IndexConfig};
+use hdt::triples::{StreamingTriplesBitmap, StreamingIndexedTriplesBitmap, FileBasedTripleAccess, IndexConfig, TripleAccess};
 use hdt::Hdt;
 use std::fs::File;
 use std::io::BufReader;
 use std::time::Instant;
 
-/// Comprehensive comparison of all three HDT access approaches:
-/// 1. Traditional TriplesBitmap (full memory)
-/// 2. StreamingTriplesBitmap (minimal memory)
-/// 3. StreamingIndexedTriplesBitmap (configurable memory/performance trade-off)
+/// Comprehensive comparison of all four HDT access approaches:
+/// 1. Traditional TriplesBitmap (full memory - fastest)
+/// 2. StreamingIndexedTriplesBitmap (configurable memory/performance trade-off)
+/// 3. StreamingTriplesBitmap (minimal memory with basic streaming)
+/// 4. FileBasedTripleAccess (zero-index pure file I/O - lowest memory)
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hdt_path = "tests/resources/tax-nodes.hdt";
 
@@ -39,8 +40,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("✓ Memory usage: {:.2} KB", basic_streaming.size_in_bytes() as f64 / 1024.0);
     println!("✓ Number of triples: {}", basic_streaming.num_triples());
 
-    // 3. Indexed Streaming HDT - Configurable Approach
-    println!("\n3. Indexed Streaming HDT (Configurable)");
+    // 3. File-Based HDT - Zero-Index Pure File I/O
+    println!("\n3. File-Based HDT (Zero-Index, Pure File I/O)");
+    println!("---------------------------------------------");
+
+    let start = Instant::now();
+    let file_based = FileBasedTripleAccess::from_file(hdt_path)?;
+    let file_based_load_time = start.elapsed();
+
+    println!("✓ Load time: {:?}", file_based_load_time);
+    println!("✓ Memory usage: {} bytes (metadata only)", file_based.size_in_bytes());
+    println!("✓ Number of triples: {}", file_based.num_triples());
+    println!("✓ Indexes loaded: none (all queries via direct file I/O)");
+
+    // 4. Indexed Streaming HDT - Configurable Approach
+    println!("\n4. Indexed Streaming HDT (Configurable)");
     println!("---------------------------------------");
 
     // Test different memory configurations
@@ -110,7 +124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Performance comparison for common operations
-    println!("\n4. Performance Comparison");
+    println!("\n5. Performance Comparison");
     println!("------------------------");
 
     let test_positions = [0, 5, 10];
@@ -140,13 +154,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let obj_basic = basic_streaming.get_object(pos)?;
         let basic_time = start.elapsed();
 
+        // File-based
+        let start = Instant::now();
+        let obj_file = file_based.get_object(pos)?;
+        let file_time = start.elapsed();
+
         // Indexed streaming
         let start = Instant::now();
         let obj_indexed = indexed_streaming.get_object(pos)?;
         let indexed_time = start.elapsed();
 
-        println!("   Position {}: Traditional({}) {:?}, Basic({}) {:?}, Indexed({}) {:?}",
-                 pos, obj_traditional, traditional_time, obj_basic, basic_time, obj_indexed, indexed_time);
+        println!("   Pos {}: Traditional({}) {:?}, FileBased({}) {:?}, BasicStream({}) {:?}, Indexed({}) {:?}",
+                 pos, obj_traditional, traditional_time, obj_file, file_time, obj_basic, basic_time, obj_indexed, indexed_time);
     }
 
     println!("\n   Subject Lookup Performance:");
@@ -155,6 +174,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let start = Instant::now();
         let pos_traditional = traditional_hdt.triples.find_y(subject_id);
         let traditional_time = start.elapsed();
+
+        // File-based
+        let start = Instant::now();
+        let pos_file = file_based.find_y(subject_id)?;
+        let file_time = start.elapsed();
 
         // Basic streaming
         let start = Instant::now();
@@ -166,42 +190,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let pos_indexed = indexed_streaming.find_y(subject_id)?;
         let indexed_time = start.elapsed();
 
-        println!("   Subject {}: Traditional({}) {:?}, Basic({}) {:?}, Indexed({}) {:?}",
-                 subject_id, pos_traditional, traditional_time, pos_basic, basic_time, pos_indexed, indexed_time);
+        println!("   Subject {}: Traditional({}) {:?}, FileBased({}) {:?}, BasicStream({}) {:?}, Indexed({}) {:?}",
+                 subject_id, pos_traditional, traditional_time, pos_file, file_time, pos_basic, basic_time, pos_indexed, indexed_time);
     }
 
     // Memory usage summary
-    println!("\n5. Memory Usage Summary");
+    println!("\n6. Memory Usage Summary");
     println!("----------------------");
 
     let traditional_mb = traditional_hdt.size_in_bytes() as f64 / (1024.0 * 1024.0);
+    let file_based_bytes = file_based.size_in_bytes() as f64;
     let basic_kb = basic_streaming.size_in_bytes() as f64 / 1024.0;
     let indexed_kb = indexed_streaming.index_memory_usage() as f64 / 1024.0;
 
     println!("Traditional HDT:      {:.2} MB (100%)", traditional_mb);
+    println!("File-Based HDT:       {} bytes ({:.4}%)", file_based_bytes, file_based_bytes / 1024.0 / 1024.0 / traditional_mb * 100.0);
     println!("Basic Streaming:      {:.2} KB ({:.1}%)", basic_kb, basic_kb / 1024.0 / traditional_mb * 100.0);
     println!("Indexed Streaming:    {:.2} KB ({:.1}%)", indexed_kb, indexed_kb / 1024.0 / traditional_mb * 100.0);
 
     println!("\nMemory savings vs Traditional:");
+    println!("File-Based HDT:       {:.0}x less memory", traditional_mb * 1024.0 * 1024.0 / file_based_bytes.max(1.0));
     println!("Basic Streaming:      {:.1}x less memory", traditional_mb * 1024.0 / basic_kb);
     println!("Indexed Streaming:    {:.1}x less memory", traditional_mb * 1024.0 / indexed_kb.max(1.0));
 
     // Recommendations
-    println!("\n6. Usage Recommendations");
+    println!("\n7. Usage Recommendations");
     println!("------------------------");
 
-    println!("📊 Traditional HDT:");
+    println!("🚀 Traditional HDT (TriplesBitmap):");
     println!("   ✅ Use when: Plenty of memory, frequent queries, maximum performance needed");
+    println!("   ✅ Best for: Production APIs with high QPS, repeated query patterns");
     println!("   ❌ Avoid when: Memory constrained, large files, many concurrent processes");
 
+    println!("\n💾 File-Based HDT (NEW - Zero-Index):");
+    println!("   ✅ Use when: Extremely memory-constrained, files larger than RAM");
+    println!("   ✅ Best for: Exploration, development, serverless, edge devices");
+    println!("   ✅ Memory: Absolute minimum (~100-200 bytes metadata only)");
+    println!("   ⚠️  Slow: Every access requires file I/O - combine with caching");
+    println!("   ❌ Avoid when: Need high throughput or low-latency queries");
+
     println!("\n🔄 Basic Streaming HDT:");
-    println!("   ✅ Use when: Very limited memory, infrequent queries, exploration tasks");
-    println!("   ❌ Avoid when: Need fast query performance, doing many repeated queries");
+    println!("   ✅ Use when: Limited memory, infrequent queries");
+    println!("   ✅ Best for: Batch processing with sequential access patterns");
+    println!("   ⚠️  Note: File-Based HDT is usually better choice (lower memory, similar perf)");
 
     println!("\n⚖️ Indexed Streaming HDT:");
     println!("   ✅ Use when: Moderate memory constraints, mixed workloads, production systems");
     println!("   ✅ Best for: Balancing memory usage with performance requirements");
     println!("   ✅ Configurable: Tune index selection based on query patterns and memory budget");
+    println!("   ✅ Sweet spot: Between file-based (too slow) and traditional (too much memory)");
 
     Ok(())
 }
@@ -212,9 +249,11 @@ mod tests {
 
     #[test]
     fn test_all_implementations_consistency() -> Result<(), Box<dyn std::error::Error>> {
-        // Test that all implementations return consistent results
+        // Test that all four implementations return consistent results
         let file = File::open("tests/resources/snikmeta.hdt")?;
         let traditional = Hdt::read(BufReader::new(file))?;
+
+        let file_based = FileBasedTripleAccess::from_file("tests/resources/snikmeta.hdt")?;
 
         let basic_streaming = StreamingTriplesBitmap::from_file("tests/resources/snikmeta.hdt")?;
 
@@ -224,17 +263,33 @@ mod tests {
         )?;
 
         // All should report same number of triples
-        assert_eq!(traditional.triples.adjlist_z.len(), basic_streaming.num_triples());
-        assert_eq!(traditional.triples.adjlist_z.len(), indexed_streaming.num_triples());
+        let num_triples = traditional.triples.adjlist_z.len();
+        assert_eq!(num_triples, file_based.num_triples());
+        assert_eq!(num_triples, basic_streaming.num_triples());
+        assert_eq!(num_triples, indexed_streaming.num_triples());
 
-        // Test object access consistency
-        for pos in 0..5.min(traditional.triples.adjlist_z.len()) {
+        // Test object access consistency across all implementations
+        for pos in 0..5.min(num_triples) {
             let obj_traditional = traditional.triples.adjlist_z.sequence.get(pos);
+            let obj_file = file_based.get_object(pos)?;
             let obj_basic = basic_streaming.get_object(pos)?;
             let obj_indexed = indexed_streaming.get_object(pos)?;
 
+            assert_eq!(obj_traditional, obj_file, "File-based mismatch at position {}", pos);
             assert_eq!(obj_traditional, obj_basic, "Basic streaming mismatch at position {}", pos);
             assert_eq!(obj_traditional, obj_indexed, "Indexed streaming mismatch at position {}", pos);
+        }
+
+        // Test subject lookup consistency
+        for subject_id in 1..=3 {
+            let pos_traditional = traditional.triples.find_y(subject_id);
+            let pos_file = file_based.find_y(subject_id)?;
+            let pos_basic = basic_streaming.find_y(subject_id)?;
+            let pos_indexed = indexed_streaming.find_y(subject_id)?;
+
+            assert_eq!(pos_traditional, pos_file, "File-based find_y mismatch for subject {}", subject_id);
+            assert_eq!(pos_traditional, pos_basic, "Basic streaming find_y mismatch for subject {}", subject_id);
+            assert_eq!(pos_traditional, pos_indexed, "Indexed streaming find_y mismatch for subject {}", subject_id);
         }
 
         Ok(())
@@ -243,6 +298,12 @@ mod tests {
     #[test]
     fn test_memory_scaling() -> Result<(), Box<dyn std::error::Error>> {
         // Test that memory usage scales with index configuration
+
+        // First verify file-based has minimal memory
+        let file_based = FileBasedTripleAccess::from_file("tests/resources/snikmeta.hdt")?;
+        assert!(file_based.size_in_bytes() < 1000,
+                "File-based should use less than 1KB: {}", file_based.size_in_bytes());
+
         let configs = [
             (1024, false, false, false),          // 1KB - minimal
             (64 * 1024, true, false, false),      // 64KB - subject only
@@ -267,6 +328,14 @@ mod tests {
             )?;
 
             let memory_usage = streaming.index_memory_usage();
+
+            // File-based should always use less memory than any indexed approach
+            // (unless indexed has 0 memory because no indexes fit in budget)
+            if memory_usage > 0 {
+                assert!(file_based.size_in_bytes() < memory_usage,
+                       "File-based ({} bytes) should use less memory than indexed ({} bytes)",
+                       file_based.size_in_bytes(), memory_usage);
+            }
 
             // Memory usage should generally increase with more indexes
             // (unless we hit memory limits)

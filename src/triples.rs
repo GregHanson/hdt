@@ -30,6 +30,8 @@ pub use triple_access::{TripleAccess, AdvancedTripleAccess, QueryCost, TimeCompl
 
 mod bitmap_triple_access;
 mod streaming_triple_access;
+mod file_based_triple_access;
+pub use file_based_triple_access::FileBasedTripleAccess;
 #[cfg(feature = "cache")]
 use serde::ser::SerializeStruct;
 
