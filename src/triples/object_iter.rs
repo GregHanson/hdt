@@ -1,5 +1,4 @@
 use crate::triples::{Id, TripleId, TriplesBitmap};
-use crate::containers::CompactVectorAccess;
 
 // see "Exchange and Consumption of Huge RDF Data" by Martinez et al. 2012
 // https://link.springer.com/chapter/10.1007/978-3-642-30284-8_36
@@ -32,8 +31,7 @@ impl Iterator for ObjectIter<'_> {
         if self.pos_index > self.max_index {
             return None;
         }
-        // Use CompactVectorAccess trait's get() method
-        let pos_y = self.triples.op_index.sequence.get(self.pos_index);
+        let pos_y = self.triples.op_index.get(self.pos_index);
         let y = self.triples.wavelet_y.access(pos_y).unwrap() as Id;
         let x = self.triples.bitmap_y.rank(pos_y) as Id + 1;
         self.pos_index += 1;

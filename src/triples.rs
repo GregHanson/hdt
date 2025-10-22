@@ -1,6 +1,6 @@
 use crate::ControlInfo;
 use crate::containers::{
-    AdjListGeneric, Bitmap, CompactVectorAccess, InMemoryCompactVector, InMemorySequence, Sequence,
+    AdjListGeneric, Bitmap, InMemorySequence, Sequence,
     SequenceAccess, bitmap, control_info, sequence,
 };
 use bytesize::ByteSize;
@@ -22,8 +22,8 @@ pub use predicate_object_iter::PredicateObjectIter;
 mod object_iter;
 pub use object_iter::ObjectIter;
 
-mod hybrid_cache;
-pub use hybrid_cache::{CacheMetadata, HybridCache};
+pub mod hybrid_cache;
+pub use hybrid_cache::HybridCache;
 #[cfg(feature = "cache")]
 use serde::ser::SerializeStruct;
 
@@ -63,24 +63,17 @@ impl TryFrom<u32> for Order {
     }
 }
 
-/// Generic inverse index from object id to positions in the object adjacency list.
+/// Inverse index from object id to positions in the object adjacency list.
 /// This object-based index allows to traverse from the leaves and support ??O and ?PO queries.
 /// Used for logarithmic (?) time access instead of linear time sequential search.
 /// See Martínez-Prieto, M., M. Arias, and J. Fernández (2012). Exchange and Consumption of Huge RDF Data. Pages 8--10.
-///
-/// Generic over CV: CompactVectorAccess trait allows either in-memory (InMemoryCompactVector)
-/// or file-based (FileBasedCompactVector) implementations.
-pub struct OpIndexGeneric<CV: CompactVectorAccess> {
-    /// Compact integer vector of object positions (generic over access method).
+pub struct OpIndex {
+    /// Compact integer vector of object positions.
     /// "[...] integer sequence: SoP, which stores, for each object, a sorted list of references to the predicate-subject pairs (sorted by predicate) related to it."
-    pub sequence: CV,
+    pub sequence: CompactVector,
     /// Bitmap with a one bit for every new object to allow finding the starting point for a given object id.
     pub bitmap: Bitmap,
 }
-
-/// Type alias for traditional in-memory OpIndex with CompactVector.
-/// This maintains backward compatibility with existing code.
-pub type OpIndex = OpIndexGeneric<InMemoryCompactVector>;
 
 #[cfg(feature = "cache")]
 impl serde::Serialize for OpIndex {
@@ -91,9 +84,9 @@ impl serde::Serialize for OpIndex {
         let mut state: <S as serde::ser::Serializer>::SerializeStruct =
             serializer.serialize_struct("OpIndex", 2)?;
 
-        // Serialize sequence using `sucds` - access inner CompactVector from InMemoryCompactVector
+        // Serialize sequence using `sucds`
         let mut seq_buffer = Vec::new();
-        self.sequence.inner().serialize_into(&mut seq_buffer).map_err(serde::ser::Error::custom)?;
+        self.sequence.serialize_into(&mut seq_buffer).map_err(serde::ser::Error::custom)?;
         state.serialize_field("sequence", &seq_buffer)?;
 
         state.serialize_field("bitmap", &self.bitmap)?;
@@ -118,16 +111,14 @@ impl<'de> serde::Deserialize<'de> for OpIndex {
 
         // Deserialize `sucds` structures
         let mut seq_reader = std::io::BufReader::new(&data.sequence[..]);
-
-        let v = CompactVector::deserialize_from(&mut seq_reader).map_err(serde::de::Error::custom)?;
-        // Wrap the CompactVector in InMemoryCompactVector for the generic OpIndex
-        let index = OpIndexGeneric::new(InMemoryCompactVector::new(v), data.bitmap);
+        let sequence = CompactVector::deserialize_from(&mut seq_reader).map_err(serde::de::Error::custom)?;
+        let index = OpIndex { sequence, bitmap: data.bitmap };
 
         Ok(index)
     }
 }
 
-impl<CV: CompactVectorAccess> fmt::Debug for OpIndexGeneric<CV> {
+impl fmt::Debug for OpIndex {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "total size {} {{", ByteSize(self.size_in_bytes() as u64))?;
         writeln!(
@@ -140,9 +131,9 @@ impl<CV: CompactVectorAccess> fmt::Debug for OpIndexGeneric<CV> {
     }
 }
 
-impl<CV: CompactVectorAccess> OpIndexGeneric<CV> {
+impl OpIndex {
     /// Create a new OpIndex with the given sequence and bitmap
-    pub fn new(sequence: CV, bitmap: Bitmap) -> Self {
+    pub fn new(sequence: CompactVector, bitmap: Bitmap) -> Self {
         Self { sequence, bitmap }
     }
 
@@ -163,7 +154,8 @@ impl<CV: CompactVectorAccess> OpIndexGeneric<CV> {
 
     /// Get the value at the given index
     pub fn get(&self, index: usize) -> usize {
-        self.sequence.get(index)
+        use sucds::int_vectors::Access;
+        self.sequence.access(index).expect("index out of bounds")
     }
 
     /// Number of entries in the sequence
@@ -178,25 +170,24 @@ impl<CV: CompactVectorAccess> OpIndexGeneric<CV> {
 }
 
 /// Generic `BitmapTriples` variant of the triples section.
-/// Uses generic traits for both adjlist_z and op_index sequences:
-/// - S: SequenceAccess for adjlist_z.sequence (InMemorySequence or FileBasedSequence)
-/// - CV: CompactVectorAccess for op_index.sequence (InMemoryCompactVector or FileBasedCompactVector)
+/// Generic over S: SequenceAccess for adjlist_z.sequence (InMemorySequence or FileBasedSequence).
+/// OpIndex is always in-memory using CompactVector directly.
 //#[derive(Clone)]
-pub struct TriplesBitmapGeneric<S: SequenceAccess, CV: CompactVectorAccess> {
+pub struct TriplesBitmapGeneric<S: SequenceAccess> {
     order: Order,
     /// bitmap to find positions in the wavelet matrix
     pub bitmap_y: Bitmap,
     /// adjacency list storing the object IDs (generic over sequence access)
     pub adjlist_z: AdjListGeneric<S>,
-    /// Index for object-based access (generic over compact vector access). Points to the predicate layer.
-    pub op_index: OpIndexGeneric<CV>,
+    /// Index for object-based access. Points to the predicate layer.
+    pub op_index: OpIndex,
     /// wavelet matrix for predicate-based access
     pub wavelet_y: WaveletMatrix<Rank9Sel>,
 }
 
 /// Type alias for the traditional TriplesBitmap with all in-memory structures.
 /// This maintains backward compatibility with existing code.
-pub type TriplesBitmap = TriplesBitmapGeneric<InMemorySequence, InMemoryCompactVector>;
+pub type TriplesBitmap = TriplesBitmapGeneric<InMemorySequence>;
 
 #[derive(Debug)]
 pub enum Level {
@@ -242,7 +233,7 @@ pub enum Error {
     SequenceError(#[from] sequence::Error),
 }
 
-impl<S: SequenceAccess, CV: CompactVectorAccess> fmt::Debug for TriplesBitmapGeneric<S, CV> {
+impl<S: SequenceAccess> fmt::Debug for TriplesBitmapGeneric<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "total size {}", ByteSize(self.size_in_bytes() as u64))?;
         writeln!(f, "adjlist_z {:#?}", self.adjlist_z)?;
@@ -314,7 +305,25 @@ impl<'de> serde::Deserialize<'de> for TriplesBitmap {
     }
 }
 
-impl<S: SequenceAccess, CV: CompactVectorAccess> TriplesBitmapGeneric<S, CV> {
+impl<S: SequenceAccess> TriplesBitmapGeneric<S> {
+    /// Create a new TriplesBitmapGeneric with the given components.
+    /// This constructor is used for creating hybrid/streaming implementations.
+    pub fn from_components(
+        order: Order,
+        bitmap_y: Bitmap,
+        adjlist_z: AdjListGeneric<S>,
+        op_index: OpIndex,
+        wavelet_y: WaveletMatrix<Rank9Sel>,
+    ) -> Self {
+        Self {
+            order,
+            bitmap_y,
+            adjlist_z,
+            op_index,
+            wavelet_y,
+        }
+    }
+
     /// Size in bytes on the heap.
     pub fn size_in_bytes(&self) -> usize {
         self.adjlist_z.size_in_bytes() + self.op_index.size_in_bytes() + self.wavelet_y.size_in_bytes()
@@ -357,7 +366,7 @@ impl<S: SequenceAccess, CV: CompactVectorAccess> TriplesBitmapGeneric<S, CV> {
         self.bin_search_y(property_id, self.find_y(subject_id), self.last_y(subject_id) + 1)
     }
 
-    fn build_wavelet(sequence: Sequence) -> WaveletMatrix<Rank9Sel> {
+    pub fn build_wavelet(sequence: Sequence) -> WaveletMatrix<Rank9Sel> {
         let mut builder =
             CompactVector::new(sequence.bits_per_entry.max(1)).expect("Failed to create wavelet matrix builder.");
         // possible refactor of Sequence to use sucds CompactVector, then builder can be removed
@@ -445,8 +454,7 @@ impl TriplesBitmap {
             }
         }
         let bitmap_index = Bitmap { dict: Rank9Sel::new(bitmap_index_bitvector) };
-        // Wrap CompactVector in InMemoryCompactVector for the generic OpIndex
-        let op_index = OpIndexGeneric::new(InMemoryCompactVector::new(cv), bitmap_index);
+        let op_index = OpIndex::new(cv, bitmap_index);
         Self { order, bitmap_y, adjlist_z, op_index, wavelet_y }
     }
 }
