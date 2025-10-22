@@ -1,20 +1,22 @@
-use crate::triples::{Id, TriplesBitmap};
+use crate::triples::{Id, TriplesBitmapGeneric};
+use crate::containers::SequenceAccess;
 use std::cmp::Ordering;
 
 // see filterPredSubj in "Exchange and Consumption of Huge RDF Data" by Martinez et al. 2012
 // https://link.springer.com/chapter/10.1007/978-3-642-30284-8_36
 
 /// Iterator over all subject IDs with a given predicate and object ID, answering an (?S,P,O) query.
-pub struct PredicateObjectIter<'a> {
-    triples: &'a TriplesBitmap,
+/// Generic over sequence access type S for TriplesBitmapGeneric.
+pub struct PredicateObjectIter<'a, S: SequenceAccess = crate::containers::InMemorySequence> {
+    triples: &'a TriplesBitmapGeneric<S>,
     pos_index: usize,
     max_index: usize,
 }
 
-impl<'a> PredicateObjectIter<'a> {
+impl<'a, S: SequenceAccess> PredicateObjectIter<'a, S> {
     /// Create a new iterator over all triples with the given predicate and object ID.
     /// Panics if the predicate or object ID is 0.
-    pub fn new(triples: &'a TriplesBitmap, p: Id, o: Id) -> Self {
+    pub fn new(triples: &'a TriplesBitmapGeneric<S>, p: Id, o: Id) -> Self {
         assert_ne!(0, p, "predicate 0 does not exist, cant iterate");
         assert_ne!(0, o, "object 0 does not exist, cant iterate");
         let mut low = triples.op_index.find(o);
@@ -64,7 +66,7 @@ impl<'a> PredicateObjectIter<'a> {
     }
 }
 
-impl Iterator for PredicateObjectIter<'_> {
+impl<S: SequenceAccess> Iterator for PredicateObjectIter<'_, S> {
     type Item = Id;
     fn next(&mut self) -> Option<Self::Item> {
         if self.pos_index > self.max_index {

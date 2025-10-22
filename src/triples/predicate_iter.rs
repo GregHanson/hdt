@@ -1,9 +1,10 @@
-use crate::triples::{Id, TripleId, TriplesBitmap};
+use crate::triples::{Id, TripleId, TriplesBitmapGeneric};
 use crate::containers::SequenceAccess;
 
 /// Iterator over all triples with a given property ID, answering an (?S,P,?O) query.
-pub struct PredicateIter<'a> {
-    triples: &'a TriplesBitmap,
+/// Generic over sequence access type S for TriplesBitmapGeneric.
+pub struct PredicateIter<'a, S: SequenceAccess = crate::containers::InMemorySequence> {
+    triples: &'a TriplesBitmapGeneric<S>,
     s: Id,
     p: Id,
     i: usize,
@@ -12,10 +13,10 @@ pub struct PredicateIter<'a> {
     occs: usize,
 }
 
-impl<'a> PredicateIter<'a> {
+impl<'a, S: SequenceAccess> PredicateIter<'a, S> {
     /// Create a new iterator over all triples with the given property ID.
     /// Panics if the object does not exist.
-    pub fn new(triples: &'a TriplesBitmap, p: Id) -> Self {
+    pub fn new(triples: &'a TriplesBitmapGeneric<S>, p: Id) -> Self {
         assert!(p != 0, "object 0 does not exist, cant iterate");
         let occs = triples.wavelet_y.rank(triples.wavelet_y.len(), p as usize).unwrap();
         //println!("the predicate {} is used by {} subjects in the index", p, occs);
@@ -23,7 +24,7 @@ impl<'a> PredicateIter<'a> {
     }
 }
 
-impl Iterator for PredicateIter<'_> {
+impl<S: SequenceAccess> Iterator for PredicateIter<'_, S> {
     type Item = TripleId;
     fn next(&mut self) -> Option<Self::Item> {
         if self.i >= self.occs {
@@ -44,7 +45,7 @@ impl Iterator for PredicateIter<'_> {
             self.pos_z += 1;
         }
 
-        let o = self.triples.adjlist_z.sequence.get(self.pos_z) as Id;
+        let o = self.triples.adjlist_z.get_id(self.pos_z);
         if self.os == 0 {
             self.i += 1;
         }

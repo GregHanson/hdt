@@ -1,8 +1,11 @@
-use crate::containers::{ControlInfo, control_info};
 use crate::containers::FileBasedSequence;
+use crate::containers::{ControlInfo, control_info};
 use crate::four_sect_dict::{self, IdKind};
 use crate::header::Header;
-use crate::triples::{Id, ObjectIter, OpIndex, PredicateIter, PredicateObjectIter, SubjectIter, TripleId, TriplesBitmap, TriplesBitmapGeneric, HybridCache};
+use crate::triples::{
+    HybridCache, Id, ObjectIter, OpIndex, PredicateIter, PredicateObjectIter, SubjectIter, TripleId,
+    TriplesBitmap, TriplesBitmapGeneric,
+};
 use crate::{FourSectDict, header};
 use bytesize::ByteSize;
 use log::{debug, error};
@@ -11,8 +14,8 @@ use std::fs::File;
 #[cfg(feature = "cache")]
 use std::io::{Seek, SeekFrom, Write};
 use std::iter;
-use std::sync::Arc;
 use std::path::Path;
+use std::sync::Arc;
 
 pub type Result<T> = core::result::Result<T, Error>;
 
@@ -51,6 +54,151 @@ impl<S: crate::containers::SequenceAccess> HdtGeneric<S> {
     /// Recursive size in bytes on the heap.
     pub fn size_in_bytes(&self) -> usize {
         self.dict.size_in_bytes() + self.triples.size_in_bytes()
+    }
+
+    /// An iterator visiting *all* triples as strings in order.
+    /// Using this method with a filter can be inefficient for large graphs,
+    /// because the strings are stored in compressed form and must be decompressed and allocated.
+    /// Whenever possible, use [`triples_with_pattern`] instead.
+    /// # Example
+    /// ```
+    /// fn print_first_triple(hdt: hdt::Hdt) {
+    ///     println!("{:?}", hdt.triples_all().next().expect("no triple in the graph"));
+    /// }
+    /// ```
+    pub fn triples_all(&self) -> impl Iterator<Item = StringTriple> + '_ {
+        let mut triple_cache = TripleCacheGeneric::new(self);
+        SubjectIter::new(&self.triples).map(move |ids| triple_cache.translate(ids).unwrap())
+    }
+
+    /// Get all subjects with the given property and object (?PO pattern).
+    /// Use this over `triples_with_pattern(None,Some(p),Some(o))` if you don't need whole triples.
+    /// # Example
+    /// Who was born in Leipzig?
+    /// ```
+    /// fn query(dbpedia: hdt::Hdt) {
+    ///     for person in dbpedia.subjects_with_po(
+    ///       "http://dbpedia.org/ontology/birthPlace", "http://dbpedia.org/resource/Leipzig") {
+    ///       println!("{person:?}");
+    ///     }
+    /// }
+    /// ```
+    pub fn subjects_with_po(&self, p: &str, o: &str) -> Box<dyn Iterator<Item = String> + '_> {
+        let pid = self.dict.string_to_id(p, IdKind::Predicate);
+        let oid = self.dict.string_to_id(o, IdKind::Object);
+        // predicate or object not in dictionary, iterator would interpret 0 as variable
+        if pid == 0 || oid == 0 {
+            return Box::new(iter::empty());
+        }
+        // needed for extending the lifetime of the parameters into the iterator for error messages
+        let p_owned = p.to_owned();
+        let o_owned = o.to_owned();
+        Box::new(
+            PredicateObjectIter::new(&self.triples, pid, oid)
+                .map(move |sid| self.dict.id_to_string(sid, IdKind::Subject))
+                .filter_map(move |r| {
+                    r.map_err(|e| error!("Error on triple with property {p_owned} and object {o_owned}: {e}")).ok()
+                }),
+        )
+    }
+
+    /// Get all triples that fit the given triple patterns, where `None` stands for a variable.
+    /// For example, `triples_with_pattern(Some(s), Some(p), None)` answers an SP? pattern.
+    /// # Example
+    /// What is the capital of the United States of America?
+    /// ```
+    /// fn query(dbpedia: hdt::Hdt) {
+    ///   println!("{:?}", dbpedia.triples_with_pattern(
+    ///     Some("http://dbpedia.org/resource/United_States"), Some("http://dbpedia.org/ontology/capital"), None)
+    ///     .next().expect("no capital found")[2]);
+    /// }
+    /// ```
+    pub fn triples_with_pattern<'a>(
+        &'a self, sp: Option<&'a str>, pp: Option<&'a str>, op: Option<&'a str>,
+    ) -> Box<dyn Iterator<Item = StringTriple> + 'a> {
+        let pattern: [Option<(Arc<str>, usize)>; 3] = [(0, sp), (1, pp), (2, op)]
+            .map(|(i, x)| x.map(|x| (Arc::from(x), self.dict.string_to_id(x, IdKind::KINDS[i]))));
+        // at least one term does not exist in the graph
+        if pattern.iter().flatten().any(|x| x.1 == 0) {
+            return Box::new(iter::empty());
+        }
+        // TODO: improve error handling
+        let mut cache = TripleCacheGeneric::new(self);
+        match pattern {
+            [Some(s), Some(p), Some(o)] => {
+                if SubjectIter::with_pattern(&self.triples, [s.1, p.1, o.1]).next().is_some() {
+                    Box::new(iter::once([s.0, p.0, o.0]))
+                } else {
+                    Box::new(iter::empty())
+                }
+            }
+            [Some(s), Some(p), None] => {
+                Box::new(SubjectIter::with_pattern(&self.triples, [s.1, p.1, 0]).map(move |t| {
+                    [s.0.clone(), p.0.clone(), Arc::from(self.dict.id_to_string(t[2], IdKind::Object).unwrap())]
+                }))
+            }
+            [Some(s), None, Some(o)] => {
+                Box::new(SubjectIter::with_pattern(&self.triples, [s.1, 0, o.1]).map(move |t| {
+                    [s.0.clone(), Arc::from(self.dict.id_to_string(t[1], IdKind::Predicate).unwrap()), o.0.clone()]
+                }))
+            }
+            [Some(s), None, None] => Box::new(
+                SubjectIter::with_pattern(&self.triples, [s.1, 0, 0])
+                    .map(move |t| [s.0.clone(), cache.get(1, t[1]).unwrap(), cache.get(2, t[2]).unwrap()]),
+            ),
+            [None, Some(p), Some(o)] => {
+                Box::new(PredicateObjectIter::new(&self.triples, p.1, o.1).map(move |sid| {
+                    [Arc::from(self.dict.id_to_string(sid, IdKind::Subject).unwrap()), p.0.clone(), o.0.clone()]
+                }))
+            }
+            [None, Some(p), None] => Box::new(
+                PredicateIter::new(&self.triples, p.1)
+                    .map(move |t| [cache.get(0, t[0]).unwrap(), p.0.clone(), cache.get(2, t[2]).unwrap()]),
+            ),
+            [None, None, Some(o)] => Box::new(
+                ObjectIter::new(&self.triples, o.1)
+                    .map(move |t| [cache.get(0, t[0]).unwrap(), cache.get(1, t[1]).unwrap(), o.0.clone()]),
+            ),
+            [None, None, None] => Box::new(self.triples_all()),
+        }
+    }
+}
+
+/// A TripleCacheGeneric stores the `Arc<str>` of the last returned triple (generic version)
+#[derive(Clone, Debug)]
+struct TripleCacheGeneric<'a, S: crate::containers::SequenceAccess> {
+    hdt: &'a HdtGeneric<S>,
+    tid: TripleId,
+    arc: [Option<Arc<str>>; 3],
+}
+
+impl<'a, S: crate::containers::SequenceAccess> TripleCacheGeneric<'a, S> {
+    /// Build a new [`TripleCacheGeneric`] for the given [`HdtGeneric`]
+    const fn new(hdt: &'a HdtGeneric<S>) -> Self {
+        TripleCacheGeneric { hdt, tid: [0; 3], arc: [None, None, None] }
+    }
+
+    /// Translate a triple of indexes into a triple of strings.
+    fn translate(&mut self, t: TripleId) -> core::result::Result<StringTriple, TranslateError> {
+        // refactor when try_map for arrays becomes stable
+        Ok([
+            self.get(0, t[0]).map_err(|e| TranslateError { e, t })?,
+            self.get(1, t[1]).map_err(|e| TranslateError { e, t })?,
+            self.get(2, t[2]).map_err(|e| TranslateError { e, t })?,
+        ])
+    }
+
+    fn get(&mut self, pos: usize, id: Id) -> core::result::Result<Arc<str>, four_sect_dict::ExtractError> {
+        debug_assert!(id != 0);
+        debug_assert!(pos < 3);
+        if self.tid[pos] == id {
+            Ok(self.arc[pos].as_ref().unwrap().clone())
+        } else {
+            let ret: Arc<str> = self.hdt.dict.id_to_string(id, IdKind::KINDS[pos])?.into();
+            self.arc[pos] = Some(ret.clone());
+            self.tid[pos] = id;
+            Ok(ret)
+        }
     }
 }
 
@@ -124,8 +272,7 @@ impl Hdt {
     /// let hdt = hdt::Hdt::read_with_hybrid_cache(hdt_path, cache_path).unwrap();
     /// ```
     pub fn read_with_hybrid_cache(
-        hdt_path: &Path,
-        cache_path: &Path,
+        hdt_path: &Path, cache_path: &Path,
     ) -> core::result::Result<HdtHybrid, Box<dyn std::error::Error>> {
         use crate::containers::AdjListGeneric;
         use std::fs::File;
@@ -160,13 +307,8 @@ impl Hdt {
         let op_index = OpIndex::new(cache.op_index_sequence, cache.op_index_bitmap);
 
         // Build the TriplesBitmapGeneric
-        let triples = TriplesBitmapGeneric::from_components(
-            cache.order,
-            cache.bitmap_y,
-            adjlist_z,
-            op_index,
-            wavelet_y,
-        );
+        let triples =
+            TriplesBitmapGeneric::from_components(cache.order, cache.bitmap_y, adjlist_z, op_index, wavelet_y);
 
         let hdt = HdtGeneric { header, dict, triples };
         debug!("HDT Hybrid size in memory {}, details:", ByteSize(hdt.size_in_bytes() as u64));
@@ -617,14 +759,12 @@ pub mod tests {
     #[ignore] // Ignored by default - run with `cargo test -- --ignored --nocapture`
     fn compare_load_times() -> Result<()> {
         use std::time::Instant;
-        use std::io::Seek;
 
         init();
 
-        let hdt_path = Path::new("tests/resources/tax-nodes.hdt");
-        let cache_path = Path::new("tests/resources/tax-node.hdt.cache");
+        let hdt_path = Path::new("tests/resources/snikmeta.hdt");
 
-        println!("\n📊 Comparing load times:\n");
+        println!("\n Comparing load times:\n");
 
         // First, load the entire file into memory so we can use Cursor to track positions
         let file_contents = std::fs::read(hdt_path)?;
@@ -637,69 +777,39 @@ pub mod tests {
         let in_memory_time = start.elapsed();
         let in_memory_size = hdt_in_memory.size_in_bytes();
 
-        println!("  ✓ Loaded in {:?}", in_memory_time);
-        println!("  📦 Memory usage: {}", ByteSize(in_memory_size as u64));
+        println!("   Loaded in {:?}", in_memory_time);
+        println!("   Memory usage: {}", ByteSize(in_memory_size as u64));
 
         // Generate the HybridCache by tracking file positions
         println!("\nGenerating HybridCache...");
-        let mut cursor = std::io::Cursor::new(&file_contents);
+        let cache_name = format!("{}.{}", hdt_path.to_str().unwrap(), "index.v2-rust-cache");
 
-        // Read control info (global header)
-        ControlInfo::read(&mut cursor)?;
-
-        // Read header
-        let _header = Header::read(&mut cursor)?;
-
-        // Track dictionary offset
-        let dictionary_offset = cursor.stream_position()?;
-
-        // Read dictionary
-        let unvalidated_dict = FourSectDict::read(&mut cursor)?;
-        let _dict = unvalidated_dict.validate()?;
-
-        // Track triples section offset
-        let triples_offset = cursor.stream_position()?;
-
-        // Read triples control info
-        let _triples_ci = ControlInfo::read(&mut cursor)?;
-
-        // Track sequence_z offset (after control info, this is where triples data starts)
-        let sequence_z_offset = cursor.stream_position()?;
-
-        // Generate cache from the already-loaded in-memory HDT
-        let cache = HybridCache::from_triples_bitmap(
-            &hdt_in_memory.triples,
-            sequence_z_offset,
-            dictionary_offset,
-            triples_offset,
-        );
-
-        // Write cache to file
-        cache.write_to_file(cache_path)
-            .map_err(|e| std::io::Error::other(format!("{}", e)))?;
-        println!("  ✓ Cache generated ({} bytes)", std::fs::metadata(cache_path)?.len());
+        println!("Generating HybridCache for {:?}...", hdt_path);
+        // Generate cache
+        let _ = HybridCache::write_cache_from_hdt_file(&hdt_path);
+        println!("  ✓ Cache generated ({} bytes)", std::fs::metadata(&cache_name)?.len());
 
         // Test 2: Hdt::read_with_hybrid_cache() - streaming
         println!("\nLoading with Hdt::read_with_hybrid_cache() (streaming)...");
         let start = Instant::now();
-        let hdt_hybrid = Hdt::read_with_hybrid_cache(hdt_path, cache_path)
+        let hdt_hybrid = Hdt::read_with_hybrid_cache(hdt_path, std::path::Path::new(&cache_name))
             .map_err(|e| std::io::Error::other(format!("{}", e)))?;
         let hybrid_time = start.elapsed();
         let hybrid_size = hdt_hybrid.size_in_bytes();
 
-        println!("  ✓ Loaded in {:?}", hybrid_time);
-        println!("  📦 Memory usage: {}", ByteSize(hybrid_size as u64));
+        println!("  Loaded in {:?}", hybrid_time);
+        println!("  Memory usage: {}", ByteSize(hybrid_size as u64));
 
         // Comparison
-        println!("\n📈 Results:");
+        println!("\n Results:");
         println!("  In-memory load time:  {:?}", in_memory_time);
         println!("  Hybrid load time:     {:?}", hybrid_time);
 
         let speedup = in_memory_time.as_secs_f64() / hybrid_time.as_secs_f64();
         if hybrid_time < in_memory_time {
-            println!("  ⚡ Hybrid is {:.2}x faster!", speedup);
+            println!("  Hybrid is {:.2}x faster!", speedup);
         } else {
-            println!("  ⚠️  In-memory is {:.2}x faster", 1.0 / speedup);
+            println!("   In-memory is {:.2}x faster", 1.0 / speedup);
         }
 
         println!("\n  In-memory size:  {}", ByteSize(in_memory_size as u64));
@@ -707,18 +817,29 @@ pub mod tests {
 
         let memory_saved = (in_memory_size - hybrid_size) as i64;
         if memory_saved > 0 {
-            println!("  💾 Memory saved: {} ({:.1}%)",
+            println!(
+                "  Memory saved: {} ({:.1}%)",
                 ByteSize(memory_saved as u64),
                 (memory_saved as f64 / in_memory_size as f64) * 100.0
             );
         }
 
         // Verify both work correctly by running a simple query
-        println!("\n🔍 Verifying correctness with sample query...");
+        println!("\n Verifying correctness with sample query...");
         let in_memory_count = hdt_in_memory.triples_with_pattern(None, None, None).count();
         // Note: Can't easily query HdtHybrid without implementing iterator traits
         println!("  In-memory triple count: {}", in_memory_count);
+        let start = Instant::now();
+        snikmeta_check(&hdt_in_memory)?;
+        let in_memory_time = start.elapsed();
 
+        let start = Instant::now();
+        snikmeta_check_generic(&hdt_hybrid)?;
+        let in_hybrid_time = start.elapsed();
+        // Comparison
+        println!("\n Results:");
+        println!("  In-memory check time:  {:?}", in_memory_time);
+        println!("  Hybrid check time:     {:?}", in_hybrid_time);
         Ok(())
     }
 
@@ -727,90 +848,22 @@ pub mod tests {
     #[test]
     #[ignore] // Ignored by default - run with `cargo test generate_test_cache -- --ignored --nocapture`
     fn generate_test_cache() -> Result<()> {
-        use std::io::{Seek, SeekFrom};
-
         init();
 
         let hdt_path = Path::new("tests/resources/snikmeta.hdt");
-        let cache_path = Path::new("tests/resources/snikmeta.hdt.cache");
+        let cache_name = format!("{}.{}", hdt_path.to_str().unwrap(), "index.v2-rust-cache");
 
         println!("Generating HybridCache for {:?}...", hdt_path);
-
-        // Open file and track positions while reading
-        let hdt_file = File::open(hdt_path)?;
-        let mut reader = std::io::BufReader::new(hdt_file);
-
-        // Read control info (global header)
-        ControlInfo::read(&mut reader)?;
-
-        // Read header
-        let _header = Header::read(&mut reader)?;
-
-        // Track dictionary offset
-        let dictionary_offset = reader.stream_position()?;
-        println!("  Dictionary offset: {}", dictionary_offset);
-
-        // Read dictionary
-        let unvalidated_dict = FourSectDict::read(&mut reader)?;
-        let _dict = unvalidated_dict.validate()?;
-
-        // Track triples section offset
-        let triples_offset = reader.stream_position()?;
-        println!("  Triples offset: {}", triples_offset);
-
-        // Read triples control info
-        let _triples_ci = ControlInfo::read(&mut reader)?;
-
-        // Track position before reading triples data (this is where sequence data starts)
-        let triples_data_start = reader.stream_position()?;
-
-        // Now we need to read the triples to build the structures, but we also need
-        // to track where sequence_z is located in the file. For now, we'll use
-        // Hdt::read() to get the full structure, then calculate offsets.
-
-        // Rewind to start
-        reader.seek(SeekFrom::Start(0))?;
-        let hdt = Hdt::read(&mut reader)?;
-
-        // The sequence_z offset needs to be determined by analyzing the HDT file structure.
-        // For TriplesBitmap format, the structure after control info is:
-        // - bitmap_y data
-        // - sequence_y data
-        // - bitmap_z data
-        // - sequence_z data (what we need!)
-        //
-        // Since we already read everything, we can estimate or use triples_data_start
-        // as an approximation. For a proper implementation, we'd need to track exact
-        // positions during the TriplesBitmap::read() call.
-        //
-        // For now, use a calculated offset based on file structure.
-        let sequence_z_offset = triples_data_start;
-        println!("  Sequence Z offset (estimated): {}", sequence_z_offset);
-
         // Generate cache
-        let cache = HybridCache::from_triples_bitmap(
-            &hdt.triples,
-            sequence_z_offset,
-            dictionary_offset,
-            triples_offset,
-        );
+        let _ = HybridCache::write_cache_from_hdt_file(&hdt_path);
 
-        // Write cache to file
-        cache.write_to_file(cache_path)
-            .map_err(|e| std::io::Error::other(format!("{}", e)))?;
-
-        let cache_size = std::fs::metadata(cache_path)?.len();
-        println!("\n  Cache successfully written to {:?}", cache_path);
+        let cache_size = std::fs::metadata(Path::new(&cache_name))?.len();
+        println!("\n  Cache successfully written to {:?}", &cache_name);
         println!("  Cache file size: {}", ByteSize(cache_size));
 
         // Verify the cache can be loaded
-        let _loaded_cache = HybridCache::read_from_file(cache_path)
-            .map_err(|e| std::io::Error::other(format!("{}", e)))?;
-        println!("  Cache verified - can be loaded successfully");
-
-        println!("\nYou can now run the compare_load_times test:");
-        println!("  cargo test compare_load_times -- --ignored --nocapture");
-
+        let _loaded_cache =
+            HybridCache::read_from_file(cache_name).map_err(|e| std::io::Error::other(format!("{}", e)))?;
         Ok(())
     }
 
@@ -842,6 +895,69 @@ pub mod tests {
     }
 
     fn snikmeta_check(hdt: &Hdt) -> Result<()> {
+        let triples = &hdt.triples;
+        assert_eq!(triples.bitmap_y.num_ones(), 49, "{:?}", triples.bitmap_y); // one for each subjecct
+        //assert_eq!();
+        let v: Vec<StringTriple> = hdt.triples_all().collect();
+        assert_eq!(v.len(), 328);
+        assert_eq!(hdt.dict.shared.num_strings, 43);
+        assert_eq!(hdt.dict.subjects.num_strings, 6);
+        assert_eq!(hdt.dict.predicates.num_strings, 23);
+        assert_eq!(hdt.dict.objects.num_strings, 133);
+        assert_eq!(v, hdt.triples_with_pattern(None, None, None).collect::<Vec<_>>(), "all triples not equal ???");
+        assert_ne!(0, hdt.dict.string_to_id("http://www.snik.eu/ontology/meta", IdKind::Subject));
+        for uri in ["http://www.snik.eu/ontology/meta/Top", "http://www.snik.eu/ontology/meta", "doesnotexist"] {
+            let filtered: Vec<_> = v.clone().into_iter().filter(|triple| triple[0].as_ref() == uri).collect();
+            let with_s: Vec<_> = hdt.triples_with_pattern(Some(uri), None, None).collect();
+            assert_eq!(filtered, with_s, "results differ between triples_all() and S?? query for {}", uri);
+        }
+        let s = "http://www.snik.eu/ontology/meta/Top";
+        let p = "http://www.w3.org/2000/01/rdf-schema#label";
+        let o = "\"top class\"@en";
+        let triple_vec = vec![[Arc::from(s), Arc::from(p), Arc::from(o)]];
+        // triple patterns with 2-3 terms
+        assert_eq!(triple_vec, hdt.triples_with_pattern(Some(s), Some(p), Some(o)).collect::<Vec<_>>(), "SPO");
+        assert_eq!(triple_vec, hdt.triples_with_pattern(Some(s), Some(p), None).collect::<Vec<_>>(), "SP?");
+        assert_eq!(triple_vec, hdt.triples_with_pattern(Some(s), None, Some(o)).collect::<Vec<_>>(), "S?O");
+        assert_eq!(triple_vec, hdt.triples_with_pattern(None, Some(p), Some(o)).collect::<Vec<_>>(), "?PO");
+        let et = "http://www.snik.eu/ontology/meta/EntityType";
+        let meta = "http://www.snik.eu/ontology/meta";
+        let subjects = ["ApplicationComponent", "Method", "RepresentationType", "SoftwareProduct"]
+            .map(|s| meta.to_owned() + "/" + s)
+            .to_vec();
+        assert_eq!(
+            subjects,
+            hdt.subjects_with_po("http://www.w3.org/2000/01/rdf-schema#subClassOf", et).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            12,
+            hdt.triples_with_pattern(None, Some("http://www.w3.org/2000/01/rdf-schema#subClassOf"), None).count()
+        );
+        assert_eq!(20, hdt.triples_with_pattern(None, None, Some(et)).count());
+        let snikeu = "http://www.snik.eu";
+        let triple_vec = [
+            "http://purl.org/dc/terms/publisher", "http://purl.org/dc/terms/source",
+            "http://xmlns.com/foaf/0.1/homepage",
+        ]
+        .into_iter()
+        .map(|p| [Arc::from(meta), Arc::from(p), Arc::from(snikeu)])
+        .collect::<Vec<_>>();
+        assert_eq!(
+            triple_vec,
+            hdt.triples_with_pattern(Some(meta), None, Some(snikeu)).collect::<Vec<_>>(),
+            "S?O multiple"
+        );
+        let s = "http://www.snik.eu/ontology/meta/хобби-N-0";
+        assert_eq!(hdt.dict.string_to_id(s, IdKind::Subject), 49);
+        assert_eq!(hdt.dict.id_to_string(49, IdKind::Subject)?, s);
+        let o = "\"ХОББИ\"@ru";
+        let triple_vec = vec![[Arc::from(s), Arc::from(p), Arc::from(o)]];
+        assert_eq!(hdt.triples_with_pattern(Some(s), Some(p), None).collect::<Vec<_>>(), triple_vec);
+        Ok(())
+    }
+
+    /// Generic version of snikmeta_check that works with HdtGeneric<S> (for HdtHybrid, etc.)
+    pub fn snikmeta_check_generic<S: crate::containers::SequenceAccess>(hdt: &HdtGeneric<S>) -> Result<()> {
         let triples = &hdt.triples;
         assert_eq!(triples.bitmap_y.num_ones(), 49, "{:?}", triples.bitmap_y); // one for each subjecct
         //assert_eq!();

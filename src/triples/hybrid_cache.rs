@@ -22,10 +22,18 @@
 //! [CRC32]                           (4 bytes)
 //! ```
 
+use crate::containers::AdjListGeneric;
 use crate::containers::Bitmap;
+use crate::containers::ControlInfo;
+use crate::containers::InMemorySequence;
+use crate::containers::Sequence;
 use crate::containers::SequenceAccess;
+use crate::four_sect_dict::FourSectDict;
+use crate::header::Header;
+use crate::triples::TriplesBitmapGeneric;
 use crate::triples::{Order, TriplesBitmap};
 use std::fs::File;
+use std::io::Seek;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use sucds::Serializable;
@@ -34,7 +42,8 @@ use sucds::char_sequences::WaveletMatrix;
 use sucds::int_vectors::CompactVector;
 
 const MAGIC: &[u8; 8] = b"HDTCACHE";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
+const CACHE_EXT: &str = "index.v2-rust-cache";
 
 /// Cached structures for HybridTripleAccess
 #[derive(Debug)]
@@ -54,11 +63,8 @@ pub struct HybridCache {
 
 impl HybridCache {
     /// Generate cache from TriplesBitmap
-    pub fn from_triples_bitmap(
-        triples: &TriplesBitmap,
-        sequence_z_offset: u64,
-        dictionary_offset: u64,
-        triples_offset: u64,
+    fn from_triples_bitmap(
+        triples: &TriplesBitmap, sequence_z_offset: u64, dictionary_offset: u64, triples_offset: u64,
     ) -> Self {
         Self {
             order: triples.order.clone(),
@@ -73,6 +79,58 @@ impl HybridCache {
             dictionary_offset,
             triples_offset,
         }
+    }
+
+    pub fn write_cache_from_hdt_file(hdt_path: &Path) -> Self {
+        let mut reader = std::io::BufReader::new(std::fs::File::open(&hdt_path).expect("msg"));
+        // Read control info (global header)
+        ControlInfo::read(&mut reader).expect("msg");
+
+        // Read header
+        let _header = Header::read(&mut reader).expect("msg");
+
+        // Track dictionary offset
+        let dictionary_offset = reader.stream_position().expect("msg");
+
+        // Read dictionary
+        let unvalidated_dict = FourSectDict::read(&mut reader).expect("msg");
+        let _dict = unvalidated_dict.validate().expect("msg");
+
+        // Track triples section offset
+        let triples_offset = reader.stream_position().expect("msg");
+
+        // Read triples control info
+        let triples_ci = ControlInfo::read(&mut reader).expect("msg");
+        // read bitmaps
+        let bitmap_y = Bitmap::read(&mut reader).expect("failed to read bitmap_y");
+        let bitmap_z = Bitmap::read(&mut reader).expect("failed to read bitmap_z");
+
+        // read sequences
+        let sequence_y = Sequence::read(&mut reader).expect("failed to read sequence_y");
+        // Track sequence_z offset (after control info, this is where triples data starts)
+        let sequence_z_offset = reader.stream_position().expect("msg");
+        let sequence_z = Sequence::read(&mut reader).expect("failed to read sequence_z");
+        let order: Order;
+        if let Some(n) = triples_ci.get("order").and_then(|v| v.parse::<u32>().ok()) {
+            order = Order::try_from(n).expect("msg");
+        } else {
+            panic!("unknown triples Order")
+        }
+        let adjlist_z = AdjListGeneric::new(InMemorySequence::new(sequence_z), bitmap_z);
+
+        let triples_bitmap = TriplesBitmapGeneric::new(order, sequence_y, bitmap_y, adjlist_z);
+        let c = Self::from_triples_bitmap(&triples_bitmap, sequence_z_offset, dictionary_offset, triples_offset);
+        let mut abs_path = std::fs::canonicalize(hdt_path).expect("msg");
+        let _ = abs_path.pop();
+        let index_file_name = format!("{}.{CACHE_EXT}", hdt_path.file_name().unwrap().to_str().unwrap());
+        let index_file_path = abs_path.join(index_file_name);
+
+        c.write_to_file(index_file_path).expect("msg");
+        // // Generate cache from the already-loaded in-memory HDT
+        // let cache = HybridCache::from_triples_bitmap(
+        //     &hdt_in_memory.triples, sequence_z_offset, dictionary_offset, triples_offset,
+        // );
+        c
     }
 
     /// Write cache to file
@@ -221,10 +279,9 @@ mod tests {
 
         // Generate cache with example offsets
         let cache = HybridCache::from_triples_bitmap(
-            &hdt.triples,
-            12345,  // sequence_z_offset
-            10000,  // dictionary_offset
-            20000,  // triples_offset
+            &hdt.triples, 12345, // sequence_z_offset
+            10000, // dictionary_offset
+            20000, // triples_offset
         );
 
         // Write to file

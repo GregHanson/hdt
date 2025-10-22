@@ -67,60 +67,164 @@ impl SequenceAccess for InMemorySequence {
 /// File-based sequence implementation (streams from disk)
 #[derive(Debug)]
 pub struct FileBasedSequence {
-    /// File path
-    file_path: std::path::PathBuf,
     /// File offset where sequence data starts
     data_offset: u64,
     /// Number of entries
     entries: usize,
     /// Bits per entry
     bits_per_entry_val: usize,
-    /// Cached file handle
-    file: std::sync::Arc<std::sync::Mutex<std::io::BufReader<std::fs::File>>>,
+    /// Cached file handle with position tracking
+    file: std::sync::Arc<std::sync::Mutex<PositionedReader>>,
+}
+
+/// Wrapper around BufReader that tracks the current position
+#[derive(Debug)]
+struct PositionedReader {
+    reader: std::io::BufReader<std::fs::File>,
+    /// Current position in the file (accounting for buffering)
+    position: u64,
+}
+
+impl PositionedReader {
+    fn new(reader: std::io::BufReader<std::fs::File>) -> Self {
+        Self { reader, position: 0 }
+    }
+
+    /// Seek to an absolute position, using relative seeking when possible
+    fn seek_to(&mut self, target: u64) -> std::io::Result<()> {
+        use std::io::{Seek, SeekFrom};
+
+        if self.position == target {
+            // Already at the right position
+            return Ok(());
+        }
+
+        // Calculate relative offset
+        let offset = target as i64 - self.position as i64;
+
+        // Use relative seek for efficiency
+        self.reader.seek(SeekFrom::Current(offset))?;
+        self.position = target;
+        Ok(())
+    }
+
+    /// Read exact number of bytes and update position
+    fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        use std::io::Read;
+        self.reader.read_exact(buf)?;
+        self.position += buf.len() as u64;
+        Ok(())
+    }
 }
 
 impl FileBasedSequence {
     /// Create a file-based sequence
+    ///
+    /// # Arguments
+    /// * `file_path` - Path to the HDT file
+    /// * `sequence_offset` - File offset to the START of the sequence section (including metadata)
+    /// * `expected_entries` - Expected number of entries (for validation)
+    /// * `expected_bits_per_entry` - Expected bits per entry (for validation)
+    ///
+    /// The function will read and validate the metadata, then calculate the actual data offset.
     pub fn new(
-        file_path: std::path::PathBuf,
-        data_offset: u64,
-        entries: usize,
-        bits_per_entry: usize,
+        file_path: std::path::PathBuf, sequence_offset: u64, expected_entries: usize,
+        expected_bits_per_entry: usize,
     ) -> std::io::Result<Self> {
+        use crate::containers::vbyte::read_vbyte;
+        use std::io::{Read, Seek, SeekFrom};
+
+        let file = std::fs::File::open(&file_path)?;
+        let mut reader = std::io::BufReader::new(file);
+
+        // Seek to the start of the sequence section
+        reader.seek(SeekFrom::Start(sequence_offset))?;
+
+        // Track how many bytes we read for metadata
+        let mut metadata_size = 0u64;
+
+        // Read and validate type (1 byte)
+        let mut type_buf = [0u8];
+        reader.read_exact(&mut type_buf)?;
+        metadata_size += 1;
+        if type_buf[0] != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Unsupported sequence type: {}, expected 1 (Log64)", type_buf[0]),
+            ));
+        }
+
+        // Read bits_per_entry (1 byte)
+        let mut bits_buf = [0u8];
+        reader.read_exact(&mut bits_buf)?;
+        metadata_size += 1;
+        let bits_per_entry = bits_buf[0] as usize;
+
+        // Validate bits_per_entry matches expected
+        if bits_per_entry != expected_bits_per_entry {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Bits per entry mismatch: found {} in file, expected {}",
+                    bits_per_entry, expected_bits_per_entry
+                ),
+            ));
+        }
+
+        // Read entries (variable-length vbyte)
+        let (entries, vbyte_bytes) = read_vbyte(&mut reader)?;
+        metadata_size += vbyte_bytes.len() as u64;
+
+        // Validate entries matches expected
+        if entries != expected_entries {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Entry count mismatch: found {} in file, expected {}", entries, expected_entries),
+            ));
+        }
+
+        // Skip CRC8 checksum (1 byte) - we don't validate it here for performance
+        let mut crc_buf = [0u8];
+        reader.read_exact(&mut crc_buf)?;
+        metadata_size += 1;
+
+        // Calculate the actual data offset (sequence_offset + metadata_size)
+        let data_offset = sequence_offset + metadata_size;
+
+        // Re-open file for the cached reader
         let file = std::fs::File::open(&file_path)?;
         let reader = std::io::BufReader::new(file);
+        let positioned_reader = PositionedReader::new(reader);
 
         Ok(Self {
-            file_path,
             data_offset,
             entries,
             bits_per_entry_val: bits_per_entry,
-            file: std::sync::Arc::new(std::sync::Mutex::new(reader)),
+            file: std::sync::Arc::new(std::sync::Mutex::new(positioned_reader)),
         })
     }
 
     /// Read a single value at index
     fn read_value(&self, index: usize) -> std::io::Result<usize> {
-        use std::io::{Read, Seek, SeekFrom};
-
         if index >= self.entries {
             return Ok(0);
         }
 
-        let mut reader = self.file.lock().unwrap();
+        let mut positioned_reader = self.file.lock().unwrap();
 
         // Calculate bit position
         let bit_offset = index * self.bits_per_entry_val;
         let byte_offset = bit_offset / 8;
         let bit_in_byte = bit_offset % 8;
 
-        // Seek to position
-        reader.seek(SeekFrom::Start(self.data_offset + byte_offset as u64))?;
+        // Seek to position using optimized relative seeking
+        let target_position = self.data_offset + byte_offset as u64;
+        positioned_reader.seek_to(target_position)?;
 
         // Read enough bytes
         let bytes_needed = ((self.bits_per_entry_val + bit_in_byte + 7) / 8).min(16);
         let mut buffer = vec![0u8; bytes_needed];
-        reader.read_exact(&mut buffer)?;
+        positioned_reader.read_exact(&mut buffer)?;
 
         // Extract bits
         let mut data = Vec::new();
