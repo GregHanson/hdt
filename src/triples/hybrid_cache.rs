@@ -7,27 +7,31 @@
 //! Cache file format (.hdt.cache):
 //! ```text
 //! [Magic: "HDTCACHE"]               (8 bytes)
-//! [Version: u32]                    (4 bytes)
+//! [Version: u32]                    (4 bytes) - VERSION 3
 //! [Order: u8]                       (1 byte)
-//! [Bitmap Y]                        (variable - sucds serialized)
-//! [Adjlist Z Bitmap]                (variable - sucds serialized)
-//! [Op Index Bitmap]                 (variable - sucds serialized)
 //! [Op Index Sequence]               (variable - sucds serialized CompactVector)
+//! [Op Index Bitmap]                 (variable - sucds serialized)
 //! [Wavelet Y]                       (variable - sucds serialized)
+//! [Bitmap Y Offset: u64]            (8 bytes - offset in HDT file where bitmap_y begins)
+//! [Bitmap Z Offset: u64]            (8 bytes - offset in HDT file where bitmap_z begins)
 //! [Sequence Z Offset: u64]          (8 bytes - offset in HDT file where sequence_z begins)
-//! [Sequence Z Entries: usize]       (8 bytes - number of entries in sequence_z)
-//! [Sequence Z Bits Per Entry: usize](8 bytes - bits per entry in sequence_z)
 //! [Dictionary Offset: u64]          (8 bytes - offset in HDT file where Dictionary section begins)
 //! [Triples Offset: u64]             (8 bytes - offset in HDT file where Triples section begins)
 //! [CRC32]                           (4 bytes)
 //! ```
+//!
+//! ## Design Rationale
+//! - **Stored in cache**: op_index (sequence + bitmap), wavelet_y - computed structures, expensive to rebuild
+//! - **File offsets only**: bitmap_y, bitmap_z - read directly from HDT file on-demand
+//! - **File offsets only**: sequence_z - metadata read during FileBasedSequence::new()
+//! - **Version 3 changes**: Removed bitmap_y/z data, sequence_z metadata; added bitmap_y/z offsets
 
 use crate::containers::AdjListGeneric;
 use crate::containers::Bitmap;
 use crate::containers::ControlInfo;
+use crate::containers::InMemoryBitmap;
 use crate::containers::InMemorySequence;
 use crate::containers::Sequence;
-use crate::containers::SequenceAccess;
 use crate::four_sect_dict::FourSectDict;
 use crate::header::Header;
 use crate::triples::TriplesBitmapGeneric;
@@ -42,40 +46,62 @@ use sucds::char_sequences::WaveletMatrix;
 use sucds::int_vectors::CompactVector;
 
 const MAGIC: &[u8; 8] = b"HDTCACHE";
-const VERSION: u32 = 2;
-const CACHE_EXT: &str = "index.v2-rust-cache";
+const VERSION: u32 = 3; // Version 3: Store offsets for bitmaps, not data
+const CACHE_EXT: &str = "index.v3-rust-cache";
 
 /// Cached structures for HybridTripleAccess
+///
+/// ## Storage Strategy:
+/// - **In cache**: op_index (both sequence and bitmap), wavelet_y - computed/built structures
+/// - **File offsets**: bitmap_y, bitmap_z, sequence_z - read from HDT file on-demand
 #[derive(Debug)]
 pub struct HybridCache {
+    /// Triple ordering (SPO, etc.)
     pub order: Order,
-    pub bitmap_y: Bitmap,
-    pub adjlist_z_bitmap: Bitmap,
-    pub op_index_bitmap: Bitmap,
+    /// Op-index sequence (ALWAYS in-memory, computed)
     pub op_index_sequence: CompactVector,
+    /// Op-index bitmap (ALWAYS in-memory, computed)
+    pub op_index_bitmap: Bitmap,
+    /// Wavelet matrix (ALWAYS in-memory, computed)
     pub wavelet_y: WaveletMatrix<Rank9Sel>,
+    /// File offset where bitmap_y begins in HDT file
+    pub bitmap_y_offset: u64,
+    /// File offset where bitmap_z (adjlist_z.bitmap) begins in HDT file
+    pub bitmap_z_offset: u64,
+    /// File offset where sequence_z (adjlist_z.sequence) begins in HDT file
     pub sequence_z_offset: u64,
-    pub sequence_z_entries: usize,
-    pub sequence_z_bits_per_entry: usize,
+    /// File offset where Dictionary section begins in HDT file
     pub dictionary_offset: u64,
+    /// File offset where Triples section begins in HDT file
     pub triples_offset: u64,
 }
 
 impl HybridCache {
-    /// Generate cache from TriplesBitmap
+    /// Generate cache from TriplesBitmap with file offsets
+    ///
+    /// # Arguments
+    /// * `triples` - The in-memory TriplesBitmap to extract computed structures from
+    /// * `bitmap_y_offset` - File offset where bitmap_y starts in HDT file
+    /// * `bitmap_z_offset` - File offset where bitmap_z starts in HDT file
+    /// * `sequence_z_offset` - File offset where sequence_z starts in HDT file
+    /// * `dictionary_offset` - File offset where dictionary starts in HDT file
+    /// * `triples_offset` - File offset where triples section starts in HDT file
     fn from_triples_bitmap(
-        triples: &TriplesBitmap, sequence_z_offset: u64, dictionary_offset: u64, triples_offset: u64,
+        triples: &TriplesBitmap,
+        bitmap_y_offset: u64,
+        bitmap_z_offset: u64,
+        sequence_z_offset: u64,
+        dictionary_offset: u64,
+        triples_offset: u64,
     ) -> Self {
         Self {
             order: triples.order.clone(),
-            bitmap_y: triples.bitmap_y.clone(),
-            adjlist_z_bitmap: triples.adjlist_z.bitmap.clone(),
-            op_index_bitmap: triples.op_index.bitmap.clone(),
             op_index_sequence: triples.op_index.sequence.clone(),
+            op_index_bitmap: triples.op_index.bitmap.clone(),
             wavelet_y: triples.wavelet_y.clone(),
+            bitmap_y_offset,
+            bitmap_z_offset,
             sequence_z_offset,
-            sequence_z_entries: triples.adjlist_z.sequence.len(),
-            sequence_z_bits_per_entry: triples.adjlist_z.sequence.bits_per_entry(),
             dictionary_offset,
             triples_offset,
         }
@@ -101,25 +127,39 @@ impl HybridCache {
 
         // Read triples control info
         let triples_ci = ControlInfo::read(&mut reader).expect("msg");
-        // read bitmaps
+
+        // Track bitmap_y offset BEFORE reading it
+        let bitmap_y_offset = reader.stream_position().expect("msg");
         let bitmap_y = Bitmap::read(&mut reader).expect("failed to read bitmap_y");
+
+        // Track bitmap_z offset BEFORE reading it
+        let bitmap_z_offset = reader.stream_position().expect("msg");
         let bitmap_z = Bitmap::read(&mut reader).expect("failed to read bitmap_z");
 
         // read sequences
         let sequence_y = Sequence::read(&mut reader).expect("failed to read sequence_y");
-        // Track sequence_z offset (after control info, this is where triples data starts)
+
+        // Track sequence_z offset BEFORE reading it
         let sequence_z_offset = reader.stream_position().expect("msg");
         let sequence_z = Sequence::read(&mut reader).expect("failed to read sequence_z");
+
         let order: Order;
         if let Some(n) = triples_ci.get("order").and_then(|v| v.parse::<u32>().ok()) {
             order = Order::try_from(n).expect("msg");
         } else {
             panic!("unknown triples Order")
         }
-        let adjlist_z = AdjListGeneric::new(InMemorySequence::new(sequence_z), bitmap_z);
+        let adjlist_z = AdjListGeneric::new(InMemorySequence::new(sequence_z), InMemoryBitmap::new(bitmap_z));
 
         let triples_bitmap = TriplesBitmapGeneric::new(order, sequence_y, bitmap_y, adjlist_z);
-        let c = Self::from_triples_bitmap(&triples_bitmap, sequence_z_offset, dictionary_offset, triples_offset);
+        let c = Self::from_triples_bitmap(
+            &triples_bitmap,
+            bitmap_y_offset,
+            bitmap_z_offset,
+            sequence_z_offset,
+            dictionary_offset,
+            triples_offset,
+        );
         let mut abs_path = std::fs::canonicalize(hdt_path).expect("msg");
         let _ = abs_path.pop();
         let index_file_name = format!("{}.{CACHE_EXT}", hdt_path.file_name().unwrap().to_str().unwrap());
@@ -141,33 +181,26 @@ impl HybridCache {
         // Write magic
         writer.write_all(MAGIC)?;
 
-        // Write version
+        // Write version (VERSION 3)
         writer.write_all(&VERSION.to_le_bytes())?;
 
         // Write order
         writer.write_all(&[self.order.clone() as u8])?;
 
-        // Write bitmap_y
-        self.bitmap_y.dict.serialize_into(&mut writer)?;
-
-        // Write adjlist_z.bitmap
-        self.adjlist_z_bitmap.dict.serialize_into(&mut writer)?;
+        // Write computed structures (in-memory only)
+        // Write op_index.sequence
+        self.op_index_sequence.serialize_into(&mut writer)?;
 
         // Write op_index.bitmap
         self.op_index_bitmap.dict.serialize_into(&mut writer)?;
 
-        // Write op_index.sequence
-        self.op_index_sequence.serialize_into(&mut writer)?;
-
         // Write wavelet_y
         self.wavelet_y.serialize_into(&mut writer)?;
 
-        // Write sequence_z metadata
+        // Write file offsets (bitmaps and sequences read from HDT on-demand)
+        writer.write_all(&self.bitmap_y_offset.to_le_bytes())?;
+        writer.write_all(&self.bitmap_z_offset.to_le_bytes())?;
         writer.write_all(&self.sequence_z_offset.to_le_bytes())?;
-        writer.write_all(&self.sequence_z_entries.to_le_bytes())?;
-        writer.write_all(&self.sequence_z_bits_per_entry.to_le_bytes())?;
-
-        // Write other file offsets
         writer.write_all(&self.dictionary_offset.to_le_bytes())?;
         writer.write_all(&self.triples_offset.to_le_bytes())?;
 
@@ -197,7 +230,7 @@ impl HybridCache {
         reader.read_exact(&mut version_bytes)?;
         let version = u32::from_le_bytes(version_bytes);
         if version != VERSION {
-            return Err(format!("Unsupported cache version: {}", version).into());
+            return Err(format!("Unsupported cache version: expected {}, found {}", VERSION, version).into());
         }
 
         // Read order
@@ -205,38 +238,30 @@ impl HybridCache {
         reader.read_exact(&mut order_byte)?;
         let order = Order::try_from(order_byte[0] as u32).map_err(|e| format!("Invalid order: {:?}", e))?;
 
-        // Read bitmap_y
-        let bitmap_y_dict = Rank9Sel::deserialize_from(&mut reader)?;
-        let bitmap_y = Bitmap { dict: bitmap_y_dict };
-
-        // Read adjlist_z.bitmap
-        let adjlist_z_bitmap_dict = Rank9Sel::deserialize_from(&mut reader)?;
-        let adjlist_z_bitmap = Bitmap { dict: adjlist_z_bitmap_dict };
+        // Read computed structures (in-memory)
+        // Read op_index.sequence
+        let op_index_sequence = CompactVector::deserialize_from(&mut reader)?;
 
         // Read op_index.bitmap
         let op_index_bitmap_dict = Rank9Sel::deserialize_from(&mut reader)?;
         let op_index_bitmap = Bitmap { dict: op_index_bitmap_dict };
 
-        // Read op_index.sequence
-        let op_index_sequence = CompactVector::deserialize_from(&mut reader)?;
-
         // Read wavelet_y
         let wavelet_y = WaveletMatrix::deserialize_from(&mut reader)?;
 
-        // Read sequence_z metadata
+        // Read file offsets
+        let mut bitmap_y_offset_bytes = [0u8; 8];
+        reader.read_exact(&mut bitmap_y_offset_bytes)?;
+        let bitmap_y_offset = u64::from_le_bytes(bitmap_y_offset_bytes);
+
+        let mut bitmap_z_offset_bytes = [0u8; 8];
+        reader.read_exact(&mut bitmap_z_offset_bytes)?;
+        let bitmap_z_offset = u64::from_le_bytes(bitmap_z_offset_bytes);
+
         let mut sequence_z_offset_bytes = [0u8; 8];
         reader.read_exact(&mut sequence_z_offset_bytes)?;
         let sequence_z_offset = u64::from_le_bytes(sequence_z_offset_bytes);
 
-        let mut sequence_z_entries_bytes = [0u8; 8];
-        reader.read_exact(&mut sequence_z_entries_bytes)?;
-        let sequence_z_entries = usize::from_le_bytes(sequence_z_entries_bytes);
-
-        let mut sequence_z_bits_per_entry_bytes = [0u8; 8];
-        reader.read_exact(&mut sequence_z_bits_per_entry_bytes)?;
-        let sequence_z_bits_per_entry = usize::from_le_bytes(sequence_z_bits_per_entry_bytes);
-
-        // Read other file offsets
         let mut dictionary_offset_bytes = [0u8; 8];
         reader.read_exact(&mut dictionary_offset_bytes)?;
         let dictionary_offset = u64::from_le_bytes(dictionary_offset_bytes);
@@ -251,14 +276,12 @@ impl HybridCache {
 
         Ok(Self {
             order,
-            bitmap_y,
-            adjlist_z_bitmap,
-            op_index_bitmap,
             op_index_sequence,
+            op_index_bitmap,
             wavelet_y,
+            bitmap_y_offset,
+            bitmap_z_offset,
             sequence_z_offset,
-            sequence_z_entries,
-            sequence_z_bits_per_entry,
             dictionary_offset,
             triples_offset,
         })
@@ -279,7 +302,10 @@ mod tests {
 
         // Generate cache with example offsets
         let cache = HybridCache::from_triples_bitmap(
-            &hdt.triples, 12345, // sequence_z_offset
+            &hdt.triples,
+            1000,  // bitmap_y_offset
+            2000,  // bitmap_z_offset
+            12345, // sequence_z_offset
             10000, // dictionary_offset
             20000, // triples_offset
         );
@@ -293,14 +319,12 @@ mod tests {
 
         // Verify
         assert_eq!(cache.order as u8, cache2.order as u8);
-        assert_eq!(cache.bitmap_y.len(), cache2.bitmap_y.len());
-        assert_eq!(cache.adjlist_z_bitmap.len(), cache2.adjlist_z_bitmap.len());
         assert_eq!(cache.op_index_bitmap.len(), cache2.op_index_bitmap.len());
         assert_eq!(cache.op_index_sequence.len(), cache2.op_index_sequence.len());
         assert_eq!(cache.wavelet_y.len(), cache2.wavelet_y.len());
+        assert_eq!(cache.bitmap_y_offset, cache2.bitmap_y_offset);
+        assert_eq!(cache.bitmap_z_offset, cache2.bitmap_z_offset);
         assert_eq!(cache.sequence_z_offset, cache2.sequence_z_offset);
-        assert_eq!(cache.sequence_z_entries, cache2.sequence_z_entries);
-        assert_eq!(cache.sequence_z_bits_per_entry, cache2.sequence_z_bits_per_entry);
         assert_eq!(cache.dictionary_offset, cache2.dictionary_offset);
         assert_eq!(cache.triples_offset, cache2.triples_offset);
 

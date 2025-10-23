@@ -1,5 +1,5 @@
+use crate::containers::{BitmapAccess, SequenceAccess};
 use crate::triples::{Id, TripleId, TriplesBitmapGeneric};
-use crate::containers::SequenceAccess;
 
 // see "Exchange and Consumption of Huge RDF Data" by Martinez et al. 2012
 // https://link.springer.com/chapter/10.1007/978-3-642-30284-8_36
@@ -7,18 +7,18 @@ use crate::containers::SequenceAccess;
 // TODO test with other orders and fix if broken
 
 /// Iterator over all triples with a given object ID, answering an (?S,?P,O) query.
-/// Generic over sequence access type S for TriplesBitmapGeneric.
-pub struct ObjectIter<'a, S: SequenceAccess = crate::containers::InMemorySequence> {
-    triples: &'a TriplesBitmapGeneric<S>,
+/// Generic over sequence access type S and bitmap access type B for TriplesBitmapGeneric.
+pub struct ObjectIter<'a, S: SequenceAccess = crate::containers::InMemorySequence, B: BitmapAccess = crate::containers::InMemoryBitmap> {
+    triples: &'a TriplesBitmapGeneric<S, B>,
     o: Id,
     pos_index: usize,
     max_index: usize,
 }
 
-impl<'a, S: SequenceAccess> ObjectIter<'a, S> {
+impl<'a, S: SequenceAccess, B: BitmapAccess> ObjectIter<'a, S, B> {
     /// Create a new iterator over all triples with the given object ID.
     /// Panics if the object does not exist.
-    pub fn new(triples: &'a TriplesBitmapGeneric<S>, o: Id) -> Self {
+    pub fn new(triples: &'a TriplesBitmapGeneric<S, B>, o: Id) -> Self {
         assert!(o != 0, "object 0 does not exist, cant iterate");
         let pos_index = triples.op_index.find(o);
         let max_index = triples.op_index.last(o);
@@ -27,7 +27,7 @@ impl<'a, S: SequenceAccess> ObjectIter<'a, S> {
     }
 }
 
-impl<S: SequenceAccess> Iterator for ObjectIter<'_, S> {
+impl<S: SequenceAccess, B: BitmapAccess> Iterator for ObjectIter<'_, S, B> {
     type Item = TripleId;
     fn next(&mut self) -> Option<Self::Item> {
         if self.pos_index > self.max_index {

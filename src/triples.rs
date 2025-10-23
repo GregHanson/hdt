@@ -1,7 +1,7 @@
 use crate::ControlInfo;
 use crate::containers::{
-    AdjListGeneric, Bitmap, InMemorySequence, Sequence,
-    SequenceAccess, bitmap, control_info, sequence,
+    AdjListGeneric, Bitmap, BitmapAccess, FileBasedBitmap, FileBasedSequence, InMemoryBitmap, InMemorySequence,
+    Sequence, SequenceAccess, bitmap, control_info, sequence,
 };
 use bytesize::ByteSize;
 use log::error;
@@ -170,24 +170,40 @@ impl OpIndex {
 }
 
 /// Generic `BitmapTriples` variant of the triples section.
-/// Generic over S: SequenceAccess for adjlist_z.sequence (InMemorySequence or FileBasedSequence).
-/// OpIndex is always in-memory using CompactVector directly.
+///
+/// Generic over:
+/// - S: SequenceAccess (InMemorySequence or FileBasedSequence)
+/// - B: BitmapAccess (InMemoryBitmap or FileBasedBitmap)
+///
+/// **Note:** OpIndex and wavelet_y are ALWAYS in-memory for both variants.
+/// These structures are:
+/// - Computed/built (not in HDT file)
+/// - Relatively small compared to sequences/bitmaps
+/// - Critical for query performance
+///
+/// ## Two Main Variants:
+/// 1. **All in-memory**: TriplesBitmap (traditional, fast, high memory)
+/// 2. **File-based**: TriplesBitmapFileBased (streaming, slow, minimal memory)
 //#[derive(Clone)]
-pub struct TriplesBitmapGeneric<S: SequenceAccess> {
+pub struct TriplesBitmapGeneric<S: SequenceAccess, B: BitmapAccess> {
     order: Order,
-    /// bitmap to find positions in the wavelet matrix
-    pub bitmap_y: Bitmap,
-    /// adjacency list storing the object IDs (generic over sequence access)
-    pub adjlist_z: AdjListGeneric<S>,
-    /// Index for object-based access. Points to the predicate layer.
+    /// bitmap to find positions in the wavelet matrix (generic: in-memory or file-based)
+    pub bitmap_y: B,
+    /// adjacency list storing the object IDs (generic: in-memory or file-based)
+    pub adjlist_z: AdjListGeneric<S, B>,
+    /// Index for object-based access. ALWAYS in-memory (computed, not in HDT file)
     pub op_index: OpIndex,
-    /// wavelet matrix for predicate-based access
+    /// wavelet matrix for predicate-based access. ALWAYS in-memory (computed, not in HDT file)
     pub wavelet_y: WaveletMatrix<Rank9Sel>,
 }
 
 /// Type alias for the traditional TriplesBitmap with all in-memory structures.
 /// This maintains backward compatibility with existing code.
-pub type TriplesBitmap = TriplesBitmapGeneric<InMemorySequence>;
+pub type TriplesBitmap = TriplesBitmapGeneric<InMemorySequence, InMemoryBitmap>;
+
+/// Type alias for file-based TriplesBitmap with streaming from disk.
+/// Minimal memory footprint but slower query performance.
+pub type TriplesBitmapFileBased = TriplesBitmapGeneric<FileBasedSequence, FileBasedBitmap>;
 
 #[derive(Debug)]
 pub enum Level {
@@ -233,7 +249,7 @@ pub enum Error {
     SequenceError(#[from] sequence::Error),
 }
 
-impl<S: SequenceAccess> fmt::Debug for TriplesBitmapGeneric<S> {
+impl<S: SequenceAccess, B: BitmapAccess> fmt::Debug for TriplesBitmapGeneric<S, B> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "total size {}", ByteSize(self.size_in_bytes() as u64))?;
         writeln!(f, "adjlist_z {:#?}", self.adjlist_z)?;
@@ -253,7 +269,7 @@ impl serde::Serialize for TriplesBitmap {
         // Extract the number of triples
         state.serialize_field("order", &self.order)?;
         //bitmap_y
-        state.serialize_field("bitmap_y", &self.bitmap_y)?;
+        state.serialize_field("bitmap_y", &self.bitmap_y.inner())?;
         // adjlist_z
         state.serialize_field("adjlist_z", &self.adjlist_z)?;
         // op_index
@@ -291,11 +307,14 @@ impl<'de> serde::Deserialize<'de> for TriplesBitmap {
             WaveletMatrix::<Rank9Sel>::deserialize_from(&mut bitmap_reader).map_err(serde::de::Error::custom)?;
 
         // Convert old AdjList to new generic form
-        let adjlist_z = AdjListGeneric::new(InMemorySequence::new(data.adjlist_z.sequence), data.adjlist_z.bitmap);
+        let adjlist_z = AdjListGeneric::new(
+            InMemorySequence::new(data.adjlist_z.sequence),
+            InMemoryBitmap::new(data.adjlist_z.bitmap),
+        );
 
         let bitmap = TriplesBitmap {
             order: data.order,
-            bitmap_y: data.bitmap_y,
+            bitmap_y: InMemoryBitmap::new(data.bitmap_y),
             adjlist_z,
             op_index: data.op_index,
             wavelet_y,
@@ -305,23 +324,14 @@ impl<'de> serde::Deserialize<'de> for TriplesBitmap {
     }
 }
 
-impl<S: SequenceAccess> TriplesBitmapGeneric<S> {
+impl<S: SequenceAccess, B: BitmapAccess> TriplesBitmapGeneric<S, B> {
     /// Create a new TriplesBitmapGeneric with the given components.
     /// This constructor is used for creating hybrid/streaming implementations.
     pub fn from_components(
-        order: Order,
-        bitmap_y: Bitmap,
-        adjlist_z: AdjListGeneric<S>,
-        op_index: OpIndex,
+        order: Order, bitmap_y: B, adjlist_z: AdjListGeneric<S, B>, op_index: OpIndex,
         wavelet_y: WaveletMatrix<Rank9Sel>,
     ) -> Self {
-        Self {
-            order,
-            bitmap_y,
-            adjlist_z,
-            op_index,
-            wavelet_y,
-        }
+        Self { order, bitmap_y, adjlist_z, op_index, wavelet_y }
     }
 
     /// Size in bytes on the heap.
@@ -400,16 +410,20 @@ impl<S: SequenceAccess> TriplesBitmapGeneric<S> {
     }
 }
 
-// Specialized implementation for TriplesBitmap (InMemorySequence, InMemoryCompactVector)
+// Specialized implementation for TriplesBitmap (InMemorySequence, InMemoryBitmap)
 // These methods build indexes and thus always use in-memory structures
 impl TriplesBitmap {
     /// builds the necessary indexes and constructs TriplesBitmap
-    /// Always uses InMemorySequence for adjlist_z and InMemoryCompactVector for op_index
+    /// Always uses InMemorySequence and InMemoryBitmap
     pub fn new(
-        order: Order, sequence_y: Sequence, bitmap_y: Bitmap, adjlist_z: AdjListGeneric<InMemorySequence>,
+        order: Order, sequence_y: Sequence, bitmap_y: Bitmap,
+        adjlist_z: AdjListGeneric<InMemorySequence, InMemoryBitmap>,
     ) -> Self {
         //let wavelet_thread = std::thread::spawn(|| Self::build_wavelet(sequence_y));
         let wavelet_y = Self::build_wavelet(sequence_y);
+
+        // Wrap bitmap_y in InMemoryBitmap for the generic interface
+        let bitmap_y_wrapped = InMemoryBitmap::new(bitmap_y);
 
         let entries = adjlist_z.sequence.len();
         // if it takes too long to calculate, can also pass in as parameter
@@ -455,7 +469,7 @@ impl TriplesBitmap {
         }
         let bitmap_index = Bitmap { dict: Rank9Sel::new(bitmap_index_bitvector) };
         let op_index = OpIndex::new(cv, bitmap_index);
-        Self { order, bitmap_y, adjlist_z, op_index, wavelet_y }
+        Self { order, bitmap_y: bitmap_y_wrapped, adjlist_z, op_index, wavelet_y }
     }
 }
 
@@ -466,8 +480,8 @@ impl TriplesBitmap {
     /// Only available for InMemorySequence since we need direct access to write sequences
     pub fn write(&self, write: &mut impl std::io::Write) -> Result<()> {
         ControlInfo::bitmap_triples(self.order.clone() as u32, self.adjlist_z.len() as u32).write(write)?;
-        self.bitmap_y.write(write).map_err(|e| Error::Bitmap(Level::Y, e))?;
-        self.adjlist_z.bitmap.write(write).map_err(|e| Error::Bitmap(Level::Z, e))?;
+        self.bitmap_y.inner().write(write).map_err(|e| Error::Bitmap(Level::Y, e))?;
+        self.adjlist_z.bitmap.inner().write(write).map_err(|e| Error::Bitmap(Level::Z, e))?;
         let y = self.wavelet_y.iter().collect::<Vec<_>>();
         Sequence::new(&y, self.wavelet_y.alph_width()).write(write).map_err(|e| Error::Sequence(Level::Y, e))?;
         // Access the inner Sequence for InMemorySequence to call write()
@@ -535,7 +549,7 @@ impl TriplesBitmap {
         let sequence_y = Sequence::new(&array_y, (Id::BITS - max_y.leading_zeros()) as usize);
         let sequence_z = Sequence::new(&array_z, (Id::BITS - max_z.leading_zeros()) as usize);
         // Wrap sequence_z in InMemorySequence for the generic AdjList
-        let adjlist_z = AdjListGeneric::new(InMemorySequence::new(sequence_z), bitmap_z);
+        let adjlist_z = AdjListGeneric::new(InMemorySequence::new(sequence_z), InMemoryBitmap::new(bitmap_z));
         TriplesBitmapGeneric::new(Order::SPO, sequence_y, bitmap_y, adjlist_z)
     }
 
@@ -585,7 +599,7 @@ impl TriplesBitmap {
         let sequence_y = Sequence::read(reader).map_err(|e| Error::Sequence(Level::Y, e))?;
         let sequence_z = Sequence::read(reader).map_err(|e| Error::Sequence(Level::Z, e))?;
         // Wrap sequence_z in InMemorySequence for the generic AdjList
-        let adjlist_z = AdjListGeneric::new(InMemorySequence::new(sequence_z), bitmap_z);
+        let adjlist_z = AdjListGeneric::new(InMemorySequence::new(sequence_z), InMemoryBitmap::new(bitmap_z));
 
         let triples_bitmap = TriplesBitmapGeneric::new(order, sequence_y, bitmap_y, adjlist_z);
         Ok(triples_bitmap)

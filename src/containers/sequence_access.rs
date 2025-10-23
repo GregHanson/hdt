@@ -123,14 +123,9 @@ impl FileBasedSequence {
     /// # Arguments
     /// * `file_path` - Path to the HDT file
     /// * `sequence_offset` - File offset to the START of the sequence section (including metadata)
-    /// * `expected_entries` - Expected number of entries (for validation)
-    /// * `expected_bits_per_entry` - Expected bits per entry (for validation)
     ///
     /// The function will read and validate the metadata, then calculate the actual data offset.
-    pub fn new(
-        file_path: std::path::PathBuf, sequence_offset: u64, expected_entries: usize,
-        expected_bits_per_entry: usize,
-    ) -> std::io::Result<Self> {
+    pub fn new(file_path: std::path::PathBuf, sequence_offset: u64) -> std::io::Result<Self> {
         use crate::containers::vbyte::read_vbyte;
         use std::io::{Read, Seek, SeekFrom};
 
@@ -160,28 +155,9 @@ impl FileBasedSequence {
         metadata_size += 1;
         let bits_per_entry = bits_buf[0] as usize;
 
-        // Validate bits_per_entry matches expected
-        if bits_per_entry != expected_bits_per_entry {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "Bits per entry mismatch: found {} in file, expected {}",
-                    bits_per_entry, expected_bits_per_entry
-                ),
-            ));
-        }
-
         // Read entries (variable-length vbyte)
         let (entries, vbyte_bytes) = read_vbyte(&mut reader)?;
         metadata_size += vbyte_bytes.len() as u64;
-
-        // Validate entries matches expected
-        if entries != expected_entries {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Entry count mismatch: found {} in file, expected {}", entries, expected_entries),
-            ));
-        }
 
         // Skip CRC8 checksum (1 byte) - we don't validate it here for performance
         let mut crc_buf = [0u8];

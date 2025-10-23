@@ -300,7 +300,7 @@ pub mod tests {
         let nt_triples: Vec<StringTriple> = snikmeta_nt.triples_all().collect();
 
         assert_eq!(nt_triples, hdt_triples);
-        assert_eq!(snikmeta.triples.bitmap_y.dict, snikmeta_nt.triples.bitmap_y.dict);
+        assert_eq!(snikmeta.triples.bitmap_y.inner().dict, snikmeta_nt.triples.bitmap_y.inner().dict);
         snikmeta_check(&snikmeta_nt)?;
         let path = Path::new("tests/resources/empty.nt");
         let hdt_empty = Hdt::read_nt(path)?;

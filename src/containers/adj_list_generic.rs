@@ -1,26 +1,26 @@
-//! Generic adjacency list that works with both in-memory and file-based sequences
+//! Generic adjacency list that works with both in-memory and file-based sequences and bitmaps
 
-use crate::containers::{Bitmap, sequence_access::SequenceAccess};
+use crate::containers::{bitmap_access::BitmapAccess, sequence_access::SequenceAccess};
 use crate::triples::Id;
 use std::cmp::Ordering;
 use std::fmt::Debug;
 
-/// Generic adjacency list with pluggable sequence implementation
+/// Generic adjacency list with pluggable sequence and bitmap implementations
 ///
 /// This allows AdjList to use either:
-/// - In-memory sequences (for TriplesBitmap)
-/// - File-based sequences (for hybrid approach)
+/// - In-memory sequences and bitmaps (for TriplesBitmap)
+/// - File-based sequences and bitmaps (for hybrid approach with minimal memory)
 #[derive(Debug)]
-pub struct AdjListGeneric<S: SequenceAccess> {
+pub struct AdjListGeneric<S: SequenceAccess, B: BitmapAccess> {
     /// Sequence implementation (in-memory or file-based)
     pub sequence: S,
-    /// Helper bitmap for rank/select queries (always in memory - lightweight)
-    pub bitmap: Bitmap,
+    /// Bitmap for rank/select queries (in-memory or file-based)
+    pub bitmap: B,
 }
 
-impl<S: SequenceAccess> AdjListGeneric<S> {
+impl<S: SequenceAccess, B: BitmapAccess> AdjListGeneric<S, B> {
     /// Create adjacency list with given sequence and bitmap
-    pub fn new(sequence: S, bitmap: Bitmap) -> Self {
+    pub fn new(sequence: S, bitmap: B) -> Self {
         Self { sequence, bitmap }
     }
 
@@ -31,7 +31,7 @@ impl<S: SequenceAccess> AdjListGeneric<S> {
 
     /// Whether the given position represents the last child of the parent node
     pub fn at_last_sibling(&self, word_index: usize) -> bool {
-        self.bitmap.at_last_sibling(word_index)
+        self.bitmap.access(word_index)
     }
 
     /// Get the ID at the given position
@@ -84,5 +84,11 @@ impl<S: SequenceAccess> AdjListGeneric<S> {
 }
 
 // Type aliases for convenience
-pub type AdjListInMemory = AdjListGeneric<crate::containers::sequence_access::InMemorySequence>;
-pub type AdjListFileBased = AdjListGeneric<crate::containers::sequence_access::FileBasedSequence>;
+pub type AdjListInMemory = AdjListGeneric<
+    crate::containers::sequence_access::InMemorySequence,
+    crate::containers::bitmap_access::InMemoryBitmap
+>;
+pub type AdjListFileBased = AdjListGeneric<
+    crate::containers::sequence_access::FileBasedSequence,
+    crate::containers::bitmap_access::FileBasedBitmap
+>;

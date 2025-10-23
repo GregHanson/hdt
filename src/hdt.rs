@@ -1,5 +1,5 @@
-use crate::containers::FileBasedSequence;
 use crate::containers::{ControlInfo, control_info};
+use crate::containers::{FileBasedBitmap, FileBasedSequence};
 use crate::four_sect_dict::{self, IdKind};
 use crate::header::Header;
 use crate::triples::{
@@ -42,19 +42,19 @@ pub struct Hdt {
 /// Type alias for hybrid/streaming HDT implementation using file-based sequences.
 /// Uses FileBasedSequence for adjlist_z (streaming) and OpIndex is always in-memory.
 /// Used with HybridCache for memory-efficient querying of large HDT files.
-pub type HdtHybrid = HdtGeneric<FileBasedSequence>;
+pub type HdtHybrid = HdtGeneric<FileBasedSequence, FileBasedBitmap>;
 
 /// Generic HDT structure that can work with different TriplesBitmap implementations.
 #[derive(Debug)]
-pub struct HdtGeneric<S: crate::containers::SequenceAccess> {
+pub struct HdtGeneric<S: crate::containers::SequenceAccess, B: crate::containers::BitmapAccess> {
     header: Header,
     pub dict: FourSectDict,
-    pub triples: TriplesBitmapGeneric<S>,
+    pub triples: TriplesBitmapGeneric<S, B>,
 }
 
 type StringTriple = [Arc<str>; 3];
 
-impl<S: crate::containers::SequenceAccess> HdtGeneric<S> {
+impl<S: crate::containers::SequenceAccess, B: crate::containers::BitmapAccess> HdtGeneric<S, B> {
     /// Recursive size in bytes on the heap.
     pub fn size_in_bytes(&self) -> usize {
         self.dict.size_in_bytes() + self.triples.size_in_bytes()
@@ -170,15 +170,15 @@ impl<S: crate::containers::SequenceAccess> HdtGeneric<S> {
 
 /// A TripleCacheGeneric stores the `Arc<str>` of the last returned triple (generic version)
 #[derive(Clone, Debug)]
-struct TripleCacheGeneric<'a, S: crate::containers::SequenceAccess> {
-    hdt: &'a HdtGeneric<S>,
+struct TripleCacheGeneric<'a, S: crate::containers::SequenceAccess, B: crate::containers::BitmapAccess> {
+    hdt: &'a HdtGeneric<S, B>,
     tid: TripleId,
     arc: [Option<Arc<str>>; 3],
 }
 
-impl<'a, S: crate::containers::SequenceAccess> TripleCacheGeneric<'a, S> {
+impl<'a, S: crate::containers::SequenceAccess, B: crate::containers::BitmapAccess> TripleCacheGeneric<'a, S, B> {
     /// Build a new [`TripleCacheGeneric`] for the given [`HdtGeneric`]
-    const fn new(hdt: &'a HdtGeneric<S>) -> Self {
+    const fn new(hdt: &'a HdtGeneric<S, B>) -> Self {
         TripleCacheGeneric { hdt, tid: [0; 3], arc: [None, None, None] }
     }
 
@@ -294,15 +294,11 @@ impl Hdt {
         let dict = unvalidated_dict.validate()?;
 
         // Create file-based sequence for adjlist_z using cached metadata
-        let sequence_z = FileBasedSequence::new(
-            hdt_path.to_path_buf(),
-            cache.sequence_z_offset,
-            cache.sequence_z_entries,
-            cache.sequence_z_bits_per_entry,
-        )?;
-
+        let sequence_z = FileBasedSequence::new(hdt_path.to_path_buf(), cache.sequence_z_offset)?;
+        let bitmap_z = FileBasedBitmap::new(hdt_path.to_path_buf(), cache.bitmap_z_offset)?;
+        let bitmap_y = FileBasedBitmap::new(hdt_path.to_path_buf(), cache.bitmap_y_offset)?;
         // Create file-based adjlist_z from cache metadata
-        let adjlist_z = AdjListGeneric::new(sequence_z, cache.adjlist_z_bitmap);
+        let adjlist_z = AdjListGeneric::new(sequence_z, bitmap_z);
 
         // Use the cached wavelet matrix
         let wavelet_y = cache.wavelet_y;
@@ -311,8 +307,7 @@ impl Hdt {
         let op_index = OpIndex::new(cache.op_index_sequence, cache.op_index_bitmap);
 
         // Build the TriplesBitmapGeneric
-        let triples =
-            TriplesBitmapGeneric::from_components(cache.order, cache.bitmap_y, adjlist_z, op_index, wavelet_y);
+        let triples = TriplesBitmapGeneric::from_components(cache.order, bitmap_y, adjlist_z, op_index, wavelet_y);
 
         let hdt = HdtGeneric { header, dict, triples };
         debug!("HDT Hybrid size in memory {}, details:", ByteSize(hdt.size_in_bytes() as u64));
@@ -585,7 +580,7 @@ impl<'a> TripleCache<'a> {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::tests::init;
+    use crate::{containers::BitmapAccess, tests::init};
     use color_eyre::Result;
     use fs_err::File;
     use pretty_assertions::{assert_eq, assert_ne};
@@ -683,7 +678,7 @@ pub mod tests {
 
         // Generate the HybridCache by tracking file positions
         println!("\nGenerating HybridCache...");
-        let cache_name = format!("{}.{}", hdt_path.to_str().unwrap(), "index.v2-rust-cache");
+        let cache_name = format!("{}.{}", hdt_path.to_str().unwrap(), "index.v3-rust-cache");
 
         println!("Generating HybridCache for {:?}...", hdt_path);
         // Generate cache
@@ -751,7 +746,7 @@ pub mod tests {
         init();
 
         let hdt_path = Path::new("tests/resources/snikmeta.hdt");
-        let cache_name = format!("{}.{}", hdt_path.to_str().unwrap(), "index.v2-rust-cache");
+        let cache_name = format!("{}.{}", hdt_path.to_str().unwrap(), "index.v3-rust-cache");
 
         println!("Generating HybridCache for {:?}...", hdt_path);
         // Generate cache
@@ -857,7 +852,9 @@ pub mod tests {
     }
 
     /// Generic version of snikmeta_check that works with HdtGeneric<S> (for HdtHybrid, etc.)
-    pub fn snikmeta_check_generic<S: crate::containers::SequenceAccess>(hdt: &HdtGeneric<S>) -> Result<()> {
+    pub fn snikmeta_check_generic<S: crate::containers::SequenceAccess, B: crate::containers::BitmapAccess>(
+        hdt: &HdtGeneric<S, B>,
+    ) -> Result<()> {
         let triples = &hdt.triples;
         assert_eq!(triples.bitmap_y.num_ones(), 49, "{:?}", triples.bitmap_y); // one for each subjecct
         //assert_eq!();
