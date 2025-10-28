@@ -315,6 +315,44 @@ impl Hdt {
         Ok(hdt)
     }
 
+    pub fn new_hybrid_cache(hdt_path: &Path) -> core::result::Result<HdtHybrid, Box<dyn std::error::Error>> {
+        use crate::containers::AdjListGeneric;
+        use std::fs::File;
+
+        // Load the HybridCache
+        let cache = HybridCache::from_hdt_path(hdt_path)?;
+
+        // Open HDT file and read header + dictionary
+        let hdt_file = File::open(hdt_path)?;
+        let mut reader = std::io::BufReader::new(hdt_file);
+
+        ControlInfo::read(&mut reader)?;
+        let header = Header::read(&mut reader)?;
+        let unvalidated_dict = FourSectDict::read(&mut reader)?;
+        let dict = unvalidated_dict.validate()?;
+
+        // Create file-based sequence for adjlist_z using cached metadata
+        let sequence_z = FileBasedSequence::new(hdt_path.to_path_buf(), cache.sequence_z_offset)?;
+        let bitmap_z = FileBasedBitmap::new(hdt_path.to_path_buf(), cache.bitmap_z_offset)?;
+        let bitmap_y = FileBasedBitmap::new(hdt_path.to_path_buf(), cache.bitmap_y_offset)?;
+        // Create file-based adjlist_z from cache metadata
+        let adjlist_z = AdjListGeneric::new(sequence_z, bitmap_z);
+
+        // Use the cached wavelet matrix
+        let wavelet_y = cache.wavelet_y;
+
+        // Use the cached op_index sequence (already built and stored in cache)
+        let op_index = OpIndex::new(cache.op_index_sequence, cache.op_index_bitmap);
+
+        // Build the TriplesBitmapGeneric
+        let triples = TriplesBitmapGeneric::from_components(cache.order, bitmap_y, adjlist_z, op_index, wavelet_y);
+
+        let hdt = HdtGeneric { header, dict, triples };
+        debug!("HDT Hybrid size in memory {}, details:", ByteSize(hdt.size_in_bytes() as u64));
+        debug!("{hdt:#?}");
+        Ok(hdt)
+    }
+
     /// Write as N-Triples
     #[cfg(feature = "sophia")]
     pub fn write_nt(&self, write: &mut impl std::io::Write) -> std::io::Result<()> {

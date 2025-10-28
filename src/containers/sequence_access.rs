@@ -79,19 +79,19 @@ pub struct FileBasedSequence {
 
 /// Wrapper around BufReader that tracks the current position
 #[derive(Debug)]
-struct PositionedReader {
+pub struct PositionedReader {
     reader: std::io::BufReader<std::fs::File>,
     /// Current position in the file (accounting for buffering)
     position: u64,
 }
 
 impl PositionedReader {
-    fn new(reader: std::io::BufReader<std::fs::File>) -> Self {
+    pub fn new(reader: std::io::BufReader<std::fs::File>) -> Self {
         Self { reader, position: 0 }
     }
 
     /// Seek to an absolute position, using relative seeking when possible
-    fn seek_to(&mut self, target: u64) -> std::io::Result<()> {
+    pub fn seek_to(&mut self, target: u64) -> std::io::Result<()> {
         use std::io::{Seek, SeekFrom};
 
         if self.position == target {
@@ -109,7 +109,7 @@ impl PositionedReader {
     }
 
     /// Read exact number of bytes and update position
-    fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+    pub fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
         use std::io::Read;
         self.reader.read_exact(buf)?;
         self.position += buf.len() as u64;

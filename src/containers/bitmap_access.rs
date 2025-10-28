@@ -2,6 +2,8 @@
 
 use std::fmt::Debug;
 
+use crate::containers::sequence_access::PositionedReader;
+
 /// Trait for accessing bitmaps with rank and select support
 ///
 /// This abstraction allows bitmaps to be either:
@@ -98,7 +100,7 @@ pub struct FileBasedBitmap {
     /// Number of one bits (cached during construction)
     num_ones_cached: usize,
     /// Cached file handle
-    file: std::sync::Arc<std::sync::Mutex<std::io::BufReader<std::fs::File>>>,
+    file: std::sync::Arc<std::sync::Mutex<PositionedReader>>,
 }
 
 impl FileBasedBitmap {
@@ -109,12 +111,9 @@ impl FileBasedBitmap {
     /// * `bitmap_offset` - File offset to the START of the bitmap section (including metadata)
     ///
     /// The function will read and validate the metadata, then calculate the actual data offset.
-    pub fn new(
-        file_path: std::path::PathBuf,
-        bitmap_offset: u64,
-    ) -> std::io::Result<Self> {
-        use std::io::{BufRead, Read, Seek, SeekFrom};
+    pub fn new(file_path: std::path::PathBuf, bitmap_offset: u64) -> std::io::Result<Self> {
         use crate::containers::vbyte::read_vbyte;
+        use std::io::{Read, Seek, SeekFrom};
 
         let file = std::fs::File::open(&file_path)?;
         let mut reader = std::io::BufReader::new(file);
@@ -131,7 +130,7 @@ impl FileBasedBitmap {
         if type_buf[0] != 1 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Unsupported bitmap type: {}, expected 1", type_buf[0])
+                format!("Unsupported bitmap type: {}, expected 1", type_buf[0]),
             ));
         }
 
@@ -155,8 +154,10 @@ impl FileBasedBitmap {
         let num_ones_cached = Self::count_ones(&mut reader, num_bits, num_words)?;
 
         // Re-open file for the cached reader
+        // Re-open file for the cached reader
         let file = std::fs::File::open(&file_path)?;
         let reader = std::io::BufReader::new(file);
+        let positioned_reader = PositionedReader::new(reader);
 
         Ok(Self {
             file_path,
@@ -164,7 +165,7 @@ impl FileBasedBitmap {
             num_bits,
             num_words,
             num_ones_cached,
-            file: std::sync::Arc::new(std::sync::Mutex::new(reader)),
+            file: std::sync::Arc::new(std::sync::Mutex::new(positioned_reader)),
         })
     }
 
@@ -195,11 +196,7 @@ impl FileBasedBitmap {
         }
 
         // Only count bits up to num_bits
-        let mask = if last_word_bits == 64 {
-            u64::MAX
-        } else {
-            (1u64 << last_word_bits) - 1
-        };
+        let mask = if last_word_bits == 64 { u64::MAX } else { (1u64 << last_word_bits) - 1 };
         count += (last_word & mask).count_ones() as usize;
 
         Ok(count)
@@ -207,8 +204,6 @@ impl FileBasedBitmap {
 
     /// Read a 64-bit word from the bitmap at the given word index
     fn read_word(&self, word_index: usize) -> std::io::Result<u64> {
-        use std::io::{Read, Seek, SeekFrom};
-
         if word_index >= self.num_words {
             return Ok(0);
         }
@@ -217,7 +212,7 @@ impl FileBasedBitmap {
 
         // Seek to the word position
         let byte_offset = word_index * 8;
-        reader.seek(SeekFrom::Start(self.data_offset + byte_offset as u64))?;
+        reader.seek_to(self.data_offset + byte_offset as u64)?;
 
         // Read the word
         if word_index == self.num_words - 1 {
@@ -303,11 +298,7 @@ impl BitmapAccess for FileBasedBitmap {
         let word_index = pos / 64;
         let bit_in_word = pos % 64;
 
-        if let Ok(word) = self.read_word(word_index) {
-            (word & (1u64 << bit_in_word)) != 0
-        } else {
-            false
-        }
+        if let Ok(word) = self.read_word(word_index) { (word & (1u64 << bit_in_word)) != 0 } else { false }
     }
 
     fn size_in_bytes(&self) -> usize {

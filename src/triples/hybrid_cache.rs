@@ -40,6 +40,8 @@ use std::fs::File;
 use std::io::Seek;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
+use log::debug;
+use log::warn;
 use sucds::Serializable;
 use sucds::bit_vectors::Rank9Sel;
 use sucds::char_sequences::WaveletMatrix;
@@ -77,6 +79,74 @@ pub struct HybridCache {
 }
 
 impl HybridCache {
+    /// Smart constructor: Load cache if exists, otherwise create it
+    ///
+    /// This is the recommended way to create a HybridCache. It automatically:
+    /// 1. Checks if a cache file exists for the given HDT file
+    /// 2. If found, loads the existing cache
+    /// 3. If not found, generates the cache from the HDT file and saves it
+    ///
+    /// # Arguments
+    /// * `hdt_path` - Path to the HDT file
+    ///
+    /// # Cache File Location
+    /// The cache file is stored in the same directory as the HDT file with the naming convention:
+    /// `<hdt_filename>.index.v3-rust-cache`
+    ///
+    /// # Example
+    /// ```ignore
+    /// let cache = HybridCache::from_hdt_path("data/myfile.hdt")?;
+    /// // First call: generates cache and saves to "data/myfile.hdt.index.v3-rust-cache"
+    /// // Second call: loads existing cache (much faster!)
+    /// ```
+    pub fn from_hdt_path(hdt_path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error>> {
+        let hdt_path = hdt_path.as_ref();
+
+        // Construct cache file path
+        let cache_path = Self::get_cache_path(hdt_path);
+
+        // Check if cache exists and is readable
+        if cache_path.exists() {
+            debug!("Found existing cache: {}", cache_path.display());
+            match Self::read_from_file(&cache_path) {
+                Ok(cache) => {
+                    debug!("Loaded cache successfully");
+                    return Ok(cache);
+                }
+                Err(e) => {
+                    warn!("Cache file exists but couldn't be read: {}", e);
+                    warn!("Regenerating cache...");
+                }
+            }
+        } else {
+            debug!("Cache not found, generating from HDT file...");
+        }
+
+        // Cache doesn't exist or couldn't be read - generate it
+        let cache = Self::write_cache_from_hdt_file(hdt_path);
+        debug!("Cache generated and saved to: {}", cache_path.display());
+
+        Ok(cache)
+    }
+
+    /// Get the cache file path for a given HDT file
+    pub fn get_cache_path(hdt_path: impl AsRef<Path>) -> std::path::PathBuf {
+        let hdt_path = hdt_path.as_ref();
+        let mut cache_path = hdt_path.to_path_buf();
+
+        // Get the original filename
+        let file_name = hdt_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+
+        // Append cache extension: myfile.hdt -> myfile.hdt.index.v3-rust-cache
+        let cache_file_name = format!("{}.{}", file_name, CACHE_EXT);
+        cache_path.set_file_name(cache_file_name);
+
+        cache_path
+    }
+
     /// Generate cache from TriplesBitmap with file offsets
     ///
     /// # Arguments
@@ -152,7 +222,7 @@ impl HybridCache {
         let adjlist_z = AdjListGeneric::new(InMemorySequence::new(sequence_z), InMemoryBitmap::new(bitmap_z));
 
         let triples_bitmap = TriplesBitmapGeneric::new(order, sequence_y, bitmap_y, adjlist_z);
-        let c = Self::from_triples_bitmap(
+        let cache = Self::from_triples_bitmap(
             &triples_bitmap,
             bitmap_y_offset,
             bitmap_z_offset,
@@ -160,17 +230,12 @@ impl HybridCache {
             dictionary_offset,
             triples_offset,
         );
-        let mut abs_path = std::fs::canonicalize(hdt_path).expect("msg");
-        let _ = abs_path.pop();
-        let index_file_name = format!("{}.{CACHE_EXT}", hdt_path.file_name().unwrap().to_str().unwrap());
-        let index_file_path = abs_path.join(index_file_name);
 
-        c.write_to_file(index_file_path).expect("msg");
-        // // Generate cache from the already-loaded in-memory HDT
-        // let cache = HybridCache::from_triples_bitmap(
-        //     &hdt_in_memory.triples, sequence_z_offset, dictionary_offset, triples_offset,
-        // );
-        c
+        // Write cache to file using the standard cache path
+        let cache_path = Self::get_cache_path(hdt_path);
+        cache.write_to_file(&cache_path).expect("Failed to write cache file");
+
+        cache
     }
 
     /// Write cache to file
@@ -293,6 +358,38 @@ mod tests {
     use super::*;
     use crate::Hdt;
     use std::io::BufReader;
+
+    #[test]
+    fn test_from_hdt_path() -> Result<(), Box<dyn std::error::Error>> {
+        let hdt_path = "tests/resources/snikmeta.hdt";
+        let cache_path = HybridCache::get_cache_path(hdt_path);
+
+        // Clean up any existing cache
+        let _ = std::fs::remove_file(&cache_path);
+
+        println!("\n=== Test 1: First call (should generate cache) ===");
+        let cache1 = HybridCache::from_hdt_path(hdt_path)?;
+        assert!(cache_path.exists(), "Cache file should be created");
+        println!("Cache size: {} bytes", std::fs::metadata(&cache_path)?.len());
+
+        println!("\n=== Test 2: Second call (should load existing cache) ===");
+        let cache2 = HybridCache::from_hdt_path(hdt_path)?;
+
+        // Verify both caches are identical
+        assert_eq!(cache1.order as u8, cache2.order as u8);
+        assert_eq!(cache1.op_index_sequence.len(), cache2.op_index_sequence.len());
+        assert_eq!(cache1.wavelet_y.len(), cache2.wavelet_y.len());
+        assert_eq!(cache1.bitmap_y_offset, cache2.bitmap_y_offset);
+        assert_eq!(cache1.bitmap_z_offset, cache2.bitmap_z_offset);
+        assert_eq!(cache1.sequence_z_offset, cache2.sequence_z_offset);
+
+        println!("\n✅ Both caches are identical!");
+
+        // Clean up
+        std::fs::remove_file(&cache_path)?;
+
+        Ok(())
+    }
 
     #[test]
     fn test_cache_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
