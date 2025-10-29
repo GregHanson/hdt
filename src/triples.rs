@@ -659,7 +659,7 @@ mod tests {
         let mut reader = BufReader::new(file);
         ControlInfo::read(&mut reader)?;
         Header::read(&mut reader)?;
-        let _dict = FourSectDict::read(&mut reader)?;
+        let _dict = FourSectDict::read(&mut reader, false)?;
         let triples = TriplesBitmap::read_sect(&mut reader)?;
         let v: Vec<TripleId> = triples.into_iter().collect::<Vec<TripleId>>();
         assert_eq!(v.len(), 328);

@@ -86,9 +86,9 @@ impl<S: SequenceAccess, B: BitmapAccess> AdjListGeneric<S, B> {
 // Type aliases for convenience
 pub type AdjListInMemory = AdjListGeneric<
     crate::containers::sequence_access::InMemorySequence,
-    crate::containers::bitmap_access::InMemoryBitmap
+    crate::containers::bitmap_access::InMemoryBitmap,
 >;
 pub type AdjListFileBased = AdjListGeneric<
     crate::containers::sequence_access::FileBasedSequence,
-    crate::containers::bitmap_access::FileBasedBitmap
+    crate::containers::bitmap_access::FileBasedBitmap,
 >;

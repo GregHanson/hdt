@@ -249,7 +249,7 @@ impl Hdt {
     pub fn read<R: std::io::BufRead>(mut reader: R) -> Result<Self> {
         ControlInfo::read(&mut reader)?;
         let header = Header::read(&mut reader)?;
-        let unvalidated_dict = FourSectDict::read(&mut reader)?;
+        let unvalidated_dict = FourSectDict::read(&mut reader, false)?;
         let triples = TriplesBitmap::read_sect(&mut reader)?;
         let dict = unvalidated_dict.validate()?;
         let hdt = Hdt { header, dict, triples };
@@ -258,64 +258,21 @@ impl Hdt {
         Ok(hdt)
     }
 
-    /// Creates a memory-efficient HDT instance using a HybridCache for streaming large sequences from disk.
-    /// This method loads the dictionary into memory but streams triple sequences from the HDT file,
-    /// significantly reducing memory usage for large HDT files.
+    /// Creates a memory-efficient HDT instance with automatic cache management.
     ///
     /// # Arguments
     /// * `hdt_path` - Path to the HDT file
-    /// * `cache_path` - Path to the `.hdt.cache` file containing pre-built indexes
+    /// * `skip_dict_validation` - If true, skips CRC32 validation of dictionary sections (saves ~400-1200ms)
     ///
     /// # Returns
-    /// Returns an `HdtHybrid` instance (which is `HdtGeneric<FileBasedSequence, InMemoryCompactVector>`)
+    /// Returns an `HdtHybrid` instance using file-based sequences and bitmaps for memory efficiency.
     ///
-    /// # Example
-    /// ```no_run
-    /// let hdt_path = std::path::Path::new("large_dataset.hdt");
-    /// let cache_path = std::path::Path::new("large_dataset.hdt.cache");
-    /// let hdt = hdt::Hdt::read_with_hybrid_cache(hdt_path, cache_path).unwrap();
-    /// ```
-    pub fn read_with_hybrid_cache(
-        hdt_path: &Path, cache_path: &Path,
+    /// # Performance
+    /// - With validation: Full CRC32 checks on all 4 dictionary sections
+    /// - Without validation: Only CRC8 metadata checks, ~400-1200ms faster
+    pub fn new_hybrid_cache(
+        hdt_path: &Path, skip_dict_validation: bool,
     ) -> core::result::Result<HdtHybrid, Box<dyn std::error::Error>> {
-        use crate::containers::AdjListGeneric;
-        use std::fs::File;
-
-        // Load the HybridCache
-        let cache = HybridCache::read_from_file(cache_path)?;
-
-        // Open HDT file and read header + dictionary
-        let hdt_file = File::open(hdt_path)?;
-        let mut reader = std::io::BufReader::new(hdt_file);
-
-        ControlInfo::read(&mut reader)?;
-        let header = Header::read(&mut reader)?;
-        let unvalidated_dict = FourSectDict::read(&mut reader)?;
-        let dict = unvalidated_dict.validate()?;
-
-        // Create file-based sequence for adjlist_z using cached metadata
-        let sequence_z = FileBasedSequence::new(hdt_path.to_path_buf(), cache.sequence_z_offset)?;
-        let bitmap_z = FileBasedBitmap::new(hdt_path.to_path_buf(), cache.bitmap_z_offset)?;
-        let bitmap_y = FileBasedBitmap::new(hdt_path.to_path_buf(), cache.bitmap_y_offset)?;
-        // Create file-based adjlist_z from cache metadata
-        let adjlist_z = AdjListGeneric::new(sequence_z, bitmap_z);
-
-        // Use the cached wavelet matrix
-        let wavelet_y = cache.wavelet_y;
-
-        // Use the cached op_index sequence (already built and stored in cache)
-        let op_index = OpIndex::new(cache.op_index_sequence, cache.op_index_bitmap);
-
-        // Build the TriplesBitmapGeneric
-        let triples = TriplesBitmapGeneric::from_components(cache.order, bitmap_y, adjlist_z, op_index, wavelet_y);
-
-        let hdt = HdtGeneric { header, dict, triples };
-        debug!("HDT Hybrid size in memory {}, details:", ByteSize(hdt.size_in_bytes() as u64));
-        debug!("{hdt:#?}");
-        Ok(hdt)
-    }
-
-    pub fn new_hybrid_cache(hdt_path: &Path) -> core::result::Result<HdtHybrid, Box<dyn std::error::Error>> {
         use crate::containers::AdjListGeneric;
         use std::fs::File;
 
@@ -328,8 +285,9 @@ impl Hdt {
 
         ControlInfo::read(&mut reader)?;
         let header = Header::read(&mut reader)?;
-        let unvalidated_dict = FourSectDict::read(&mut reader)?;
-        let dict = unvalidated_dict.validate()?;
+
+        // Conditionally validate dictionary based on parameter
+        let dict = FourSectDict::read(&mut reader, skip_dict_validation)?.validate()?;
 
         // Create file-based sequence for adjlist_z using cached metadata
         let sequence_z = FileBasedSequence::new(hdt_path.to_path_buf(), cache.sequence_z_offset)?;
@@ -689,6 +647,45 @@ pub mod tests {
         Ok(())
     }
 
+    /// Test that dictionary validation can be skipped
+    #[test]
+    fn test_skip_dict_validation() -> Result<()> {
+        use std::time::Instant;
+
+        init();
+
+        let hdt_path = Path::new("tests/resources/snikmeta.hdt");
+
+        // Load with validation
+        let start = Instant::now();
+        let hdt_validated =
+            Hdt::new_hybrid_cache(hdt_path, false).map_err(|e| std::io::Error::other(format!("{}", e)))?;
+        let validated_time = start.elapsed();
+
+        // Load without validation
+        let start = Instant::now();
+        let hdt_skip_validation =
+            Hdt::new_hybrid_cache(hdt_path, true).map_err(|e| std::io::Error::other(format!("{}", e)))?;
+        let skip_validation_time = start.elapsed();
+
+        println!("\nDictionary load comparison:");
+        println!("  With validation:    {:?}", validated_time);
+        println!("  Without validation: {:?}", skip_validation_time);
+
+        if skip_validation_time < validated_time {
+            println!(
+                "  Skip validation is {:.2}x faster!",
+                validated_time.as_secs_f64() / skip_validation_time.as_secs_f64()
+            );
+        }
+
+        // Verify both work correctly
+        snikmeta_check_generic(&hdt_validated)?;
+        snikmeta_check_generic(&hdt_skip_validation)?;
+
+        Ok(())
+    }
+
     /// Compare load times between Hdt::read() and Hdt::read_with_hybrid_cache()
     #[test]
     fn compare_load_times() -> Result<()> {
@@ -726,8 +723,8 @@ pub mod tests {
         // Test 2: Hdt::read_with_hybrid_cache() - streaming
         println!("\nLoading with Hdt::read_with_hybrid_cache() (streaming)...");
         let start = Instant::now();
-        let hdt_hybrid = Hdt::read_with_hybrid_cache(hdt_path, std::path::Path::new(&cache_name))
-            .map_err(|e| std::io::Error::other(format!("{}", e)))?;
+        let hdt_hybrid =
+            Hdt::new_hybrid_cache(hdt_path, false).map_err(|e| std::io::Error::other(format!("{}", e)))?;
         let hybrid_time = start.elapsed();
         let hybrid_size = hdt_hybrid.size_in_bytes();
 

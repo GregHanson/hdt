@@ -1,6 +1,7 @@
 //! Trait abstraction for sequence access - allows both in-memory and file-based implementations
 
-use std::fmt::Debug;
+use bytesize::ByteSize;
+use std::fmt::{self, Debug};
 
 /// Trait for accessing integer sequences
 ///
@@ -65,7 +66,6 @@ impl SequenceAccess for InMemorySequence {
 }
 
 /// File-based sequence implementation (streams from disk)
-#[derive(Debug)]
 pub struct FileBasedSequence {
     /// File offset where sequence data starts
     data_offset: u64,
@@ -75,6 +75,12 @@ pub struct FileBasedSequence {
     bits_per_entry_val: usize,
     /// Cached file handle with position tracking
     file: std::sync::Arc<std::sync::Mutex<PositionedReader>>,
+}
+
+impl fmt::Debug for FileBasedSequence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}, sequence read directly from file", ByteSize(self.size_in_bytes() as u64))
+    }
 }
 
 /// Wrapper around BufReader that tracks the current position

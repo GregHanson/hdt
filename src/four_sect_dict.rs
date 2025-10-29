@@ -149,13 +149,14 @@ impl FourSectDict {
     }
 
     /// read the whole dictionary section including control information
-    pub fn read<R: BufRead>(reader: &mut R) -> Result<UnvalidatedFourSectDict> {
+    pub fn read<R: BufRead>(reader: &mut R, skip_validation: bool) -> Result<UnvalidatedFourSectDict> {
         use SectKind::*;
         let dict_ci = ControlInfo::read(reader)?;
         if dict_ci.format != "<http://purl.org/HDT/hdt#dictionaryFour>" {
             return Err(Error::Other("Implementation only supports four section dictionaries".to_owned()));
         }
-        let mut f = |sect_kind| DictSectPFC::read(reader).map_err(|e| DictSectError { e, sect_kind });
+        let mut f =
+            |sect_kind| DictSectPFC::read(reader, skip_validation).map_err(|e| DictSectError { e, sect_kind });
         Ok(UnvalidatedFourSectDict([f(Shared)?, f(Subject)?, f(Predicate)?, f(Object)?]))
     }
 
@@ -214,7 +215,7 @@ mod tests {
         ControlInfo::read(&mut reader)?;
         Header::read(&mut reader)?;
 
-        let dict = FourSectDict::read(&mut reader)?.validate()?;
+        let dict = FourSectDict::read(&mut reader, false)?.validate()?;
         assert_eq!(dict.shared.num_strings(), 43, "wrong number of strings in the shared section");
         assert_eq!(dict.subjects.num_strings(), 6, "wrong number of strings in the subject section");
         assert_eq!(dict.predicates.num_strings(), 23, "wrong number of strings in the predicates section");
@@ -245,7 +246,7 @@ mod tests {
         }
         let mut buf = Vec::new();
         dict.write(&mut buf)?;
-        let dict2 = FourSectDict::read(&mut std::io::Cursor::new(buf))?.validate()?;
+        let dict2 = FourSectDict::read(&mut std::io::Cursor::new(buf), false)?.validate()?;
         assert_eq!(dict, dict2);
         Ok(())
     }

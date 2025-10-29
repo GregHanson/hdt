@@ -1,8 +1,8 @@
 //! Trait abstraction for bitmap access - allows both in-memory and file-based implementations
 
-use std::fmt::Debug;
-
 use crate::containers::sequence_access::PositionedReader;
+use bytesize::ByteSize;
+use std::fmt::{self, Debug};
 
 /// Trait for accessing bitmaps with rank and select support
 ///
@@ -87,10 +87,7 @@ impl BitmapAccess for InMemoryBitmap {
 /// - select1() is O(n) instead of O(1)
 ///
 /// Use this only when memory is extremely constrained and performance is not critical.
-#[derive(Debug)]
 pub struct FileBasedBitmap {
-    /// File path
-    file_path: std::path::PathBuf,
     /// File offset where bitmap data starts (after metadata and CRC8)
     data_offset: u64,
     /// Total number of bits in the bitmap
@@ -101,6 +98,12 @@ pub struct FileBasedBitmap {
     num_ones_cached: usize,
     /// Cached file handle
     file: std::sync::Arc<std::sync::Mutex<PositionedReader>>,
+}
+
+impl fmt::Debug for FileBasedBitmap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}, bitmap read directly from file", ByteSize(self.size_in_bytes() as u64))
+    }
 }
 
 impl FileBasedBitmap {
@@ -154,13 +157,11 @@ impl FileBasedBitmap {
         let num_ones_cached = Self::count_ones(&mut reader, num_bits, num_words)?;
 
         // Re-open file for the cached reader
-        // Re-open file for the cached reader
         let file = std::fs::File::open(&file_path)?;
         let reader = std::io::BufReader::new(file);
         let positioned_reader = PositionedReader::new(reader);
 
         Ok(Self {
-            file_path,
             data_offset,
             num_bits,
             num_words,

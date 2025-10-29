@@ -226,7 +226,7 @@ impl DictSectPFC {
     }
 
     /// Returns an unverified dictionary section together with a handle to verify the checksum.
-    pub fn read<R: BufRead>(reader: &mut R) -> Result<JoinHandle<Result<Self>>> {
+    pub fn read<R: BufRead>(reader: &mut R, skip_validation: bool) -> Result<JoinHandle<Result<Self>>> {
         let mut preamble = [0_u8];
         reader.read_exact(&mut preamble)?;
         if preamble[0] != 2 {
@@ -275,13 +275,15 @@ impl DictSectPFC {
         reader.read_exact(&mut crc_code)?;
         let cloned_data = Arc::clone(&packed_data);
         Ok(spawn(move || {
-            let crc32 = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI);
-            let mut digest32 = crc32.digest();
-            digest32.update(&cloned_data[..]);
-            let crc_calculated32 = digest32.finalize();
-            let crc_code32 = u32::from_le_bytes(crc_code);
-            if crc_calculated32 != crc_code32 {
-                return Err(Error::InvalidCrc32Checksum(crc_calculated32, crc_code32));
+            if !skip_validation {
+                let crc32 = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI);
+                let mut digest32 = crc32.digest();
+                digest32.update(&cloned_data[..]);
+                let crc_calculated32 = digest32.finalize();
+                let crc_code32 = u32::from_le_bytes(crc_code);
+                if crc_calculated32 != crc_code32 {
+                    return Err(Error::InvalidCrc32Checksum(crc_calculated32, crc_code32));
+                }
             }
             Ok(DictSectPFC { num_strings, block_size, sequence, packed_data })
         }))
@@ -395,7 +397,7 @@ mod tests {
             dict_ci.format
         );
 
-        let shared = DictSectPFC::read(&mut reader)?.join().unwrap()?;
+        let shared = DictSectPFC::read(&mut reader, false)?.join().unwrap()?;
         // the file contains IRIs that are used both as subject and object 23128
         assert_eq!(shared.num_strings, 43);
         assert_eq!(shared.packed_data.len(), 614);
@@ -409,7 +411,7 @@ mod tests {
         let data_size = (sequence.bits_per_entry * sequence.entries).div_ceil(64);
         assert_eq!(sequence.data.len(), data_size);
 
-        let subjects = DictSectPFC::read(&mut reader)?.join().unwrap()?;
+        let subjects = DictSectPFC::read(&mut reader, false)?.join().unwrap()?;
         assert_eq!(subjects.num_strings, 6);
         for term in [
             "http://www.snik.eu/ontology/meta", "http://www.snik.eu/ontology/meta/feature",
@@ -434,20 +436,20 @@ mod tests {
         ControlInfo::read(&mut reader)?;
         Header::read(&mut reader)?;
         let _ = ControlInfo::read(&mut reader)?;
-        let shared = DictSectPFC::read(&mut reader)?.join().unwrap()?;
+        let shared = DictSectPFC::read(&mut reader, false)?.join().unwrap()?;
         assert_eq!(shared.num_strings, 43);
         assert_eq!(shared.packed_data.len(), 614);
         assert_eq!(shared.block_size, 16);
 
-        let subjects = DictSectPFC::read(&mut reader)?.join().unwrap()?;
-        let predicates = DictSectPFC::read(&mut reader)?.join().unwrap()?;
-        let objects = DictSectPFC::read(&mut reader)?.join().unwrap()?;
+        let subjects = DictSectPFC::read(&mut reader, false)?.join().unwrap()?;
+        let predicates = DictSectPFC::read(&mut reader, false)?.join().unwrap()?;
+        let objects = DictSectPFC::read(&mut reader, false)?.join().unwrap()?;
 
         for sect in [shared, subjects, predicates, objects] {
             let mut buf = Vec::<u8>::new();
             sect.write(&mut buf)?;
             let mut cursor = std::io::Cursor::new(buf);
-            let sect2 = DictSectPFC::read(&mut cursor)?.join().unwrap()?;
+            let sect2 = DictSectPFC::read(&mut cursor, false)?.join().unwrap()?;
             assert_eq!(sect.num_strings, sect2.num_strings);
             assert_eq!(sect.sequence, sect2.sequence);
             assert_eq!(sect.packed_data.len(), sect2.packed_data.len());
