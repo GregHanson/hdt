@@ -114,7 +114,7 @@ impl FileBasedBitmap {
     /// * `bitmap_offset` - File offset to the START of the bitmap section (including metadata)
     ///
     /// The function will read and validate the metadata, then calculate the actual data offset.
-    pub fn new(file_path: std::path::PathBuf, bitmap_offset: u64) -> std::io::Result<Self> {
+    pub fn new(file_path: &std::path::PathBuf, bitmap_offset: u64) -> std::io::Result<Self> {
         use crate::containers::vbyte::read_vbyte;
         use std::io::{Read, Seek, SeekFrom};
 
@@ -188,7 +188,7 @@ impl FileBasedBitmap {
 
         // Read last word (byte-aligned)
         let last_word_bits = if num_bits == 0 { 0 } else { ((num_bits - 1) % 64) + 1 };
-        let last_word_bytes = (last_word_bits + 7) / 8;
+        let last_word_bytes = last_word_bits.div_ceil(8);
         let mut last_word = 0u64;
         for byte_idx in 0..last_word_bytes {
             let mut byte_buf = [0u8];
@@ -219,7 +219,7 @@ impl FileBasedBitmap {
         if word_index == self.num_words - 1 {
             // Last word is byte-aligned
             let last_word_bits = if self.num_bits == 0 { 0 } else { ((self.num_bits - 1) % 64) + 1 };
-            let last_word_bytes = (last_word_bits + 7) / 8;
+            let last_word_bytes = last_word_bits.div_ceil(8);
             let mut word = 0u64;
             for byte_idx in 0..last_word_bytes {
                 let mut byte_buf = [0u8];

@@ -16,6 +16,10 @@
 //! [Bitmap Z Offset: u64]            (8 bytes - offset in HDT file where bitmap_z begins)
 //! [Sequence Z Offset: u64]          (8 bytes - offset in HDT file where sequence_z begins)
 //! [Dictionary Offset: u64]          (8 bytes - offset in HDT file where Dictionary section begins)
+//! [Dict Shared Offset: u64]         (8 bytes - offset where shared dictionary section begins)
+//! [Dict Subjects Offset: u64]       (8 bytes - offset where subjects dictionary section begins)
+//! [Dict Predicates Offset: u64]     (8 bytes - offset where predicates dictionary section begins)
+//! [Dict Objects Offset: u64]        (8 bytes - offset where objects dictionary section begins)
 //! [Triples Offset: u64]             (8 bytes - offset in HDT file where Triples section begins)
 //! [CRC32]                           (4 bytes)
 //! ```
@@ -32,12 +36,13 @@ use crate::containers::ControlInfo;
 use crate::containers::InMemoryBitmap;
 use crate::containers::InMemorySequence;
 use crate::containers::Sequence;
-use crate::four_sect_dict::FourSectDict;
 use crate::header::Header;
 use crate::triples::TriplesBitmapGeneric;
 use crate::triples::{Order, TriplesBitmap};
+use bytesize::ByteSize;
 use log::debug;
 use log::warn;
+use std::fmt;
 use std::fs::File;
 use std::io::Seek;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -55,8 +60,7 @@ const CACHE_EXT: &str = "index.v3-rust-cache";
 ///
 /// ## Storage Strategy:
 /// - **In cache**: op_index (both sequence and bitmap), wavelet_y - computed/built structures
-/// - **File offsets**: bitmap_y, bitmap_z, sequence_z - read from HDT file on-demand
-#[derive(Debug)]
+/// - **File offsets**: bitmap_y, bitmap_z, sequence_z, dictionary sections - read from HDT file on-demand
 pub struct HybridCache {
     /// Triple ordering (SPO, etc.)
     pub order: Order,
@@ -74,8 +78,33 @@ pub struct HybridCache {
     pub sequence_z_offset: u64,
     /// File offset where Dictionary section begins in HDT file
     pub dictionary_offset: u64,
+    /// File offset where shared dictionary section begins
+    pub dict_shared_offset: u64,
+    /// File offset where subjects dictionary section begins
+    pub dict_subjects_offset: u64,
+    /// File offset where predicates dictionary section begins
+    pub dict_predicates_offset: u64,
+    /// File offset where objects dictionary section begins
+    pub dict_objects_offset: u64,
     /// File offset where Triples section begins in HDT file
     pub triples_offset: u64,
+}
+
+impl fmt::Debug for HybridCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "total size {}: {{ {} op_sequence, {} op_bitmap, {} sequence_y }}",
+            ByteSize(
+                self.op_index_sequence.size_in_bytes() as u64
+                    + self.op_index_bitmap.size_in_bytes() as u64
+                    + self.wavelet_y.size_in_bytes() as u64
+            ),
+            ByteSize(self.op_index_sequence.size_in_bytes() as u64),
+            ByteSize(self.op_index_bitmap.size_in_bytes() as u64),
+            ByteSize(self.wavelet_y.size_in_bytes() as u64),
+        )
+    }
 }
 
 impl HybridCache {
@@ -111,10 +140,11 @@ impl HybridCache {
             match Self::read_from_file(&cache_path) {
                 Ok(cache) => {
                     debug!("Loaded cache successfully");
+                    debug!("{cache:#?}");
                     return Ok(cache);
                 }
                 Err(e) => {
-                    warn!("Cache file exists but couldn't be read: {}", e);
+                    warn!("Cache file exists but couldn't be read: {e}");
                     warn!("Regenerating cache...");
                 }
             }
@@ -138,7 +168,7 @@ impl HybridCache {
         let file_name = hdt_path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
 
         // Append cache extension: myfile.hdt -> myfile.hdt.index.v3-rust-cache
-        let cache_file_name = format!("{}.{}", file_name, CACHE_EXT);
+        let cache_file_name = format!("{file_name}.{CACHE_EXT}");
         cache_path.set_file_name(cache_file_name);
 
         cache_path
@@ -152,10 +182,16 @@ impl HybridCache {
     /// * `bitmap_z_offset` - File offset where bitmap_z starts in HDT file
     /// * `sequence_z_offset` - File offset where sequence_z starts in HDT file
     /// * `dictionary_offset` - File offset where dictionary starts in HDT file
+    /// * `dict_shared_offset` - File offset where shared dictionary section starts
+    /// * `dict_subjects_offset` - File offset where subjects dictionary section starts
+    /// * `dict_predicates_offset` - File offset where predicates dictionary section starts
+    /// * `dict_objects_offset` - File offset where objects dictionary section starts
     /// * `triples_offset` - File offset where triples section starts in HDT file
+    #[allow(clippy::too_many_arguments)]
     fn from_triples_bitmap(
         triples: &TriplesBitmap, bitmap_y_offset: u64, bitmap_z_offset: u64, sequence_z_offset: u64,
-        dictionary_offset: u64, triples_offset: u64,
+        dictionary_offset: u64, dict_shared_offset: u64, dict_subjects_offset: u64, dict_predicates_offset: u64,
+        dict_objects_offset: u64, triples_offset: u64,
     ) -> Self {
         Self {
             order: triples.order.clone(),
@@ -166,24 +202,44 @@ impl HybridCache {
             bitmap_z_offset,
             sequence_z_offset,
             dictionary_offset,
+            dict_shared_offset,
+            dict_subjects_offset,
+            dict_predicates_offset,
+            dict_objects_offset,
             triples_offset,
         }
     }
 
     pub fn write_cache_from_hdt_file(hdt_path: &Path) -> Self {
-        let mut reader = std::io::BufReader::new(std::fs::File::open(&hdt_path).expect("msg"));
+        let mut reader = std::io::BufReader::new(std::fs::File::open(hdt_path).expect("msg"));
         // Read control info (global header)
         ControlInfo::read(&mut reader).expect("msg");
 
         // Read header
-        let _header = Header::read(&mut reader).expect("msg");
+        let _ = Header::read(&mut reader).expect("msg");
 
-        // Track dictionary offset
+        // Track dictionary offset (before control info)
         let dictionary_offset = reader.stream_position().expect("msg");
 
-        // Read dictionary
-        let unvalidated_dict = FourSectDict::read(&mut reader, true).expect("msg");
-        let _dict = unvalidated_dict.validate().expect("msg");
+        // Read dictionary control info
+        let _ = ControlInfo::read(&mut reader).expect("msg");
+
+        // Track offsets for each dictionary section BEFORE reading them
+        let dict_shared_offset = reader.stream_position().expect("msg");
+        let _ =
+            crate::dict_sect_pfc::DictSectPFC::read(&mut reader, true).expect("msg").join().unwrap().expect("msg");
+
+        let dict_subjects_offset = reader.stream_position().expect("msg");
+        let _ =
+            crate::dict_sect_pfc::DictSectPFC::read(&mut reader, true).expect("msg").join().unwrap().expect("msg");
+
+        let dict_predicates_offset = reader.stream_position().expect("msg");
+        let _ =
+            crate::dict_sect_pfc::DictSectPFC::read(&mut reader, true).expect("msg").join().unwrap().expect("msg");
+
+        let dict_objects_offset = reader.stream_position().expect("msg");
+        let _ =
+            crate::dict_sect_pfc::DictSectPFC::read(&mut reader, true).expect("msg").join().unwrap().expect("msg");
 
         // Track triples section offset
         let triples_offset = reader.stream_position().expect("msg");
@@ -217,8 +273,10 @@ impl HybridCache {
         let triples_bitmap = TriplesBitmapGeneric::new(order, sequence_y, bitmap_y, adjlist_z);
         let cache = Self::from_triples_bitmap(
             &triples_bitmap, bitmap_y_offset, bitmap_z_offset, sequence_z_offset, dictionary_offset,
-            triples_offset,
+            dict_shared_offset, dict_subjects_offset, dict_predicates_offset, dict_objects_offset, triples_offset,
         );
+
+        debug!("{cache:#?}");
 
         // Write cache to file using the standard cache path
         let cache_path = Self::get_cache_path(hdt_path);
@@ -251,11 +309,15 @@ impl HybridCache {
         // Write wavelet_y
         self.wavelet_y.serialize_into(&mut writer)?;
 
-        // Write file offsets (bitmaps and sequences read from HDT on-demand)
+        // Write file offsets (bitmaps, sequences, and dictionary sections read from HDT on-demand)
         writer.write_all(&self.bitmap_y_offset.to_le_bytes())?;
         writer.write_all(&self.bitmap_z_offset.to_le_bytes())?;
         writer.write_all(&self.sequence_z_offset.to_le_bytes())?;
         writer.write_all(&self.dictionary_offset.to_le_bytes())?;
+        writer.write_all(&self.dict_shared_offset.to_le_bytes())?;
+        writer.write_all(&self.dict_subjects_offset.to_le_bytes())?;
+        writer.write_all(&self.dict_predicates_offset.to_le_bytes())?;
+        writer.write_all(&self.dict_objects_offset.to_le_bytes())?;
         writer.write_all(&self.triples_offset.to_le_bytes())?;
 
         // Write CRC32 (computed over all written data)
@@ -284,13 +346,13 @@ impl HybridCache {
         reader.read_exact(&mut version_bytes)?;
         let version = u32::from_le_bytes(version_bytes);
         if version != VERSION {
-            return Err(format!("Unsupported cache version: expected {}, found {}", VERSION, version).into());
+            return Err(format!("Unsupported cache version: expected {VERSION}, found {version}").into());
         }
 
         // Read order
         let mut order_byte = [0u8];
         reader.read_exact(&mut order_byte)?;
-        let order = Order::try_from(order_byte[0] as u32).map_err(|e| format!("Invalid order: {:?}", e))?;
+        let order = Order::try_from(order_byte[0] as u32).map_err(|e| format!("Invalid order: {e}"))?;
 
         // Read computed structures (in-memory)
         // Read op_index.sequence
@@ -320,6 +382,22 @@ impl HybridCache {
         reader.read_exact(&mut dictionary_offset_bytes)?;
         let dictionary_offset = u64::from_le_bytes(dictionary_offset_bytes);
 
+        let mut dict_shared_offset_bytes = [0u8; 8];
+        reader.read_exact(&mut dict_shared_offset_bytes)?;
+        let dict_shared_offset = u64::from_le_bytes(dict_shared_offset_bytes);
+
+        let mut dict_subjects_offset_bytes = [0u8; 8];
+        reader.read_exact(&mut dict_subjects_offset_bytes)?;
+        let dict_subjects_offset = u64::from_le_bytes(dict_subjects_offset_bytes);
+
+        let mut dict_predicates_offset_bytes = [0u8; 8];
+        reader.read_exact(&mut dict_predicates_offset_bytes)?;
+        let dict_predicates_offset = u64::from_le_bytes(dict_predicates_offset_bytes);
+
+        let mut dict_objects_offset_bytes = [0u8; 8];
+        reader.read_exact(&mut dict_objects_offset_bytes)?;
+        let dict_objects_offset = u64::from_le_bytes(dict_objects_offset_bytes);
+
         let mut triples_offset_bytes = [0u8; 8];
         reader.read_exact(&mut triples_offset_bytes)?;
         let triples_offset = u64::from_le_bytes(triples_offset_bytes);
@@ -337,6 +415,10 @@ impl HybridCache {
             bitmap_z_offset,
             sequence_z_offset,
             dictionary_offset,
+            dict_shared_offset,
+            dict_subjects_offset,
+            dict_predicates_offset,
+            dict_objects_offset,
             triples_offset,
         })
     }
@@ -372,7 +454,7 @@ mod tests {
         assert_eq!(cache1.bitmap_z_offset, cache2.bitmap_z_offset);
         assert_eq!(cache1.sequence_z_offset, cache2.sequence_z_offset);
 
-        println!("\n✅ Both caches are identical!");
+        println!("\nBoth caches are identical!");
 
         // Clean up
         std::fs::remove_file(&cache_path)?;
@@ -392,6 +474,10 @@ mod tests {
             2000,  // bitmap_z_offset
             12345, // sequence_z_offset
             10000, // dictionary_offset
+            10100, // dict_shared_offset
+            10200, // dict_subjects_offset
+            10300, // dict_predicates_offset
+            10400, // dict_objects_offset
             20000, // triples_offset
         );
 
@@ -411,9 +497,13 @@ mod tests {
         assert_eq!(cache.bitmap_z_offset, cache2.bitmap_z_offset);
         assert_eq!(cache.sequence_z_offset, cache2.sequence_z_offset);
         assert_eq!(cache.dictionary_offset, cache2.dictionary_offset);
+        assert_eq!(cache.dict_shared_offset, cache2.dict_shared_offset);
+        assert_eq!(cache.dict_subjects_offset, cache2.dict_subjects_offset);
+        assert_eq!(cache.dict_predicates_offset, cache2.dict_predicates_offset);
+        assert_eq!(cache.dict_objects_offset, cache2.dict_objects_offset);
         assert_eq!(cache.triples_offset, cache2.triples_offset);
 
-        println!("✅ Cache roundtrip successful!");
+        println!("Cache roundtrip successful!");
         println!("   Cache file size: {} bytes", std::fs::metadata(cache_path)?.len());
 
         // Clean up

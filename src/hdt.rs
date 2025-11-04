@@ -6,9 +6,10 @@ use crate::triples::{
     HybridCache, Id, ObjectIter, OpIndex, PredicateIter, PredicateObjectIter, SubjectIter, TripleId,
     TriplesBitmap, TriplesBitmapGeneric,
 };
-use crate::{FourSectDict, header};
+use crate::{FileBasedDictSectPfc, FourSectDict, header};
 use bytesize::ByteSize;
 use log::{debug, error};
+use std::fs::File;
 #[cfg(feature = "cache")]
 use std::fs::File;
 #[cfg(feature = "cache")]
@@ -39,22 +40,41 @@ pub struct Hdt {
     pub triples: TriplesBitmap,
 }
 
-/// Type alias for hybrid/streaming HDT implementation using file-based sequences.
+/// Type alias for hybrid/streaming HDT implementation using file-based sequences and bitmaps, but in-memory dictionary.
 /// Uses FileBasedSequence for adjlist_z (streaming) and OpIndex is always in-memory.
 /// Used with HybridCache for memory-efficient querying of large HDT files.
-pub type HdtHybrid = HdtGeneric<FileBasedSequence, FileBasedBitmap>;
+pub type HdtHybrid = HdtGeneric<FileBasedSequence, FileBasedBitmap, FileBasedDictSectPfc>;
 
-/// Generic HDT structure that can work with different TriplesBitmap implementations.
+/// Type alias for fully file-based HDT implementation.
+/// Uses file-based sequences, bitmaps, AND dictionary sections for maximum memory efficiency.
+pub type HdtFullyFileBased =
+    HdtGeneric<FileBasedSequence, FileBasedBitmap, crate::dict_sect_pfc::FileBasedDictSectPfc>;
+
+/// Generic HDT structure that can work with different TriplesBitmap and Dictionary implementations.
+///
+/// # Generic Parameters
+/// - `S`: Sequence access implementation (InMemorySequence or FileBasedSequence)
+/// - `B`: Bitmap access implementation (InMemoryBitmap or FileBasedBitmap)
+/// - `D`: Dictionary section access implementation (DictSectPFC or FileBasedDictSectPfc)
 #[derive(Debug)]
-pub struct HdtGeneric<S: crate::containers::SequenceAccess, B: crate::containers::BitmapAccess> {
+pub struct HdtGeneric<
+    S: crate::containers::SequenceAccess,
+    B: crate::containers::BitmapAccess,
+    D: crate::dict_sect_pfc::DictSectPfcAccess,
+> {
     header: Header,
-    pub dict: FourSectDict,
+    pub dict: crate::four_sect_dict::FourSectDictGeneric<D>,
     pub triples: TriplesBitmapGeneric<S, B>,
 }
 
 type StringTriple = [Arc<str>; 3];
 
-impl<S: crate::containers::SequenceAccess, B: crate::containers::BitmapAccess> HdtGeneric<S, B> {
+impl<
+    S: crate::containers::SequenceAccess,
+    B: crate::containers::BitmapAccess,
+    D: crate::dict_sect_pfc::DictSectPfcAccess,
+> HdtGeneric<S, B, D>
+{
     /// Recursive size in bytes on the heap.
     pub fn size_in_bytes(&self) -> usize {
         self.dict.size_in_bytes() + self.triples.size_in_bytes()
@@ -170,15 +190,26 @@ impl<S: crate::containers::SequenceAccess, B: crate::containers::BitmapAccess> H
 
 /// A TripleCacheGeneric stores the `Arc<str>` of the last returned triple (generic version)
 #[derive(Clone, Debug)]
-struct TripleCacheGeneric<'a, S: crate::containers::SequenceAccess, B: crate::containers::BitmapAccess> {
-    hdt: &'a HdtGeneric<S, B>,
+struct TripleCacheGeneric<
+    'a,
+    S: crate::containers::SequenceAccess,
+    B: crate::containers::BitmapAccess,
+    D: crate::dict_sect_pfc::DictSectPfcAccess,
+> {
+    hdt: &'a HdtGeneric<S, B, D>,
     tid: TripleId,
     arc: [Option<Arc<str>>; 3],
 }
 
-impl<'a, S: crate::containers::SequenceAccess, B: crate::containers::BitmapAccess> TripleCacheGeneric<'a, S, B> {
+impl<
+    'a,
+    S: crate::containers::SequenceAccess,
+    B: crate::containers::BitmapAccess,
+    D: crate::dict_sect_pfc::DictSectPfcAccess,
+> TripleCacheGeneric<'a, S, B, D>
+{
     /// Build a new [`TripleCacheGeneric`] for the given [`HdtGeneric`]
-    const fn new(hdt: &'a HdtGeneric<S, B>) -> Self {
+    const fn new(hdt: &'a HdtGeneric<S, B, D>) -> Self {
         TripleCacheGeneric { hdt, tid: [0; 3], arc: [None, None, None] }
     }
 
@@ -271,28 +302,29 @@ impl Hdt {
     /// - With validation: Full CRC32 checks on all 4 dictionary sections
     /// - Without validation: Only CRC8 metadata checks, ~400-1200ms faster
     pub fn new_hybrid_cache(
-        hdt_path: &Path, skip_dict_validation: bool,
+        hdt_path: &Path, _skip_dict_validation: bool,
     ) -> core::result::Result<HdtHybrid, Box<dyn std::error::Error>> {
         use crate::containers::AdjListGeneric;
-        use std::fs::File;
 
         // Load the HybridCache
         let cache = HybridCache::from_hdt_path(hdt_path)?;
-
         // Open HDT file and read header + dictionary
         let hdt_file = File::open(hdt_path)?;
         let mut reader = std::io::BufReader::new(hdt_file);
 
         ControlInfo::read(&mut reader)?;
         let header = Header::read(&mut reader)?;
-
         // Conditionally validate dictionary based on parameter
-        let dict = FourSectDict::read(&mut reader, skip_dict_validation)?.validate()?;
+        let dict = FourSectDict::from_cache(
+            hdt_path, cache.dict_shared_offset, cache.dict_subjects_offset, cache.dict_predicates_offset,
+            cache.dict_objects_offset,
+        )?;
 
+        let buf = &hdt_path.to_path_buf();
         // Create file-based sequence for adjlist_z using cached metadata
-        let sequence_z = FileBasedSequence::new(hdt_path.to_path_buf(), cache.sequence_z_offset)?;
-        let bitmap_z = FileBasedBitmap::new(hdt_path.to_path_buf(), cache.bitmap_z_offset)?;
-        let bitmap_y = FileBasedBitmap::new(hdt_path.to_path_buf(), cache.bitmap_y_offset)?;
+        let sequence_z = FileBasedSequence::new(buf, cache.sequence_z_offset)?;
+        let bitmap_z = FileBasedBitmap::new(buf, cache.bitmap_z_offset)?;
+        let bitmap_y = FileBasedBitmap::new(buf, cache.bitmap_y_offset)?;
         // Create file-based adjlist_z from cache metadata
         let adjlist_z = AdjListGeneric::new(sequence_z, bitmap_z);
 
@@ -659,18 +691,18 @@ pub mod tests {
         // Load with validation
         let start = Instant::now();
         let hdt_validated =
-            Hdt::new_hybrid_cache(hdt_path, false).map_err(|e| std::io::Error::other(format!("{}", e)))?;
+            Hdt::new_hybrid_cache(hdt_path, false).map_err(|e| std::io::Error::other(format!("{e}")))?;
         let validated_time = start.elapsed();
 
         // Load without validation
         let start = Instant::now();
         let hdt_skip_validation =
-            Hdt::new_hybrid_cache(hdt_path, true).map_err(|e| std::io::Error::other(format!("{}", e)))?;
+            Hdt::new_hybrid_cache(hdt_path, true).map_err(|e| std::io::Error::other(format!("{e}")))?;
         let skip_validation_time = start.elapsed();
 
         println!("\nDictionary load comparison:");
-        println!("  With validation:    {:?}", validated_time);
-        println!("  Without validation: {:?}", skip_validation_time);
+        println!("  With validation:    {validated_time:?}");
+        println!("  Without validation: {skip_validation_time:?}");
 
         if skip_validation_time < validated_time {
             println!(
@@ -708,37 +740,37 @@ pub mod tests {
         let in_memory_time = start.elapsed();
         let in_memory_size = hdt_in_memory.size_in_bytes();
 
-        println!("   Loaded in {:?}", in_memory_time);
+        println!("   Loaded in {in_memory_time:?}");
         println!("   Memory usage: {}", ByteSize(in_memory_size as u64));
 
         // Generate the HybridCache by tracking file positions
         println!("\nGenerating HybridCache...");
         let cache_name = format!("{}.{}", hdt_path.to_str().unwrap(), "index.v3-rust-cache");
 
-        println!("Generating HybridCache for {:?}...", hdt_path);
+        println!("Generating HybridCache for {hdt_path:?}...");
         // Generate cache
-        let _ = HybridCache::write_cache_from_hdt_file(&hdt_path);
-        println!("  ✓ Cache generated ({} bytes)", std::fs::metadata(&cache_name)?.len());
+        let _ = HybridCache::write_cache_from_hdt_file(hdt_path);
+        println!("  Cache generated ({} bytes)", std::fs::metadata(&cache_name)?.len());
 
         // Test 2: Hdt::read_with_hybrid_cache() - streaming
         println!("\nLoading with Hdt::read_with_hybrid_cache() (streaming)...");
         let start = Instant::now();
         let hdt_hybrid =
-            Hdt::new_hybrid_cache(hdt_path, false).map_err(|e| std::io::Error::other(format!("{}", e)))?;
+            Hdt::new_hybrid_cache(hdt_path, false).map_err(|e| std::io::Error::other(format!("{e}")))?;
         let hybrid_time = start.elapsed();
         let hybrid_size = hdt_hybrid.size_in_bytes();
 
-        println!("  Loaded in {:?}", hybrid_time);
+        println!("  Loaded in {hybrid_time:?}");
         println!("  Memory usage: {}", ByteSize(hybrid_size as u64));
 
         // Comparison
         println!("\n Results:");
-        println!("  In-memory load time:  {:?}", in_memory_time);
-        println!("  Hybrid load time:     {:?}", hybrid_time);
+        println!("  In-memory load time:  {in_memory_time:?}");
+        println!("  Hybrid load time:     {hybrid_time:?}");
 
         let speedup = in_memory_time.as_secs_f64() / hybrid_time.as_secs_f64();
         if hybrid_time < in_memory_time {
-            println!("  Hybrid is {:.2}x faster!", speedup);
+            println!("  Hybrid is {speedup:.2}x faster!");
         } else {
             println!("   In-memory is {:.2}x faster", 1.0 / speedup);
         }
@@ -759,7 +791,7 @@ pub mod tests {
         println!("\n Verifying correctness with sample query...");
         let in_memory_count = hdt_in_memory.triples_with_pattern(None, None, None).count();
         // Note: Can't easily query HdtHybrid without implementing iterator traits
-        println!("  In-memory triple count: {}", in_memory_count);
+        println!("  In-memory triple count: {in_memory_count}");
         let start = Instant::now();
         snikmeta_check(&hdt_in_memory)?;
         let in_memory_time = start.elapsed();
@@ -769,8 +801,8 @@ pub mod tests {
         let in_hybrid_time = start.elapsed();
         // Comparison
         println!("\n Results:");
-        println!("  In-memory check time:  {:?}", in_memory_time);
-        println!("  Hybrid check time:     {:?}", in_hybrid_time);
+        println!("  In-memory check time:  {in_memory_time:?}");
+        println!("  Hybrid check time:     {in_hybrid_time:?}");
         Ok(())
     }
 
@@ -783,9 +815,9 @@ pub mod tests {
         let hdt_path = Path::new("tests/resources/snikmeta.hdt");
         let cache_name = format!("{}.{}", hdt_path.to_str().unwrap(), "index.v3-rust-cache");
 
-        println!("Generating HybridCache for {:?}...", hdt_path);
+        println!("Generating HybridCache for {hdt_path:?}...");
         // Generate cache
-        let _ = HybridCache::write_cache_from_hdt_file(&hdt_path);
+        let _ = HybridCache::write_cache_from_hdt_file(hdt_path);
 
         let cache_size = std::fs::metadata(Path::new(&cache_name))?.len();
         println!("\n  Cache successfully written to {:?}", &cache_name);
@@ -793,7 +825,7 @@ pub mod tests {
 
         // Verify the cache can be loaded
         let _loaded_cache =
-            HybridCache::read_from_file(cache_name).map_err(|e| std::io::Error::other(format!("{}", e)))?;
+            HybridCache::read_from_file(cache_name).map_err(|e| std::io::Error::other(format!("{e}")))?;
         Ok(())
     }
 
@@ -830,10 +862,10 @@ pub mod tests {
         //assert_eq!();
         let v: Vec<StringTriple> = hdt.triples_all().collect();
         assert_eq!(v.len(), 328);
-        assert_eq!(hdt.dict.shared.num_strings, 43);
-        assert_eq!(hdt.dict.subjects.num_strings, 6);
-        assert_eq!(hdt.dict.predicates.num_strings, 23);
-        assert_eq!(hdt.dict.objects.num_strings, 133);
+        assert_eq!(hdt.dict.shared.num_strings(), 43);
+        assert_eq!(hdt.dict.subjects.num_strings(), 6);
+        assert_eq!(hdt.dict.predicates.num_strings(), 23);
+        assert_eq!(hdt.dict.objects.num_strings(), 133);
         assert_eq!(v, hdt.triples_with_pattern(None, None, None).collect::<Vec<_>>(), "all triples not equal ???");
         assert_ne!(0, hdt.dict.string_to_id("http://www.snik.eu/ontology/meta", IdKind::Subject));
         for uri in ["http://www.snik.eu/ontology/meta/Top", "http://www.snik.eu/ontology/meta", "doesnotexist"] {
@@ -886,19 +918,23 @@ pub mod tests {
         Ok(())
     }
 
-    /// Generic version of snikmeta_check that works with HdtGeneric<S> (for HdtHybrid, etc.)
-    pub fn snikmeta_check_generic<S: crate::containers::SequenceAccess, B: crate::containers::BitmapAccess>(
-        hdt: &HdtGeneric<S, B>,
+    /// Generic version of snikmeta_check that works with HdtGeneric<S, B, D> (for HdtHybrid, etc.)
+    pub fn snikmeta_check_generic<
+        S: crate::containers::SequenceAccess,
+        B: crate::containers::BitmapAccess,
+        D: crate::dict_sect_pfc::DictSectPfcAccess,
+    >(
+        hdt: &HdtGeneric<S, B, D>,
     ) -> Result<()> {
         let triples = &hdt.triples;
         assert_eq!(triples.bitmap_y.num_ones(), 49, "{:?}", triples.bitmap_y); // one for each subjecct
         //assert_eq!();
         let v: Vec<StringTriple> = hdt.triples_all().collect();
         assert_eq!(v.len(), 328);
-        assert_eq!(hdt.dict.shared.num_strings, 43);
-        assert_eq!(hdt.dict.subjects.num_strings, 6);
-        assert_eq!(hdt.dict.predicates.num_strings, 23);
-        assert_eq!(hdt.dict.objects.num_strings, 133);
+        assert_eq!(hdt.dict.shared.num_strings(), 43);
+        assert_eq!(hdt.dict.subjects.num_strings(), 6);
+        assert_eq!(hdt.dict.predicates.num_strings(), 23);
+        assert_eq!(hdt.dict.objects.num_strings(), 133);
         assert_eq!(v, hdt.triples_with_pattern(None, None, None).collect::<Vec<_>>(), "all triples not equal ???");
         assert_ne!(0, hdt.dict.string_to_id("http://www.snik.eu/ontology/meta", IdKind::Subject));
         for uri in ["http://www.snik.eu/ontology/meta/Top", "http://www.snik.eu/ontology/meta", "doesnotexist"] {

@@ -21,4 +21,4 @@ pub use bitmap::Bitmap;
 pub use bitmap_access::{BitmapAccess, FileBasedBitmap, InMemoryBitmap};
 pub use control_info::{ControlInfo, ControlType};
 pub use sequence::Sequence;
-pub use sequence_access::{FileBasedSequence, InMemorySequence, SequenceAccess};
+pub use sequence_access::{FileBasedSequence, InMemorySequence, PositionedReader, SequenceAccess};

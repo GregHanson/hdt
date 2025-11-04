@@ -131,7 +131,7 @@ impl FileBasedSequence {
     /// * `sequence_offset` - File offset to the START of the sequence section (including metadata)
     ///
     /// The function will read and validate the metadata, then calculate the actual data offset.
-    pub fn new(file_path: std::path::PathBuf, sequence_offset: u64) -> std::io::Result<Self> {
+    pub fn new(file_path: &std::path::PathBuf, sequence_offset: u64) -> std::io::Result<Self> {
         use crate::containers::vbyte::read_vbyte;
         use std::io::{Read, Seek, SeekFrom};
 
@@ -204,7 +204,7 @@ impl FileBasedSequence {
         positioned_reader.seek_to(target_position)?;
 
         // Read enough bytes
-        let bytes_needed = ((self.bits_per_entry_val + bit_in_byte + 7) / 8).min(16);
+        let bytes_needed = (self.bits_per_entry_val + bit_in_byte).div_ceil(8).min(16);
         let mut buffer = vec![0u8; bytes_needed];
         positioned_reader.read_exact(&mut buffer)?;
 
