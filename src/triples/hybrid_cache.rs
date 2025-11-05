@@ -4,11 +4,13 @@
 //! structures used by HybridTripleAccess, allowing them to be prebuilt from
 //! TriplesBitmap and reused.
 //!
-//! Cache file format (.hdt.cache):
+//! Cache file format (.hdt.index.v4-rust-cache):
 //! ```text
-//! [Magic: "HDTCACHE"]               (8 bytes)
-//! [Version: u32]                    (4 bytes) - VERSION 3
-//! [Order: u8]                       (1 byte)
+//! [ControlInfo]                     (HDT ControlInfo structure with type=Index)
+//!   - format: "<http://purl.org/HDT/hdt#cacheV4>"
+//!   - properties["order"]           (SPO=1, SOP=2, PSO=3, etc.)
+//!   - properties["numTriples"]      (total number of triples)
+//!   - properties["headerSize"]      (size of HDT header section in bytes)
 //! [Op Index Sequence]               (variable - sucds serialized CompactVector)
 //! [Op Index Bitmap]                 (variable - sucds serialized)
 //! [Wavelet Y]                       (variable - sucds serialized)
@@ -21,14 +23,13 @@
 //! [Dict Predicates Offset: u64]     (8 bytes - offset where predicates dictionary section begins)
 //! [Dict Objects Offset: u64]        (8 bytes - offset where objects dictionary section begins)
 //! [Triples Offset: u64]             (8 bytes - offset in HDT file where Triples section begins)
-//! [CRC32]                           (4 bytes)
 //! ```
 //!
 //! ## Design Rationale
 //! - **Stored in cache**: op_index (sequence + bitmap), wavelet_y - computed structures, expensive to rebuild
 //! - **File offsets only**: bitmap_y, bitmap_z - read directly from HDT file on-demand
 //! - **File offsets only**: sequence_z - metadata read during FileBasedSequence::new()
-//! - **Version 3 changes**: Removed bitmap_y/z data, sequence_z metadata; added bitmap_y/z offsets
+//! - **Version 4 changes**: Use ControlInfo structure, moved order/numTriples/headerSize to properties
 
 use crate::containers::AdjListGeneric;
 use crate::containers::Bitmap;
@@ -52,18 +53,18 @@ use sucds::bit_vectors::Rank9Sel;
 use sucds::char_sequences::WaveletMatrix;
 use sucds::int_vectors::CompactVector;
 
-const MAGIC: &[u8; 8] = b"HDTCACHE";
-const VERSION: u32 = 3; // Version 3: Store offsets for bitmaps, not data
-const CACHE_EXT: &str = "index.v3-rust-cache";
+pub const CACHE_EXT: &str = "index.v4-rust-cache";
+const CACHE_FORMAT: &str = "<http://purl.org/HDT/hdt#cacheV4>";
 
 /// Cached structures for HybridTripleAccess
 ///
 /// ## Storage Strategy:
 /// - **In cache**: op_index (both sequence and bitmap), wavelet_y - computed/built structures
 /// - **File offsets**: bitmap_y, bitmap_z, sequence_z, dictionary sections - read from HDT file on-demand
+/// - **Metadata in ControlInfo**: order, numTriples, headerSize stored in properties
 pub struct HybridCache {
-    /// Triple ordering (SPO, etc.)
-    pub order: Order,
+    /// Control information containing metadata (order, numTriples, headerSize)
+    pub control_info: ControlInfo,
     /// Op-index sequence (ALWAYS in-memory, computed)
     pub op_index_sequence: CompactVector,
     /// Op-index bitmap (ALWAYS in-memory, computed)
@@ -104,6 +105,29 @@ impl fmt::Debug for HybridCache {
             ByteSize(self.op_index_bitmap.size_in_bytes() as u64),
             ByteSize(self.wavelet_y.size_in_bytes() as u64),
         )
+    }
+}
+
+impl HybridCache {
+    /// Get the triple ordering from cache metadata
+    pub fn order(&self) -> Result<Order, Box<dyn std::error::Error>> {
+        let order_str = self.control_info.get("order").ok_or("order property not found in cache")?;
+        let order_value = order_str.parse::<u8>()?;
+        Order::try_from(order_value as u32).map_err(|e| format!("Invalid order value: {e}").into())
+    }
+
+    /// Get the number of triples from cache metadata
+    pub fn num_triples(&self) -> Result<usize, Box<dyn std::error::Error>> {
+        let num_triples_str =
+            self.control_info.get("numTriples").ok_or("numTriples property not found in cache")?;
+        Ok(num_triples_str.parse::<usize>()?)
+    }
+
+    /// Get the header size from cache metadata
+    pub fn header_size(&self) -> Result<u64, Box<dyn std::error::Error>> {
+        let header_size_str =
+            self.control_info.get("headerSize").ok_or("headerSize property not found in cache")?;
+        Ok(header_size_str.parse::<u64>()?)
     }
 }
 
@@ -178,6 +202,7 @@ impl HybridCache {
     ///
     /// # Arguments
     /// * `triples` - The in-memory TriplesBitmap to extract computed structures from
+    /// * `header_size` - Size of the HDT header section in bytes
     /// * `bitmap_y_offset` - File offset where bitmap_y starts in HDT file
     /// * `bitmap_z_offset` - File offset where bitmap_z starts in HDT file
     /// * `sequence_z_offset` - File offset where sequence_z starts in HDT file
@@ -189,12 +214,24 @@ impl HybridCache {
     /// * `triples_offset` - File offset where triples section starts in HDT file
     #[allow(clippy::too_many_arguments)]
     fn from_triples_bitmap(
-        triples: &TriplesBitmap, bitmap_y_offset: u64, bitmap_z_offset: u64, sequence_z_offset: u64,
-        dictionary_offset: u64, dict_shared_offset: u64, dict_subjects_offset: u64, dict_predicates_offset: u64,
-        dict_objects_offset: u64, triples_offset: u64,
+        triples: &TriplesBitmap, header_size: u64, bitmap_y_offset: u64, bitmap_z_offset: u64,
+        sequence_z_offset: u64, dictionary_offset: u64, dict_shared_offset: u64, dict_subjects_offset: u64,
+        dict_predicates_offset: u64, dict_objects_offset: u64, triples_offset: u64,
     ) -> Self {
+        use crate::containers::ControlType;
+        use std::collections::HashMap;
+
+        // Create ControlInfo with metadata in properties
+        let mut properties = HashMap::new();
+        properties.insert("order".to_owned(), (triples.order.clone() as u8).to_string());
+        properties.insert("numTriples".to_owned(), triples.adjlist_z.len().to_string());
+        properties.insert("headerSize".to_owned(), header_size.to_string());
+
+        let control_info =
+            ControlInfo { control_type: ControlType::Index, format: CACHE_FORMAT.to_owned(), properties };
+
         Self {
-            order: triples.order.clone(),
+            control_info,
             op_index_sequence: triples.op_index.sequence.clone(),
             op_index_bitmap: triples.op_index.bitmap.clone(),
             wavelet_y: triples.wavelet_y.clone(),
@@ -215,8 +252,9 @@ impl HybridCache {
         // Read control info (global header)
         ControlInfo::read(&mut reader).expect("msg");
 
-        // Read header
-        let _ = Header::read(&mut reader).expect("msg");
+        // Read header and get its size
+        let header = Header::read(&mut reader).expect("msg");
+        let header_size = header.length as u64;
 
         // Track dictionary offset (before control info)
         let dictionary_offset = reader.stream_position().expect("msg");
@@ -272,7 +310,7 @@ impl HybridCache {
 
         let triples_bitmap = TriplesBitmapGeneric::new(order, sequence_y, bitmap_y, adjlist_z);
         let cache = Self::from_triples_bitmap(
-            &triples_bitmap, bitmap_y_offset, bitmap_z_offset, sequence_z_offset, dictionary_offset,
+            &triples_bitmap, header_size, bitmap_y_offset, bitmap_z_offset, sequence_z_offset, dictionary_offset,
             dict_shared_offset, dict_subjects_offset, dict_predicates_offset, dict_objects_offset, triples_offset,
         );
 
@@ -290,14 +328,8 @@ impl HybridCache {
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
 
-        // Write magic
-        writer.write_all(MAGIC)?;
-
-        // Write version (VERSION 3)
-        writer.write_all(&VERSION.to_le_bytes())?;
-
-        // Write order
-        writer.write_all(&[self.order.clone() as u8])?;
+        // Write ControlInfo (replaces magic + version + order)
+        self.control_info.write(&mut writer)?;
 
         // Write computed structures (in-memory only)
         // Write op_index.sequence
@@ -320,11 +352,6 @@ impl HybridCache {
         writer.write_all(&self.dict_objects_offset.to_le_bytes())?;
         writer.write_all(&self.triples_offset.to_le_bytes())?;
 
-        // Write CRC32 (computed over all written data)
-        // For simplicity, we'll skip CRC for now (TODO: add later)
-        let crc: u32 = 0;
-        writer.write_all(&crc.to_le_bytes())?;
-
         writer.flush()?;
         Ok(())
     }
@@ -334,25 +361,27 @@ impl HybridCache {
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
 
-        // Read and verify magic
-        let mut magic = [0u8; 8];
-        reader.read_exact(&mut magic)?;
-        if &magic != MAGIC {
-            return Err("Invalid cache file magic".into());
+        // Read and verify ControlInfo
+        let control_info = ControlInfo::read(&mut reader)?;
+
+        // Verify it's an Index type
+        use crate::containers::ControlType;
+        if control_info.control_type != ControlType::Index {
+            return Err(format!(
+                "Invalid cache file: expected Index control type, found {:?}",
+                control_info.control_type
+            )
+            .into());
         }
 
-        // Read version
-        let mut version_bytes = [0u8; 4];
-        reader.read_exact(&mut version_bytes)?;
-        let version = u32::from_le_bytes(version_bytes);
-        if version != VERSION {
-            return Err(format!("Unsupported cache version: expected {VERSION}, found {version}").into());
+        // Verify format
+        if control_info.format != CACHE_FORMAT {
+            return Err(format!(
+                "Unsupported cache format: expected {}, found {}",
+                CACHE_FORMAT, control_info.format
+            )
+            .into());
         }
-
-        // Read order
-        let mut order_byte = [0u8];
-        reader.read_exact(&mut order_byte)?;
-        let order = Order::try_from(order_byte[0] as u32).map_err(|e| format!("Invalid order: {e}"))?;
 
         // Read computed structures (in-memory)
         // Read op_index.sequence
@@ -402,12 +431,8 @@ impl HybridCache {
         reader.read_exact(&mut triples_offset_bytes)?;
         let triples_offset = u64::from_le_bytes(triples_offset_bytes);
 
-        // Read CRC32 (skip validation for now)
-        let mut _crc_bytes = [0u8; 4];
-        reader.read_exact(&mut _crc_bytes)?;
-
         Ok(Self {
-            order,
+            control_info,
             op_index_sequence,
             op_index_bitmap,
             wavelet_y,
@@ -447,7 +472,7 @@ mod tests {
         let cache2 = HybridCache::from_hdt_path(hdt_path)?;
 
         // Verify both caches are identical
-        assert_eq!(cache1.order as u8, cache2.order as u8);
+        assert_eq!(cache1.order()? as u8, cache2.order()? as u8);
         assert_eq!(cache1.op_index_sequence.len(), cache2.op_index_sequence.len());
         assert_eq!(cache1.wavelet_y.len(), cache2.wavelet_y.len());
         assert_eq!(cache1.bitmap_y_offset, cache2.bitmap_y_offset);
@@ -470,7 +495,8 @@ mod tests {
 
         // Generate cache with example offsets
         let cache = HybridCache::from_triples_bitmap(
-            &hdt.triples, 1000,  // bitmap_y_offset
+            &hdt.triples, 5000,  // header_size
+            1000,  // bitmap_y_offset
             2000,  // bitmap_z_offset
             12345, // sequence_z_offset
             10000, // dictionary_offset
@@ -489,7 +515,9 @@ mod tests {
         let cache2 = HybridCache::read_from_file(cache_path)?;
 
         // Verify
-        assert_eq!(cache.order as u8, cache2.order as u8);
+        assert_eq!(cache.order()? as u8, cache2.order()? as u8);
+        assert_eq!(cache.num_triples()?, cache2.num_triples()?);
+        assert_eq!(cache.header_size()?, cache2.header_size()?);
         assert_eq!(cache.op_index_bitmap.len(), cache2.op_index_bitmap.len());
         assert_eq!(cache.op_index_sequence.len(), cache2.op_index_sequence.len());
         assert_eq!(cache.wavelet_y.len(), cache2.wavelet_y.len());
