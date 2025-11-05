@@ -1,27 +1,22 @@
 use crate::containers::{ControlInfo, control_info};
-use crate::containers::{FileBasedBitmap, FileBasedSequence};
+use crate::containers::{FileBasedBitmap, FileBasedSequence, MmapBitmap};
 use crate::four_sect_dict::{self, IdKind};
 use crate::header::Header;
 use crate::triples::{
     HybridCache, Id, ObjectIter, OpIndex, PredicateIter, PredicateObjectIter, SubjectIter, TripleId,
     TriplesBitmap, TriplesBitmapGeneric,
 };
-use crate::{FileBasedDictSectPfc, FourSectDict, header};
+use crate::{FourSectDict, header};
 use bytesize::ByteSize;
 use log::{debug, error};
 use std::fs::File;
 #[cfg(feature = "cache")]
-use std::fs::File;
-#[cfg(feature = "cache")]
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom};
 use std::iter;
 use std::path::Path;
 use std::sync::Arc;
 
 pub type Result<T> = core::result::Result<T, Error>;
-
-#[cfg(feature = "cache")]
-const CACHE_EXT: &str = "index.v1-rust-cache";
 #[cfg(feature = "nt")]
 #[path = "nt.rs"]
 /// Converting N-Triples to HDT, available only if HDT is built with the experimental `"nt"` feature.
@@ -40,10 +35,10 @@ pub struct Hdt {
     pub triples: TriplesBitmap,
 }
 
-/// Type alias for hybrid/streaming HDT implementation using file-based sequences and bitmaps, but in-memory dictionary.
-/// Uses FileBasedSequence for adjlist_z (streaming) and OpIndex is always in-memory.
+/// Type alias for hybrid/streaming HDT implementation using file-based sequences, bitmaps, and dictionaries, but in-memory wavelet.
+/// Uses FileBasedSequence for adjlist_z (streaming), FileBasedBitmap for bitmaps, FileBasedDictSectPfc for dictionaries, and OpIndex is always in-memory.
 /// Used with HybridCache for memory-efficient querying of large HDT files.
-pub type HdtHybrid = HdtGeneric<FileBasedSequence, FileBasedBitmap, FileBasedDictSectPfc>;
+pub type HdtHybrid = HdtGeneric<FileBasedSequence, MmapBitmap, crate::dict_sect_pfc::FileBasedDictSectPfc>;
 
 /// Type alias for fully file-based HDT implementation.
 /// Uses file-based sequences, bitmaps, AND dictionary sections for maximum memory efficiency.
@@ -323,19 +318,19 @@ impl Hdt {
         let buf = &hdt_path.to_path_buf();
         // Create file-based sequence for adjlist_z using cached metadata
         let sequence_z = FileBasedSequence::new(buf, cache.sequence_z_offset)?;
-        let bitmap_z = FileBasedBitmap::new(buf, cache.bitmap_z_offset)?;
-        let bitmap_y = FileBasedBitmap::new(buf, cache.bitmap_y_offset)?;
+        let bitmap_z = MmapBitmap::new(buf, cache.bitmap_z_offset)?;
+        let bitmap_y = MmapBitmap::new(buf, cache.bitmap_y_offset)?;
         // Create file-based adjlist_z from cache metadata
         let adjlist_z = AdjListGeneric::new(sequence_z, bitmap_z);
 
-        // Use the cached wavelet matrix
-        let wavelet_y = cache.wavelet_y;
+        // Get order before moving cache fields
+        let order = cache.order()?;
 
         // Use the cached op_index sequence (already built and stored in cache)
         let op_index = OpIndex::new(cache.op_index_sequence, cache.op_index_bitmap);
 
         // Build the TriplesBitmapGeneric
-        let triples = TriplesBitmapGeneric::from_components(cache.order, bitmap_y, adjlist_z, op_index, wavelet_y);
+        let triples = TriplesBitmapGeneric::from_components(order, bitmap_y, adjlist_z, op_index, cache.wavelet_y);
 
         let hdt = HdtGeneric { header, dict, triples };
         debug!("HDT Hybrid size in memory {}, details:", ByteSize(hdt.size_in_bytes() as u64));
@@ -364,85 +359,81 @@ impl Hdt {
     /// ```
     #[cfg(feature = "cache")]
     pub fn read_from_path(f: &std::path::Path) -> Result<Self> {
+        use crate::containers::{AdjListGeneric, InMemoryBitmap, InMemorySequence};
         use log::warn;
+
+        // Try to use HybridCache for faster loading (avoids recomputing op_index and wavelet_y)
+        // But return a fully in-memory Hdt (not HdtHybrid)
+        let cache = match HybridCache::from_hdt_path(f) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                warn!("Could not load HybridCache, falling back to full HDT read: {e}");
+                None
+            }
+        };
 
         let source = File::open(f)?;
         let mut reader = std::io::BufReader::new(source);
         ControlInfo::read(&mut reader)?;
         let header = Header::read(&mut reader)?;
-        let unvalidated_dict = FourSectDict::read(&mut reader)?;
-        let mut abs_path = std::fs::canonicalize(f)?;
-        let _ = abs_path.pop();
-        let index_file_name = format!("{}.{CACHE_EXT}", f.file_name().unwrap().to_str().unwrap());
-        let index_file_path = abs_path.join(index_file_name);
-        let triples = if index_file_path.exists() {
-            let pos = reader.stream_position()?;
-            match Self::load_with_cache(&mut reader, &index_file_path, header.length) {
+        let unvalidated_dict = FourSectDict::read(&mut reader, false)?;
+
+        // Capture position after dictionary for fallback
+        let triples_section_offset = reader.stream_position()?;
+
+        let triples = if let Some(cache) = cache {
+            // Try to use cache, but fall back to regular reading if there's any error
+            // (e.g., cache is from a different HDT file or corrupted)
+            match (|| -> core::result::Result<TriplesBitmap, Box<dyn std::error::Error>> {
+                println!("{:?}", cache.control_info.properties);
+                if cache.header_size()? != (header.length as u64) {
+                    error!(
+                        "index file corrupt, headers don't match. expected {}, got {}",
+                        cache.header_size()?,
+                        header.length as u64
+                    );
+                    return Err("failed index validation".into());
+                }
+                // Extract order before consuming cache fields
+                let order = cache.order()?;
+
+                // Read the bitmaps and sequences from HDT file using cached offsets
+                reader.seek(SeekFrom::Start(cache.bitmap_y_offset))?;
+                let bitmap_y = crate::containers::Bitmap::read(&mut reader)?;
+
+                reader.seek(SeekFrom::Start(cache.sequence_z_offset))?;
+                let sequence_z = crate::containers::Sequence::read(&mut reader)?;
+
+                reader.seek(SeekFrom::Start(cache.bitmap_z_offset))?;
+                let bitmap_z = crate::containers::Bitmap::read(&mut reader)?;
+
+                // Use cached op_index and wavelet_y
+                let op_index = OpIndex::new(cache.op_index_sequence, cache.op_index_bitmap);
+                let adjlist_z =
+                    AdjListGeneric::new(InMemorySequence::new(sequence_z), InMemoryBitmap::new(bitmap_z));
+                let bitmap_y_mem = InMemoryBitmap::new(bitmap_y);
+
+                Ok(TriplesBitmapGeneric::from_components(
+                    order, bitmap_y_mem, adjlist_z, op_index, cache.wavelet_y,
+                ))
+            })() {
                 Ok(triples) => triples,
                 Err(e) => {
-                    warn!("error loading cache, overwriting: {e}");
-                    reader.seek(SeekFrom::Start(pos))?;
-                    Self::load_without_cache(&mut reader, &index_file_path, header.length)?
+                    warn!("Error using cache, falling back to full read: {e}");
+                    // Seek back to triples section (after dictionary)
+                    reader.seek(SeekFrom::Start(triples_section_offset))?;
+                    TriplesBitmap::read_sect(&mut reader)?
                 }
             }
         } else {
-            Self::load_without_cache(&mut reader, &index_file_path, header.length)?
+            // Fall back to reading the entire triples section
+            TriplesBitmap::read_sect(&mut reader)?
         };
-
         let dict = unvalidated_dict.validate()?;
         let hdt = Hdt { header, dict, triples };
         debug!("HDT size in memory {}, details:", ByteSize(hdt.size_in_bytes() as u64));
         debug!("{hdt:#?}");
         Ok(hdt)
-    }
-
-    #[cfg(feature = "cache")]
-    fn load_without_cache<R: std::io::BufRead>(
-        mut reader: R, index_file_path: &std::path::PathBuf, header_length: usize,
-    ) -> Result<TriplesBitmap> {
-        use log::warn;
-
-        debug!("no cache detected, generating index");
-        let triples = TriplesBitmap::read_sect(&mut reader)?;
-        debug!("index generated, saving cache to {}", index_file_path.display());
-        if let Err(e) = Self::write_cache(index_file_path, &triples, header_length) {
-            warn!("error trying to save cache to file: {e}");
-        }
-        Ok(triples)
-    }
-
-    #[cfg(feature = "cache")]
-    fn load_with_cache<R: std::io::BufRead>(
-        mut reader: R, index_file_path: &std::path::PathBuf, header_length: usize,
-    ) -> core::result::Result<TriplesBitmap, Box<dyn std::error::Error>> {
-        use std::io::Read;
-        // load cached index
-        debug!("hdt file cache detected, loading from {}", index_file_path.display());
-        let index_source = File::open(index_file_path)?;
-        let mut index_reader = std::io::BufReader::new(index_source);
-        let triples_ci = ControlInfo::read(&mut reader)?;
-        // we cannot rely on the numTriples property being present, see https://github.com/rdfhdt/hdt-cpp/issues/289
-        // let num_triples = triples_ci.get("numTriples").expect("numTriples key missing in triples CI");
-        // thus we use the number of bytes of the header data
-        let mut buf = [0u8; 8];
-        index_reader.read_exact(&mut buf)?;
-        if header_length != usize::from_le_bytes(buf) {
-            return Err("failed index validation".into());
-        }
-        let triples = TriplesBitmap::load_cache(&mut index_reader, &triples_ci)?;
-        Ok(triples)
-    }
-
-    #[cfg(feature = "cache")]
-    fn write_cache(
-        index_file_path: &std::path::PathBuf, triples: &TriplesBitmap, header_length: usize,
-    ) -> core::result::Result<(), Box<dyn std::error::Error>> {
-        let new_index_file = File::create(index_file_path)?;
-        let mut writer = std::io::BufWriter::new(new_index_file);
-        writer.write_all(&header_length.to_le_bytes())?;
-        bincode::serde::encode_into_std_write(triples, &mut writer, bincode::config::standard())?;
-        writer.flush()?;
-        Ok(())
     }
 
     pub fn write(&self, write: &mut impl std::io::Write) -> Result<()> {
@@ -634,9 +625,10 @@ pub mod tests {
 
     // make sure loading with cache works under different circumstances
     // e.g. clear cache, prexisting cache, stale cache
-    #[cfg(feature = "cache")]
     #[test]
+    #[cfg(feature = "cache")]
     fn cache() -> Result<()> {
+        use crate::triples::hybrid_cache::CACHE_EXT;
         use fs_err::remove_file;
         use std::path::Path;
         init();
@@ -721,8 +713,8 @@ pub mod tests {
     /// Compare load times between Hdt::read() and Hdt::read_with_hybrid_cache()
     #[test]
     fn compare_load_times() -> Result<()> {
+        use crate::triples::hybrid_cache::CACHE_EXT;
         use std::time::Instant;
-
         init();
 
         let hdt_path = Path::new("tests/resources/snikmeta.hdt");
@@ -745,7 +737,7 @@ pub mod tests {
 
         // Generate the HybridCache by tracking file positions
         println!("\nGenerating HybridCache...");
-        let cache_name = format!("{}.{}", hdt_path.to_str().unwrap(), "index.v3-rust-cache");
+        let cache_name = format!("{}.{CACHE_EXT}", hdt_path.to_str().unwrap());
 
         println!("Generating HybridCache for {hdt_path:?}...");
         // Generate cache
@@ -810,10 +802,11 @@ pub mod tests {
     /// Run this once to create the cache file needed by compare_load_times test.
     #[test]
     fn generate_test_cache() -> Result<()> {
+        use crate::triples::hybrid_cache::CACHE_EXT;
         init();
 
         let hdt_path = Path::new("tests/resources/snikmeta.hdt");
-        let cache_name = format!("{}.{}", hdt_path.to_str().unwrap(), "index.v3-rust-cache");
+        let cache_name = format!("{}.{CACHE_EXT}", hdt_path.to_str().unwrap());
 
         println!("Generating HybridCache for {hdt_path:?}...");
         // Generate cache
@@ -846,7 +839,7 @@ pub mod tests {
         let nt_triples: Vec<StringTriple> = snikmeta_nt.triples_all().collect();
 
         assert_eq!(nt_triples, hdt_triples);
-        assert_eq!(snikmeta.triples.bitmap_y.dict, snikmeta_nt.triples.bitmap_y.dict);
+        assert_eq!(snikmeta.triples.bitmap_y.inner().dict, snikmeta_nt.triples.bitmap_y.inner().dict);
         snikmeta_check(&snikmeta_nt)?;
         let path = std::path::Path::new("tests/resources/empty.nt");
         let hdt_empty = Hdt::read_nt(path)?;
@@ -918,7 +911,7 @@ pub mod tests {
         Ok(())
     }
 
-    /// Generic version of snikmeta_check that works with HdtGeneric<S, B, D> (for HdtHybrid, etc.)
+    /// Generic version of snikmeta_check that works with HdtGeneric<S, B, D, W> (for HdtHybrid, etc.)
     pub fn snikmeta_check_generic<
         S: crate::containers::SequenceAccess,
         B: crate::containers::BitmapAccess,

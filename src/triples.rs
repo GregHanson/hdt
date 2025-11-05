@@ -24,8 +24,6 @@ pub use object_iter::ObjectIter;
 
 pub mod hybrid_cache;
 pub use hybrid_cache::HybridCache;
-#[cfg(feature = "cache")]
-use serde::ser::SerializeStruct;
 
 pub type Result<T> = core::result::Result<T, Error>;
 
@@ -34,7 +32,6 @@ pub type Result<T> = core::result::Result<T, Error>;
 #[allow(missing_docs)]
 #[repr(u8)]
 #[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord)]
-#[cfg_attr(feature = "cache", derive(serde::Deserialize, serde::Serialize))]
 pub enum Order {
     #[default]
     Unknown = 0,
@@ -73,49 +70,6 @@ pub struct OpIndex {
     pub sequence: CompactVector,
     /// Bitmap with a one bit for every new object to allow finding the starting point for a given object id.
     pub bitmap: Bitmap,
-}
-
-#[cfg(feature = "cache")]
-impl serde::Serialize for OpIndex {
-    fn serialize<S>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error>
-    where
-        S: serde::ser::Serializer,
-    {
-        let mut state: <S as serde::ser::Serializer>::SerializeStruct =
-            serializer.serialize_struct("OpIndex", 2)?;
-
-        // Serialize sequence using `sucds`
-        let mut seq_buffer = Vec::new();
-        self.sequence.serialize_into(&mut seq_buffer).map_err(serde::ser::Error::custom)?;
-        state.serialize_field("sequence", &seq_buffer)?;
-
-        state.serialize_field("bitmap", &self.bitmap)?;
-
-        state.end()
-    }
-}
-
-#[cfg(feature = "cache")]
-impl<'de> serde::Deserialize<'de> for OpIndex {
-    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
-    where
-        D: serde::de::Deserializer<'de>,
-    {
-        #[derive(serde::Deserialize)]
-        struct OpIndexData {
-            sequence: Vec<u8>,
-            bitmap: Bitmap,
-        }
-
-        let data = OpIndexData::deserialize(deserializer)?;
-
-        // Deserialize `sucds` structures
-        let mut seq_reader = std::io::BufReader::new(&data.sequence[..]);
-        let sequence = CompactVector::deserialize_from(&mut seq_reader).map_err(serde::de::Error::custom)?;
-        let index = OpIndex { sequence, bitmap: data.bitmap };
-
-        Ok(index)
-    }
 }
 
 impl fmt::Debug for OpIndex {
@@ -193,8 +147,8 @@ pub struct TriplesBitmapGeneric<S: SequenceAccess, B: BitmapAccess> {
     pub adjlist_z: AdjListGeneric<S, B>,
     /// Index for object-based access. ALWAYS in-memory (computed, not in HDT file)
     pub op_index: OpIndex,
-    /// wavelet matrix for predicate-based access. ALWAYS in-memory (computed, not in HDT file)
-    pub wavelet_y: WaveletMatrix<Rank9Sel>,
+    /// wavelet matrix for predicate-based access (generic: in-memory or file-based)
+    pub wavelet_y: sucds::char_sequences::WaveletMatrix<Rank9Sel>,
 }
 
 /// Type alias for the traditional TriplesBitmap with all in-memory structures.
@@ -234,9 +188,6 @@ pub enum Error {
     TripleComponentZero(usize, usize, usize),
     #[error("unspecified external library error")]
     External(#[from] Box<dyn std::error::Error + Send + Sync + 'static>),
-    #[error("cache decode error")]
-    #[cfg(feature = "cache")]
-    Decode(#[from] bincode::error::DecodeError),
     #[error("IO error")]
     Io(#[from] std::io::Error),
     #[error("Header error")]
@@ -255,72 +206,6 @@ impl<S: SequenceAccess, B: BitmapAccess> fmt::Debug for TriplesBitmapGeneric<S, 
         writeln!(f, "adjlist_z {:#?}", self.adjlist_z)?;
         writeln!(f, "op_index {:#?}", self.op_index)?;
         write!(f, "wavelet_y {}", ByteSize(self.wavelet_y.size_in_bytes() as u64))
-    }
-}
-
-#[cfg(feature = "cache")]
-impl serde::Serialize for TriplesBitmap {
-    fn serialize<S>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error>
-    where
-        S: serde::ser::Serializer,
-    {
-        let mut state: <S as serde::ser::Serializer>::SerializeStruct =
-            serializer.serialize_struct("TriplesBitmap", 5)?;
-        // Extract the number of triples
-        state.serialize_field("order", &self.order)?;
-        //bitmap_y
-        state.serialize_field("bitmap_y", &self.bitmap_y.inner())?;
-        // adjlist_z
-        state.serialize_field("adjlist_z", &self.adjlist_z)?;
-        // op_index
-        state.serialize_field("op_index", &self.op_index)?;
-        // wavelet_y
-        let mut wavelet_y_buffer = Vec::new();
-        self.wavelet_y.serialize_into(&mut wavelet_y_buffer).map_err(serde::ser::Error::custom)?;
-        state.serialize_field("wavelet_y", &wavelet_y_buffer)?;
-
-        state.end()
-    }
-}
-
-#[cfg(feature = "cache")]
-impl<'de> serde::Deserialize<'de> for TriplesBitmap {
-    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
-    where
-        D: serde::de::Deserializer<'de>,
-    {
-        use crate::containers::AdjList;
-        #[derive(serde::Deserialize)]
-        struct TriplesBitmapData {
-            order: Order,
-            pub bitmap_y: Bitmap,
-            pub adjlist_z: AdjList, // Still uses old AdjList for backwards compatibility
-            pub op_index: OpIndex,
-            pub wavelet_y: Vec<u8>,
-        }
-
-        let data = TriplesBitmapData::deserialize(deserializer)?;
-
-        // Deserialize `sucds` structures
-        let mut bitmap_reader = std::io::BufReader::new(&data.wavelet_y[..]);
-        let wavelet_y =
-            WaveletMatrix::<Rank9Sel>::deserialize_from(&mut bitmap_reader).map_err(serde::de::Error::custom)?;
-
-        // Convert old AdjList to new generic form
-        let adjlist_z = AdjListGeneric::new(
-            InMemorySequence::new(data.adjlist_z.sequence),
-            InMemoryBitmap::new(data.adjlist_z.bitmap),
-        );
-
-        let bitmap = TriplesBitmap {
-            order: data.order,
-            bitmap_y: InMemoryBitmap::new(data.bitmap_y),
-            adjlist_z,
-            op_index: data.op_index,
-            wavelet_y,
-        };
-
-        Ok(bitmap)
     }
 }
 
@@ -421,7 +306,6 @@ impl TriplesBitmap {
     ) -> Self {
         //let wavelet_thread = std::thread::spawn(|| Self::build_wavelet(sequence_y));
         let wavelet_y = Self::build_wavelet(sequence_y);
-
         // Wrap bitmap_y in InMemoryBitmap for the generic interface
         let bitmap_y_wrapped = InMemoryBitmap::new(bitmap_y);
 
@@ -566,22 +450,6 @@ impl TriplesBitmap {
     }
 
     /// load the cached HDT index file, only supports TriplesBitmap
-    #[cfg(feature = "cache")]
-    pub fn load_cache<R: BufRead>(reader: &mut R, info: &ControlInfo) -> Result<Self> {
-        match &info.format[..] {
-            "<http://purl.org/HDT/hdt#triplesBitmap>" => TriplesBitmap::load(reader),
-            "<http://purl.org/HDT/hdt#triplesList>" => Err(Error::TriplesList),
-            f => Err(Error::UnknownTriplesFormat(f.to_owned())),
-        }
-    }
-
-    /// load the entire cached TriplesBitmap object
-    #[cfg(feature = "cache")]
-    pub fn load<R: BufRead>(reader: &mut R) -> Result<Self> {
-        let triples: TriplesBitmap = bincode::serde::decode_from_std_read(reader, bincode::config::standard())?;
-        Ok(triples)
-    }
-
     fn read<R: BufRead>(reader: &mut R, triples_ci: &ControlInfo) -> Result<Self> {
         //let order: Order = Order::try_from(triples_ci.get("order").unwrap().parse::<u32>());
         let order: Order;
