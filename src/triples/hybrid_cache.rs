@@ -12,8 +12,7 @@
 //!   - properties["numTriples"]      (total number of triples)
 //!   - properties["headerSize"]      (size of HDT header section in bytes)
 //! [Op Index Sequence]               (variable - sucds serialized CompactVector)
-//! [Op Index Bitmap]                 (variable - sucds serialized)
-//! [Wavelet Y]                       (variable - sucds serialized)
+//! [Wavelet Y]                       (variable - sucds serialized WaveletMatrix)
 //! [Bitmap Y Offset: u64]            (8 bytes - offset in HDT file where bitmap_y begins)
 //! [Bitmap Z Offset: u64]            (8 bytes - offset in HDT file where bitmap_z begins)
 //! [Sequence Z Offset: u64]          (8 bytes - offset in HDT file where sequence_z begins)
@@ -23,6 +22,7 @@
 //! [Dict Predicates Offset: u64]     (8 bytes - offset where predicates dictionary section begins)
 //! [Dict Objects Offset: u64]        (8 bytes - offset where objects dictionary section begins)
 //! [Triples Offset: u64]             (8 bytes - offset in HDT file where Triples section begins)
+//! [Op Index Bitmap]                 (variable - sucds serialized Rank9Sel, offset returned by read_from_file())
 //! ```
 //!
 //! ## Design Rationale
@@ -38,8 +38,8 @@ use crate::containers::InMemoryBitmap;
 use crate::containers::InMemorySequence;
 use crate::containers::Sequence;
 use crate::header::Header;
+use crate::triples::Order;
 use crate::triples::TriplesBitmapGeneric;
-use crate::triples::{Order, TriplesBitmap};
 use bytesize::ByteSize;
 use log::debug;
 use log::warn;
@@ -59,17 +59,17 @@ const CACHE_FORMAT: &str = "<http://purl.org/HDT/hdt#cacheV4>";
 /// Cached structures for HybridTripleAccess
 ///
 /// ## Storage Strategy:
-/// - **In cache**: op_index (both sequence and bitmap), wavelet_y - computed/built structures
-/// - **File offsets**: bitmap_y, bitmap_z, sequence_z, dictionary sections - read from HDT file on-demand
+/// - **In cache (in memory)**: op_index.sequence, wavelet_y - computed/built structures loaded into memory
+/// - **In cache (on disk)**: op_index.bitmap - written at end of cache file, offset returned by read_from_file()
+/// - **HDT file offsets**: bitmap_y, bitmap_z, sequence_z, dictionary sections - read from HDT file on-demand
 /// - **Metadata in ControlInfo**: order, numTriples, headerSize stored in properties
 pub struct HybridCache {
     /// Control information containing metadata (order, numTriples, headerSize)
     pub control_info: ControlInfo,
-    /// Op-index sequence (ALWAYS in-memory, computed)
+    /// Op-index sequence (stored in cache file, always loaded into memory)
+    /// TODO: significantly larger than OpIndex.bitmap, read from file instead?
     pub op_index_sequence: CompactVector,
-    /// Op-index bitmap (ALWAYS in-memory, computed)
-    pub op_index_bitmap: Bitmap,
-    /// Wavelet matrix (ALWAYS in-memory, computed)
+    /// Wavelet matrix (stored in cache file, always loaded into memory)
     pub wavelet_y: WaveletMatrix<Rank9Sel>,
     /// File offset where bitmap_y begins in HDT file
     pub bitmap_y_offset: u64,
@@ -95,14 +95,9 @@ impl fmt::Debug for HybridCache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "total size {}: {{ {} op_sequence, {} op_bitmap, {} sequence_y }}",
-            ByteSize(
-                self.op_index_sequence.size_in_bytes() as u64
-                    + self.op_index_bitmap.size_in_bytes() as u64
-                    + self.wavelet_y.size_in_bytes() as u64
-            ),
+            "in-memory size {}: {{ {} op_sequence, {} wavelet_y }}",
+            ByteSize(self.op_index_sequence.size_in_bytes() as u64 + self.wavelet_y.size_in_bytes() as u64),
             ByteSize(self.op_index_sequence.size_in_bytes() as u64),
-            ByteSize(self.op_index_bitmap.size_in_bytes() as u64),
             ByteSize(self.wavelet_y.size_in_bytes() as u64),
         )
     }
@@ -152,7 +147,13 @@ impl HybridCache {
     /// // First call: generates cache and saves to "data/myfile.hdt.index.v3-rust-cache"
     /// // Second call: loads existing cache (much faster!)
     /// ```
-    pub fn from_hdt_path(hdt_path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error>> {
+    /// Load or create cache, returning the cache and the offset to the OpIndex bitmap in the cache file
+    ///
+    /// # Returns
+    /// Returns a tuple `(HybridCache, u64)` where:
+    /// - `HybridCache`: The loaded/created cache
+    /// - `u64`: File offset in the cache file where the OpIndex bitmap begins
+    pub fn from_hdt_path(hdt_path: impl AsRef<Path>) -> Result<(Self, u64), Box<dyn std::error::Error>> {
         let hdt_path = hdt_path.as_ref();
 
         // Construct cache file path
@@ -162,10 +163,10 @@ impl HybridCache {
         if cache_path.exists() {
             debug!("Found existing cache: {}", cache_path.display());
             match Self::read_from_file(&cache_path) {
-                Ok(cache) => {
+                Ok((cache, op_index_bitmap_offset)) => {
                     debug!("Loaded cache successfully");
                     debug!("{cache:#?}");
-                    return Ok(cache);
+                    return Ok((cache, op_index_bitmap_offset));
                 }
                 Err(e) => {
                     warn!("Cache file exists but couldn't be read: {e}");
@@ -176,11 +177,7 @@ impl HybridCache {
             debug!("Cache not found, generating from HDT file...");
         }
 
-        // Cache doesn't exist or couldn't be read - generate it
-        let cache = Self::write_cache_from_hdt_file(hdt_path);
-        debug!("Cache generated and saved to: {}", cache_path.display());
-
-        Ok(cache)
+        Ok(Self::write_cache_from_hdt_file(hdt_path))
     }
 
     /// Get the cache file path for a given HDT file
@@ -198,56 +195,11 @@ impl HybridCache {
         cache_path
     }
 
-    /// Generate cache from TriplesBitmap with file offsets
-    ///
-    /// # Arguments
-    /// * `triples` - The in-memory TriplesBitmap to extract computed structures from
-    /// * `header_size` - Size of the HDT header section in bytes
-    /// * `bitmap_y_offset` - File offset where bitmap_y starts in HDT file
-    /// * `bitmap_z_offset` - File offset where bitmap_z starts in HDT file
-    /// * `sequence_z_offset` - File offset where sequence_z starts in HDT file
-    /// * `dictionary_offset` - File offset where dictionary starts in HDT file
-    /// * `dict_shared_offset` - File offset where shared dictionary section starts
-    /// * `dict_subjects_offset` - File offset where subjects dictionary section starts
-    /// * `dict_predicates_offset` - File offset where predicates dictionary section starts
-    /// * `dict_objects_offset` - File offset where objects dictionary section starts
-    /// * `triples_offset` - File offset where triples section starts in HDT file
-    #[allow(clippy::too_many_arguments)]
-    fn from_triples_bitmap(
-        triples: &TriplesBitmap, header_size: u64, bitmap_y_offset: u64, bitmap_z_offset: u64,
-        sequence_z_offset: u64, dictionary_offset: u64, dict_shared_offset: u64, dict_subjects_offset: u64,
-        dict_predicates_offset: u64, dict_objects_offset: u64, triples_offset: u64,
-    ) -> Self {
+    pub fn write_cache_from_hdt_file(hdt_path: &Path) -> (Self, u64) {
         use crate::containers::ControlType;
         use std::collections::HashMap;
+        use std::io::Seek;
 
-        // Create ControlInfo with metadata in properties
-        let mut properties = HashMap::new();
-        properties.insert("order".to_owned(), (triples.order.clone() as u8).to_string());
-        properties.insert("numTriples".to_owned(), triples.adjlist_z.len().to_string());
-        properties.insert("headerSize".to_owned(), header_size.to_string());
-
-        let control_info =
-            ControlInfo { control_type: ControlType::Index, format: CACHE_FORMAT.to_owned(), properties };
-
-        Self {
-            control_info,
-            op_index_sequence: triples.op_index.sequence.clone(),
-            op_index_bitmap: triples.op_index.bitmap.clone(),
-            wavelet_y: triples.wavelet_y.clone(),
-            bitmap_y_offset,
-            bitmap_z_offset,
-            sequence_z_offset,
-            dictionary_offset,
-            dict_shared_offset,
-            dict_subjects_offset,
-            dict_predicates_offset,
-            dict_objects_offset,
-            triples_offset,
-        }
-    }
-
-    pub fn write_cache_from_hdt_file(hdt_path: &Path) -> Self {
         let mut reader = std::io::BufReader::new(std::fs::File::open(hdt_path).expect("msg"));
         // Read control info (global header)
         ControlInfo::read(&mut reader).expect("msg");
@@ -309,55 +261,81 @@ impl HybridCache {
         let adjlist_z = AdjListGeneric::new(InMemorySequence::new(sequence_z), InMemoryBitmap::new(bitmap_z));
 
         let triples_bitmap = TriplesBitmapGeneric::new(order, sequence_y, bitmap_y, adjlist_z);
-        let cache = Self::from_triples_bitmap(
-            &triples_bitmap, header_size, bitmap_y_offset, bitmap_z_offset, sequence_z_offset, dictionary_offset,
-            dict_shared_offset, dict_subjects_offset, dict_predicates_offset, dict_objects_offset, triples_offset,
-        );
 
-        debug!("{cache:#?}");
-
-        // Write cache to file using the standard cache path
+        // Prepare cache file for writing
         let cache_path = Self::get_cache_path(hdt_path);
-        cache.write_to_file(&cache_path).expect("Failed to write cache file");
-
-        cache
-    }
-
-    /// Write cache to file
-    pub fn write_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), Box<dyn std::error::Error>> {
-        let file = File::create(path)?;
+        let file = File::create(&cache_path).expect("Failed to create cache file");
         let mut writer = BufWriter::new(file);
 
-        // Write ControlInfo (replaces magic + version + order)
-        self.control_info.write(&mut writer)?;
+        // Create ControlInfo with metadata in properties
 
-        // Write computed structures (in-memory only)
+        let mut properties = HashMap::new();
+        properties.insert("order".to_owned(), (triples_bitmap.order.clone() as u8).to_string());
+        properties.insert("numTriples".to_owned(), triples_bitmap.adjlist_z.len().to_string());
+        properties.insert("headerSize".to_owned(), header_size.to_string());
+        let control_info =
+            ControlInfo { control_type: ControlType::Index, format: CACHE_FORMAT.to_owned(), properties };
+
+        // Write ControlInfo
+        control_info.write(&mut writer).expect("Failed to write ControlInfo");
+
         // Write op_index.sequence
-        self.op_index_sequence.serialize_into(&mut writer)?;
-
-        // Write op_index.bitmap
-        self.op_index_bitmap.dict.serialize_into(&mut writer)?;
+        triples_bitmap
+            .op_index
+            .sequence
+            .serialize_into(&mut writer)
+            .expect("Failed to serialize op_index.sequence");
 
         // Write wavelet_y
-        self.wavelet_y.serialize_into(&mut writer)?;
+        triples_bitmap.wavelet_y.serialize_into(&mut writer).expect("Failed to serialize wavelet_y");
 
-        // Write file offsets (bitmaps, sequences, and dictionary sections read from HDT on-demand)
-        writer.write_all(&self.bitmap_y_offset.to_le_bytes())?;
-        writer.write_all(&self.bitmap_z_offset.to_le_bytes())?;
-        writer.write_all(&self.sequence_z_offset.to_le_bytes())?;
-        writer.write_all(&self.dictionary_offset.to_le_bytes())?;
-        writer.write_all(&self.dict_shared_offset.to_le_bytes())?;
-        writer.write_all(&self.dict_subjects_offset.to_le_bytes())?;
-        writer.write_all(&self.dict_predicates_offset.to_le_bytes())?;
-        writer.write_all(&self.dict_objects_offset.to_le_bytes())?;
-        writer.write_all(&self.triples_offset.to_le_bytes())?;
+        // Write all HDT file offsets
+        writer.write_all(&bitmap_y_offset.to_le_bytes()).expect("Failed to write bitmap_y_offset");
+        writer.write_all(&bitmap_z_offset.to_le_bytes()).expect("Failed to write bitmap_z_offset");
+        writer.write_all(&sequence_z_offset.to_le_bytes()).expect("Failed to write sequence_z_offset");
+        writer.write_all(&dictionary_offset.to_le_bytes()).expect("Failed to write dictionary_offset");
+        writer.write_all(&dict_shared_offset.to_le_bytes()).expect("Failed to write dict_shared_offset");
+        writer.write_all(&dict_subjects_offset.to_le_bytes()).expect("Failed to write dict_subjects_offset");
+        writer.write_all(&dict_predicates_offset.to_le_bytes()).expect("Failed to write dict_predicates_offset");
+        writer.write_all(&dict_objects_offset.to_le_bytes()).expect("Failed to write dict_objects_offset");
+        writer.write_all(&triples_offset.to_le_bytes()).expect("Failed to write triples_offset");
 
-        writer.flush()?;
-        Ok(())
+        let op_index_bitmap_offset = writer.stream_position().expect("failed to get op index bitmap offset");
+        // Write op_index.bitmap at the END of the file
+        // (offset returned by read_from_file(), can be mmap'd or loaded into memory)
+        triples_bitmap.op_index.bitmap.inner().write(&mut writer).expect("Failed to serialize op_index.bitmap");
+
+        writer.flush().expect("Failed to flush writer");
+
+        // Create and return the cache structure
+        let cache = Self {
+            control_info,
+            op_index_sequence: triples_bitmap.op_index.sequence.clone(),
+            wavelet_y: triples_bitmap.wavelet_y.clone(),
+            bitmap_y_offset,
+            bitmap_z_offset,
+            sequence_z_offset,
+            dictionary_offset,
+            dict_shared_offset,
+            dict_subjects_offset,
+            dict_predicates_offset,
+            dict_objects_offset,
+            triples_offset,
+        };
+
+        debug!("Cache generated and saved to: {}", cache_path.display());
+        debug!("{cache:#?}");
+        (cache, op_index_bitmap_offset)
     }
 
-    /// Read cache from file
-    pub fn read_from_file<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
+    /// Read cache from file, returning the cache structure and the offset to the OpIndex bitmap
+    ///
+    /// # Returns
+    /// Returns a tuple `(HybridCache, u64)` where:
+    /// - `HybridCache`: The loaded cache with in-memory structures (op_index.sequence, wavelet_y)
+    /// - `u64`: File offset in the cache file where the OpIndex bitmap begins (can be used with MmapBitmap::new(), InMemoryBitmap, or FileBasedBitmap constructors)
+    pub fn read_from_file<P: AsRef<Path>>(path: P) -> Result<(Self, u64), Box<dyn std::error::Error>> {
+        use crate::containers::ControlType;
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
 
@@ -365,7 +343,6 @@ impl HybridCache {
         let control_info = ControlInfo::read(&mut reader)?;
 
         // Verify it's an Index type
-        use crate::containers::ControlType;
         if control_info.control_type != ControlType::Index {
             return Err(format!(
                 "Invalid cache file: expected Index control type, found {:?}",
@@ -387,14 +364,10 @@ impl HybridCache {
         // Read op_index.sequence
         let op_index_sequence = CompactVector::deserialize_from(&mut reader)?;
 
-        // Read op_index.bitmap
-        let op_index_bitmap_dict = Rank9Sel::deserialize_from(&mut reader)?;
-        let op_index_bitmap = Bitmap { dict: op_index_bitmap_dict };
-
         // Read wavelet_y
         let wavelet_y = WaveletMatrix::deserialize_from(&mut reader)?;
 
-        // Read file offsets
+        // Read HDT file offsets
         let mut bitmap_y_offset_bytes = [0u8; 8];
         reader.read_exact(&mut bitmap_y_offset_bytes)?;
         let bitmap_y_offset = u64::from_le_bytes(bitmap_y_offset_bytes);
@@ -431,10 +404,13 @@ impl HybridCache {
         reader.read_exact(&mut triples_offset_bytes)?;
         let triples_offset = u64::from_le_bytes(triples_offset_bytes);
 
-        Ok(Self {
+        // The OpIndex bitmap starts right after all the offsets
+        // (it's the last thing in the file)
+        let op_index_bitmap_offset = reader.stream_position()?;
+
+        let cache = Self {
             control_info,
             op_index_sequence,
-            op_index_bitmap,
             wavelet_y,
             bitmap_y_offset,
             bitmap_z_offset,
@@ -445,15 +421,15 @@ impl HybridCache {
             dict_predicates_offset,
             dict_objects_offset,
             triples_offset,
-        })
+        };
+
+        Ok((cache, op_index_bitmap_offset))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Hdt;
-    use std::io::BufReader;
 
     #[test]
     fn test_from_hdt_path() -> Result<(), Box<dyn std::error::Error>> {
@@ -464,12 +440,12 @@ mod tests {
         let _ = std::fs::remove_file(&cache_path);
 
         println!("\n=== Test 1: First call (should generate cache) ===");
-        let cache1 = HybridCache::from_hdt_path(hdt_path)?;
+        let (cache1, offset1) = HybridCache::from_hdt_path(hdt_path)?;
         assert!(cache_path.exists(), "Cache file should be created");
         println!("Cache size: {} bytes", std::fs::metadata(&cache_path)?.len());
 
         println!("\n=== Test 2: Second call (should load existing cache) ===");
-        let cache2 = HybridCache::from_hdt_path(hdt_path)?;
+        let (cache2, offset2) = HybridCache::from_hdt_path(hdt_path)?;
 
         // Verify both caches are identical
         assert_eq!(cache1.order()? as u8, cache2.order()? as u8);
@@ -478,64 +454,12 @@ mod tests {
         assert_eq!(cache1.bitmap_y_offset, cache2.bitmap_y_offset);
         assert_eq!(cache1.bitmap_z_offset, cache2.bitmap_z_offset);
         assert_eq!(cache1.sequence_z_offset, cache2.sequence_z_offset);
+        assert_eq!(offset1, offset2, "OpIndex bitmap offsets should match");
 
         println!("\nBoth caches are identical!");
 
         // Clean up
         std::fs::remove_file(&cache_path)?;
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_cache_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
-        // Load TriplesBitmap
-        let file = File::open("tests/resources/snikmeta.hdt")?;
-        let hdt = Hdt::read(BufReader::new(file))?;
-
-        // Generate cache with example offsets
-        let cache = HybridCache::from_triples_bitmap(
-            &hdt.triples, 5000,  // header_size
-            1000,  // bitmap_y_offset
-            2000,  // bitmap_z_offset
-            12345, // sequence_z_offset
-            10000, // dictionary_offset
-            10100, // dict_shared_offset
-            10200, // dict_subjects_offset
-            10300, // dict_predicates_offset
-            10400, // dict_objects_offset
-            20000, // triples_offset
-        );
-
-        // Write to file
-        let cache_path = "/tmp/test.hdt.cache";
-        cache.write_to_file(cache_path)?;
-
-        // Read back
-        let cache2 = HybridCache::read_from_file(cache_path)?;
-
-        // Verify
-        assert_eq!(cache.order()? as u8, cache2.order()? as u8);
-        assert_eq!(cache.num_triples()?, cache2.num_triples()?);
-        assert_eq!(cache.header_size()?, cache2.header_size()?);
-        assert_eq!(cache.op_index_bitmap.len(), cache2.op_index_bitmap.len());
-        assert_eq!(cache.op_index_sequence.len(), cache2.op_index_sequence.len());
-        assert_eq!(cache.wavelet_y.len(), cache2.wavelet_y.len());
-        assert_eq!(cache.bitmap_y_offset, cache2.bitmap_y_offset);
-        assert_eq!(cache.bitmap_z_offset, cache2.bitmap_z_offset);
-        assert_eq!(cache.sequence_z_offset, cache2.sequence_z_offset);
-        assert_eq!(cache.dictionary_offset, cache2.dictionary_offset);
-        assert_eq!(cache.dict_shared_offset, cache2.dict_shared_offset);
-        assert_eq!(cache.dict_subjects_offset, cache2.dict_subjects_offset);
-        assert_eq!(cache.dict_predicates_offset, cache2.dict_predicates_offset);
-        assert_eq!(cache.dict_objects_offset, cache2.dict_objects_offset);
-        assert_eq!(cache.triples_offset, cache2.triples_offset);
-
-        println!("Cache roundtrip successful!");
-        println!("   Cache file size: {} bytes", std::fs::metadata(cache_path)?.len());
-
-        // Clean up
-        std::fs::remove_file(cache_path)?;
 
         Ok(())
     }

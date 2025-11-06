@@ -64,15 +64,21 @@ impl TryFrom<u32> for Order {
 /// This object-based index allows to traverse from the leaves and support ??O and ?PO queries.
 /// Used for logarithmic (?) time access instead of linear time sequential search.
 /// See Martínez-Prieto, M., M. Arias, and J. Fernández (2012). Exchange and Consumption of Huge RDF Data. Pages 8--10.
-pub struct OpIndex {
+///
+/// Generic over B: BitmapAccess to support both in-memory and file-based bitmaps.
+pub struct OpIndexGeneric<B: BitmapAccess> {
     /// Compact integer vector of object positions.
     /// "[...] integer sequence: SoP, which stores, for each object, a sorted list of references to the predicate-subject pairs (sorted by predicate) related to it."
     pub sequence: CompactVector,
     /// Bitmap with a one bit for every new object to allow finding the starting point for a given object id.
-    pub bitmap: Bitmap,
+    pub bitmap: B,
 }
 
-impl fmt::Debug for OpIndex {
+/// Type alias for traditional in-memory OpIndex.
+/// This maintains backward compatibility with existing code.
+pub type OpIndex = OpIndexGeneric<InMemoryBitmap>;
+
+impl<B: BitmapAccess> fmt::Debug for OpIndexGeneric<B> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "total size {} {{", ByteSize(self.size_in_bytes() as u64))?;
         writeln!(
@@ -85,9 +91,9 @@ impl fmt::Debug for OpIndex {
     }
 }
 
-impl OpIndex {
+impl<B: BitmapAccess> OpIndexGeneric<B> {
     /// Create a new OpIndex with the given sequence and bitmap
-    pub fn new(sequence: CompactVector, bitmap: Bitmap) -> Self {
+    pub fn new(sequence: CompactVector, bitmap: B) -> Self {
         Self { sequence, bitmap }
     }
 
@@ -127,17 +133,15 @@ impl OpIndex {
 ///
 /// Generic over:
 /// - S: SequenceAccess (InMemorySequence or FileBasedSequence)
-/// - B: BitmapAccess (InMemoryBitmap or FileBasedBitmap)
+/// - B: BitmapAccess (InMemoryBitmap, FileBasedBitmap, or MmapBitmap)
 ///
-/// **Note:** OpIndex and wavelet_y are ALWAYS in-memory for both variants.
-/// These structures are:
-/// - Computed/built (not in HDT file)
-/// - Relatively small compared to sequences/bitmaps
-/// - Critical for query performance
+/// **Note:** OpIndex bitmap now uses the same BitmapAccess type B as the other bitmaps.
+/// This allows HdtHybrid to use MmapBitmap for the OpIndex while Hdt uses InMemoryBitmap.
 ///
-/// ## Two Main Variants:
+/// ## Main Variants:
 /// 1. **All in-memory**: TriplesBitmap (traditional, fast, high memory)
 /// 2. **File-based**: TriplesBitmapFileBased (streaming, slow, minimal memory)
+/// 3. **Hybrid with mmap**: Uses MmapBitmap for efficient multi-file scenarios
 //#[derive(Clone)]
 pub struct TriplesBitmapGeneric<S: SequenceAccess, B: BitmapAccess> {
     order: Order,
@@ -145,8 +149,8 @@ pub struct TriplesBitmapGeneric<S: SequenceAccess, B: BitmapAccess> {
     pub bitmap_y: B,
     /// adjacency list storing the object IDs (generic: in-memory or file-based)
     pub adjlist_z: AdjListGeneric<S, B>,
-    /// Index for object-based access. ALWAYS in-memory (computed, not in HDT file)
-    pub op_index: OpIndex,
+    /// Index for object-based access. Uses same BitmapAccess type B
+    pub op_index: OpIndexGeneric<B>,
     /// wavelet matrix for predicate-based access (generic: in-memory or file-based)
     pub wavelet_y: sucds::char_sequences::WaveletMatrix<Rank9Sel>,
 }
@@ -213,7 +217,7 @@ impl<S: SequenceAccess, B: BitmapAccess> TriplesBitmapGeneric<S, B> {
     /// Create a new TriplesBitmapGeneric with the given components.
     /// This constructor is used for creating hybrid/streaming implementations.
     pub fn from_components(
-        order: Order, bitmap_y: B, adjlist_z: AdjListGeneric<S, B>, op_index: OpIndex,
+        order: Order, bitmap_y: B, adjlist_z: AdjListGeneric<S, B>, op_index: OpIndexGeneric<B>,
         wavelet_y: WaveletMatrix<Rank9Sel>,
     ) -> Self {
         Self { order, bitmap_y, adjlist_z, op_index, wavelet_y }
@@ -352,7 +356,8 @@ impl TriplesBitmap {
             }
         }
         let bitmap_index = Bitmap { dict: Rank9Sel::new(bitmap_index_bitvector) };
-        let op_index = OpIndex::new(cv, bitmap_index);
+        let bitmap_index_wrapped = InMemoryBitmap::new(bitmap_index);
+        let op_index = OpIndex::new(cv, bitmap_index_wrapped);
         Self { order, bitmap_y: bitmap_y_wrapped, adjlist_z, op_index, wavelet_y }
     }
 }

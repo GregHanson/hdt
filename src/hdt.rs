@@ -3,7 +3,7 @@ use crate::containers::{FileBasedBitmap, FileBasedSequence, MmapBitmap};
 use crate::four_sect_dict::{self, IdKind};
 use crate::header::Header;
 use crate::triples::{
-    HybridCache, Id, ObjectIter, OpIndex, PredicateIter, PredicateObjectIter, SubjectIter, TripleId,
+    HybridCache, Id, ObjectIter, OpIndexGeneric, PredicateIter, PredicateObjectIter, SubjectIter, TripleId,
     TriplesBitmap, TriplesBitmapGeneric,
 };
 use crate::{FourSectDict, header};
@@ -301,8 +301,10 @@ impl Hdt {
     ) -> core::result::Result<HdtHybrid, Box<dyn std::error::Error>> {
         use crate::containers::AdjListGeneric;
 
-        // Load the HybridCache
-        let cache = HybridCache::from_hdt_path(hdt_path)?;
+        // Load the HybridCache and get the offset to the OpIndex bitmap in the cache file
+        let (cache, op_index_bitmap_offset) = HybridCache::from_hdt_path(hdt_path)?;
+        let cache_path = HybridCache::get_cache_path(hdt_path);
+
         // Open HDT file and read header + dictionary
         let hdt_file = File::open(hdt_path)?;
         let mut reader = std::io::BufReader::new(hdt_file);
@@ -327,7 +329,9 @@ impl Hdt {
         let order = cache.order()?;
 
         // Use the cached op_index sequence (already built and stored in cache)
-        let op_index = OpIndex::new(cache.op_index_sequence, cache.op_index_bitmap);
+        // For HdtHybrid, we use MmapBitmap for the OpIndex bitmap (stored at end of cache file)
+        let op_index_bitmap = MmapBitmap::new(&cache_path, op_index_bitmap_offset)?;
+        let op_index = OpIndexGeneric::new(cache.op_index_sequence, op_index_bitmap);
 
         // Build the TriplesBitmapGeneric
         let triples = TriplesBitmapGeneric::from_components(order, bitmap_y, adjlist_z, op_index, cache.wavelet_y);
@@ -360,12 +364,13 @@ impl Hdt {
     #[cfg(feature = "cache")]
     pub fn read_from_path(f: &std::path::Path) -> Result<Self> {
         use crate::containers::{AdjListGeneric, InMemoryBitmap, InMemorySequence};
+        use crate::triples::OpIndex;
         use log::warn;
 
         // Try to use HybridCache for faster loading (avoids recomputing op_index and wavelet_y)
         // But return a fully in-memory Hdt (not HdtHybrid)
-        let cache = match HybridCache::from_hdt_path(f) {
-            Ok(c) => Some(c),
+        let cache_and_offset = match HybridCache::from_hdt_path(f) {
+            Ok((cache, offset)) => Some((cache, offset)),
             Err(e) => {
                 warn!("Could not load HybridCache, falling back to full HDT read: {e}");
                 None
@@ -381,11 +386,10 @@ impl Hdt {
         // Capture position after dictionary for fallback
         let triples_section_offset = reader.stream_position()?;
 
-        let triples = if let Some(cache) = cache {
+        let triples = if let Some((cache, op_index_bitmap_offset)) = cache_and_offset {
             // Try to use cache, but fall back to regular reading if there's any error
             // (e.g., cache is from a different HDT file or corrupted)
             match (|| -> core::result::Result<TriplesBitmap, Box<dyn std::error::Error>> {
-                println!("{:?}", cache.control_info.properties);
                 if cache.header_size()? != (header.length as u64) {
                     error!(
                         "index file corrupt, headers don't match. expected {}, got {}",
@@ -407,8 +411,16 @@ impl Hdt {
                 reader.seek(SeekFrom::Start(cache.bitmap_z_offset))?;
                 let bitmap_z = crate::containers::Bitmap::read(&mut reader)?;
 
-                // Use cached op_index and wavelet_y
-                let op_index = OpIndex::new(cache.op_index_sequence, cache.op_index_bitmap);
+                // Use cached op_index sequence and load bitmap from cache file
+                // For Hdt (fully in-memory), we load the OpIndex bitmap into memory
+                let cache_path = HybridCache::get_cache_path(f);
+                let cache_file = File::open(cache_path)?;
+                let mut cache_reader = std::io::BufReader::new(cache_file);
+                cache_reader.seek(SeekFrom::Start(op_index_bitmap_offset))?;
+                let op_index_bitmap = crate::containers::Bitmap::read(&mut cache_reader)?;
+                let op_index_bitmap_wrapped = InMemoryBitmap::new(op_index_bitmap);
+                let op_index = OpIndex::new(cache.op_index_sequence, op_index_bitmap_wrapped);
+
                 let adjlist_z =
                     AdjListGeneric::new(InMemorySequence::new(sequence_z), InMemoryBitmap::new(bitmap_z));
                 let bitmap_y_mem = InMemoryBitmap::new(bitmap_y);
@@ -626,6 +638,7 @@ pub mod tests {
     // make sure loading with cache works under different circumstances
     // e.g. clear cache, prexisting cache, stale cache
     #[test]
+    #[serial_test::serial]
     #[cfg(feature = "cache")]
     fn cache() -> Result<()> {
         use crate::triples::hybrid_cache::CACHE_EXT;
@@ -634,11 +647,10 @@ pub mod tests {
         init();
         // start with an empty cache
         let filename = "tests/resources/snikmeta.hdt";
-        let cachename = format!("{filename}.{CACHE_EXT}");
         let path = Path::new(filename);
-        let path_cache = Path::new(&cachename);
+        let path_cache = HybridCache::get_cache_path(path);
         // force fresh cache
-        let _ = remove_file(path_cache);
+        let _ = remove_file(&path_cache);
         let hdt1 = Hdt::read_from_path(path)?;
         snikmeta_check(&hdt1)?;
         // now it should be cached
@@ -663,7 +675,7 @@ pub mod tests {
             let _ = remove_file(path_empty_cache);
             Hdt::read_from_path(path_empty_hdt)?;
             // purposefully create a mismatch between cache and HDT file for the same name
-            fs_err::rename(path_empty_cache, path_cache)?;
+            fs_err::rename(path_empty_cache, &path_cache)?;
             // mismatch should be detected and handled
             let hdt3 = Hdt::read_from_path(path)?;
             snikmeta_check(&hdt3)?;
@@ -679,6 +691,8 @@ pub mod tests {
         init();
 
         let hdt_path = Path::new("tests/resources/snikmeta.hdt");
+
+        let _ = std::fs::remove_file(HybridCache::get_cache_path(hdt_path));
 
         // Load with validation
         let start = Instant::now();

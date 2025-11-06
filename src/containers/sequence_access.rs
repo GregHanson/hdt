@@ -135,7 +135,7 @@ impl FileBasedSequence {
         use crate::containers::vbyte::read_vbyte;
         use std::io::{Read, Seek, SeekFrom};
 
-        let file = std::fs::File::open(&file_path)?;
+        let file = std::fs::File::open(file_path)?;
         let mut reader = std::io::BufReader::new(file);
 
         // Seek to the start of the sequence section
@@ -174,7 +174,7 @@ impl FileBasedSequence {
         let data_offset = sequence_offset + metadata_size;
 
         // Re-open file for the cached reader
-        let file = std::fs::File::open(&file_path)?;
+        let file = std::fs::File::open(file_path)?;
         let reader = std::io::BufReader::new(file);
         let positioned_reader = PositionedReader::new(reader);
 

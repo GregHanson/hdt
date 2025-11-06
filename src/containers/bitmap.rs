@@ -110,7 +110,7 @@ impl Bitmap {
         }
 
         // read all but the last word, last word is byte aligned
-        let full_byte_amount = ((num_bits - 1) >> 6) * 8;
+        let full_byte_amount = if num_bits == 0 { 0 } else { ((num_bits - 1) >> 6) * 8 };
         let mut full_words = vec![0_u8; full_byte_amount];
         // div_ceil is unstable
         let mut data: Vec<usize> =

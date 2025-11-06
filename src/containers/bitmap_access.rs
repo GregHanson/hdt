@@ -118,7 +118,7 @@ impl FileBasedBitmap {
         use crate::containers::vbyte::read_vbyte;
         use std::io::{Read, Seek, SeekFrom};
 
-        let file = std::fs::File::open(&file_path)?;
+        let file = std::fs::File::open(file_path)?;
         let mut reader = std::io::BufReader::new(file);
 
         // Seek to the start of the bitmap section
@@ -157,7 +157,7 @@ impl FileBasedBitmap {
         let num_ones_cached = Self::count_ones(&mut reader, num_bits, num_words)?;
 
         // Re-open file for the cached reader
-        let file = std::fs::File::open(&file_path)?;
+        let file = std::fs::File::open(file_path)?;
         let reader = std::io::BufReader::new(file);
         let positioned_reader = PositionedReader::new(reader);
 
@@ -340,7 +340,6 @@ impl FileBasedBitmap {
 /// Memory usage:
 /// - Only metadata in heap (~100 bytes)
 /// - Bitmap data in OS page cache (demand-paged)
-#[derive(Debug)]
 pub struct MmapBitmap {
     /// Memory-mapped file
     mmap: memmap2::Mmap,
@@ -352,6 +351,12 @@ pub struct MmapBitmap {
     num_words: usize,
     /// Cached count of one bits
     num_ones_cached: usize,
+}
+
+impl fmt::Debug for MmapBitmap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}, memmaped from file", ByteSize(self.size_in_bytes() as u64))
+    }
 }
 
 impl MmapBitmap {

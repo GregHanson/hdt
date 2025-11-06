@@ -453,7 +453,7 @@ impl FileBasedDictSectPfc {
         use std::fs::File;
         use std::io::{BufReader, Seek, SeekFrom};
 
-        let file = File::open(&file_path)?;
+        let file = File::open(file_path)?;
         let mut reader = BufReader::new(file);
         reader.seek(SeekFrom::Start(section_offset))?;
 
@@ -495,7 +495,7 @@ impl FileBasedDictSectPfc {
 
         // Open a new file handle for the cached reader
         // (We create a fresh file handle for data access to avoid conflicts with metadata reading)
-        let data_file = File::open(&file_path)?;
+        let data_file = File::open(file_path)?;
         let data_reader = BufReader::new(data_file);
         let positioned_reader = crate::containers::PositionedReader::new(data_reader);
         let file = std::sync::Arc::new(std::sync::Mutex::new(positioned_reader));
