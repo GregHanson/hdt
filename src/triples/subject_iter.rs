@@ -2,11 +2,16 @@ use super::{Id, TripleId, TriplesBitmapGeneric};
 use crate::containers::{BitmapAccess, SequenceAccess};
 
 /// Iterator over triples fitting an SPO, SP? S?? or ??? triple pattern.
-/// Generic over sequence access type S and bitmap access type B for TriplesBitmapGeneric.
+/// Generic over sequence access type S, compact vector access type C, and bitmap access type B for TriplesBitmapGeneric.
 //#[derive(Debug)]
-pub struct SubjectIter<'a, S: SequenceAccess = crate::containers::InMemorySequence, B: BitmapAccess = crate::containers::InMemoryBitmap> {
+pub struct SubjectIter<
+    'a,
+    S: SequenceAccess = crate::containers::InMemorySequence,
+    C: crate::containers::CompactVectorAccess = crate::containers::InMemoryCompactVector,
+    B: BitmapAccess = crate::containers::InMemoryBitmap,
+> {
     // triples data
-    triples: &'a TriplesBitmapGeneric<S, B>,
+    triples: &'a TriplesBitmapGeneric<S, C, B>,
     // x-coordinate identifier
     x: Id,
     // current position
@@ -17,9 +22,9 @@ pub struct SubjectIter<'a, S: SequenceAccess = crate::containers::InMemorySequen
     search_z: usize, // for S?O
 }
 
-impl<'a, S: SequenceAccess, B: BitmapAccess> SubjectIter<'a, S, B> {
+impl<'a, S: SequenceAccess, C: crate::containers::CompactVectorAccess, B: BitmapAccess> SubjectIter<'a, S, C, B> {
     /// Create an iterator over all triples.
-    pub fn new(triples: &'a TriplesBitmapGeneric<S, B>) -> Self {
+    pub fn new(triples: &'a TriplesBitmapGeneric<S, C, B>) -> Self {
         SubjectIter {
             triples,
             x: 1, // was 0 in the old code but it should start at 1
@@ -32,13 +37,13 @@ impl<'a, S: SequenceAccess, B: BitmapAccess> SubjectIter<'a, S, B> {
     }
 
     /// Use when no results are found.
-    pub const fn empty(triples: &'a TriplesBitmapGeneric<S, B>) -> Self {
+    pub const fn empty(triples: &'a TriplesBitmapGeneric<S, C, B>) -> Self {
         SubjectIter { triples, x: 1, pos_y: 0, pos_z: 0, max_y: 0, max_z: 0, search_z: 0 }
     }
 
     /// Convenience method for the S?? triple pattern.
     /// See <https://github.com/rdfhdt/hdt-cpp/blob/develop/libhdt/src/triples/BitmapTriplesIterators.cpp>.
-    pub fn with_s(triples: &'a TriplesBitmapGeneric<S, B>, subject_id: Id) -> Self {
+    pub fn with_s(triples: &'a TriplesBitmapGeneric<S, C, B>, subject_id: Id) -> Self {
         let min_y = triples.find_y(subject_id - 1);
         let min_z = triples.adjlist_z.find(min_y as Id);
         let max_y = triples.find_y(subject_id);
@@ -59,7 +64,7 @@ impl<'a, S: SequenceAccess, B: BitmapAccess> SubjectIter<'a, S, B> {
     /// SubjectIter::with_pattern(triples, TripleId(1, 2, 3);
     /// ```
     // Translated from <https://github.com/rdfhdt/hdt-cpp/blob/develop/libhdt/src/triples/BitmapTriplesIterators.cpp>.
-    pub fn with_pattern(triples: &'a TriplesBitmapGeneric<S, B>, pat: TripleId) -> Self {
+    pub fn with_pattern(triples: &'a TriplesBitmapGeneric<S, C, B>, pat: TripleId) -> Self {
         let [pat_x, pat_y, pat_z] = pat;
         let (min_y, max_y, min_z, max_z);
         let mut x = 1;
@@ -108,7 +113,9 @@ impl<'a, S: SequenceAccess, B: BitmapAccess> SubjectIter<'a, S, B> {
     }
 }
 
-impl<S: SequenceAccess, B: BitmapAccess> Iterator for SubjectIter<'_, S, B> {
+impl<S: SequenceAccess, C: crate::containers::CompactVectorAccess, B: BitmapAccess> Iterator
+    for SubjectIter<'_, S, C, B>
+{
     type Item = TripleId;
 
     fn next(&mut self) -> Option<Self::Item> {

@@ -7,18 +7,18 @@ use crate::triples::{Id, TripleId, TriplesBitmapGeneric};
 // TODO test with other orders and fix if broken
 
 /// Iterator over all triples with a given object ID, answering an (?S,?P,O) query.
-/// Generic over sequence access type S and bitmap access type B for TriplesBitmapGeneric.
-pub struct ObjectIter<'a, S: SequenceAccess = crate::containers::InMemorySequence, B: BitmapAccess = crate::containers::InMemoryBitmap> {
-    triples: &'a TriplesBitmapGeneric<S, B>,
+/// Generic over sequence access type S, compact vector access type C, and bitmap access type B for TriplesBitmapGeneric.
+pub struct ObjectIter<'a, S: SequenceAccess = crate::containers::InMemorySequence, C: crate::containers::CompactVectorAccess = crate::containers::InMemoryCompactVector, B: BitmapAccess = crate::containers::InMemoryBitmap> {
+    triples: &'a TriplesBitmapGeneric<S, C, B>,
     o: Id,
     pos_index: usize,
     max_index: usize,
 }
 
-impl<'a, S: SequenceAccess, B: BitmapAccess> ObjectIter<'a, S, B> {
+impl<'a, S: SequenceAccess, C: crate::containers::CompactVectorAccess, B: BitmapAccess> ObjectIter<'a, S, C, B> {
     /// Create a new iterator over all triples with the given object ID.
     /// Panics if the object does not exist.
-    pub fn new(triples: &'a TriplesBitmapGeneric<S, B>, o: Id) -> Self {
+    pub fn new(triples: &'a TriplesBitmapGeneric<S, C, B>, o: Id) -> Self {
         assert!(o != 0, "object 0 does not exist, cant iterate");
         let pos_index = triples.op_index.find(o);
         let max_index = triples.op_index.last(o);
@@ -27,7 +27,7 @@ impl<'a, S: SequenceAccess, B: BitmapAccess> ObjectIter<'a, S, B> {
     }
 }
 
-impl<S: SequenceAccess, B: BitmapAccess> Iterator for ObjectIter<'_, S, B> {
+impl<S: SequenceAccess, C: crate::containers::CompactVectorAccess, B: BitmapAccess> Iterator for ObjectIter<'_, S, C, B> {
     type Item = TripleId;
     fn next(&mut self) -> Option<Self::Item> {
         if self.pos_index > self.max_index {

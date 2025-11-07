@@ -1,5 +1,5 @@
+use crate::containers::{BitmapAccess, CompactVectorAccess, SequenceAccess};
 use crate::triples::{Id, TriplesBitmapGeneric};
-use crate::containers::{BitmapAccess, SequenceAccess};
 use std::cmp::Ordering;
 
 // see filterPredSubj in "Exchange and Consumption of Huge RDF Data" by Martinez et al. 2012
@@ -7,16 +7,21 @@ use std::cmp::Ordering;
 
 /// Iterator over all subject IDs with a given predicate and object ID, answering an (?S,P,O) query.
 /// Generic over sequence access type S and bitmap access type B for TriplesBitmapGeneric.
-pub struct PredicateObjectIter<'a, S: SequenceAccess = crate::containers::InMemorySequence, B: BitmapAccess = crate::containers::InMemoryBitmap> {
-    triples: &'a TriplesBitmapGeneric<S, B>,
+pub struct PredicateObjectIter<
+    'a,
+    S: SequenceAccess = crate::containers::InMemorySequence,
+    C: crate::containers::CompactVectorAccess = crate::containers::InMemoryCompactVector,
+    B: BitmapAccess = crate::containers::InMemoryBitmap,
+> {
+    triples: &'a TriplesBitmapGeneric<S, C, B>,
     pos_index: usize,
     max_index: usize,
 }
 
-impl<'a, S: SequenceAccess, B: BitmapAccess> PredicateObjectIter<'a, S, B> {
+impl<'a, S: SequenceAccess, C: CompactVectorAccess, B: BitmapAccess> PredicateObjectIter<'a, S, C, B> {
     /// Create a new iterator over all triples with the given predicate and object ID.
     /// Panics if the predicate or object ID is 0.
-    pub fn new(triples: &'a TriplesBitmapGeneric<S, B>, p: Id, o: Id) -> Self {
+    pub fn new(triples: &'a TriplesBitmapGeneric<S, C, B>, p: Id, o: Id) -> Self {
         assert_ne!(0, p, "predicate 0 does not exist, cant iterate");
         assert_ne!(0, o, "object 0 does not exist, cant iterate");
         let mut low = triples.op_index.find(o);
@@ -66,7 +71,9 @@ impl<'a, S: SequenceAccess, B: BitmapAccess> PredicateObjectIter<'a, S, B> {
     }
 }
 
-impl<S: SequenceAccess, B: BitmapAccess> Iterator for PredicateObjectIter<'_, S, B> {
+impl<S: SequenceAccess, C: crate::containers::CompactVectorAccess, B: BitmapAccess> Iterator
+    for PredicateObjectIter<'_, S, C, B>
+{
     type Item = Id;
     fn next(&mut self) -> Option<Self::Item> {
         if self.pos_index > self.max_index {

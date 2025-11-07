@@ -1,10 +1,15 @@
+use crate::containers::{BitmapAccess, CompactVectorAccess, SequenceAccess};
 use crate::triples::{Id, TripleId, TriplesBitmapGeneric};
-use crate::containers::{BitmapAccess, SequenceAccess};
 
 /// Iterator over all triples with a given property ID, answering an (?S,P,?O) query.
 /// Generic over sequence access type S and bitmap access type B for TriplesBitmapGeneric.
-pub struct PredicateIter<'a, S: SequenceAccess = crate::containers::InMemorySequence, B: BitmapAccess = crate::containers::InMemoryBitmap> {
-    triples: &'a TriplesBitmapGeneric<S, B>,
+pub struct PredicateIter<
+    'a,
+    S: SequenceAccess = crate::containers::InMemorySequence,
+    C: crate::containers::CompactVectorAccess = crate::containers::InMemoryCompactVector,
+    B: BitmapAccess = crate::containers::InMemoryBitmap,
+> {
+    triples: &'a TriplesBitmapGeneric<S, C, B>,
     s: Id,
     p: Id,
     i: usize,
@@ -13,10 +18,10 @@ pub struct PredicateIter<'a, S: SequenceAccess = crate::containers::InMemorySequ
     occs: usize,
 }
 
-impl<'a, S: SequenceAccess, B: BitmapAccess> PredicateIter<'a, S, B> {
+impl<'a, S: SequenceAccess, C: CompactVectorAccess, B: BitmapAccess> PredicateIter<'a, S, C, B> {
     /// Create a new iterator over all triples with the given property ID.
     /// Panics if the object does not exist.
-    pub fn new(triples: &'a TriplesBitmapGeneric<S, B>, p: Id) -> Self {
+    pub fn new(triples: &'a TriplesBitmapGeneric<S, C, B>, p: Id) -> Self {
         assert!(p != 0, "object 0 does not exist, cant iterate");
         let occs = triples.wavelet_y.rank(triples.wavelet_y.len(), p as usize).unwrap();
         //println!("the predicate {} is used by {} subjects in the index", p, occs);
@@ -24,7 +29,9 @@ impl<'a, S: SequenceAccess, B: BitmapAccess> PredicateIter<'a, S, B> {
     }
 }
 
-impl<S: SequenceAccess, B: BitmapAccess> Iterator for PredicateIter<'_, S, B> {
+impl<S: SequenceAccess, C: crate::containers::CompactVectorAccess, B: BitmapAccess> Iterator
+    for PredicateIter<'_, S, C, B>
+{
     type Item = TripleId;
     fn next(&mut self) -> Option<Self::Item> {
         if self.i >= self.occs {

@@ -11,7 +11,6 @@
 //!   - properties["order"]           (SPO=1, SOP=2, PSO=3, etc.)
 //!   - properties["numTriples"]      (total number of triples)
 //!   - properties["headerSize"]      (size of HDT header section in bytes)
-//! [Op Index Sequence]               (variable - sucds serialized CompactVector)
 //! [Wavelet Y]                       (variable - sucds serialized WaveletMatrix)
 //! [Bitmap Y Offset: u64]            (8 bytes - offset in HDT file where bitmap_y begins)
 //! [Bitmap Z Offset: u64]            (8 bytes - offset in HDT file where bitmap_z begins)
@@ -22,11 +21,13 @@
 //! [Dict Predicates Offset: u64]     (8 bytes - offset where predicates dictionary section begins)
 //! [Dict Objects Offset: u64]        (8 bytes - offset where objects dictionary section begins)
 //! [Triples Offset: u64]             (8 bytes - offset in HDT file where Triples section begins)
-//! [Op Index Bitmap]                 (variable - sucds serialized Rank9Sel, offset returned by read_from_file())
+//! [Op Index Bitmap]                 (variable - sucds serialized Rank9Sel via Bitmap::write(), offset returned by read_from_file())
+//! [Op Index Sequence]               (variable - sucds serialized CompactVector, offset = bitmap_offset + bitmap_size)
 //! ```
 //!
 //! ## Design Rationale
-//! - **Stored in cache**: op_index (sequence + bitmap), wavelet_y - computed structures, expensive to rebuild
+//! - **Stored in cache (in memory)**: wavelet_y - computed structure, expensive to rebuild, always loaded
+//! - **Stored in cache (on disk)**: op_index.bitmap, op_index.sequence - can be accessed on-demand or mmapped
 //! - **File offsets only**: bitmap_y, bitmap_z - read directly from HDT file on-demand
 //! - **File offsets only**: sequence_z - metadata read during FileBasedSequence::new()
 //! - **Version 4 changes**: Use ControlInfo structure, moved order/numTriples/headerSize to properties
@@ -51,24 +52,20 @@ use std::path::Path;
 use sucds::Serializable;
 use sucds::bit_vectors::Rank9Sel;
 use sucds::char_sequences::WaveletMatrix;
-use sucds::int_vectors::CompactVector;
 
-pub const CACHE_EXT: &str = "index.v4-rust-cache";
+pub const CACHE_EXT: &str = "index.v5-rust-cache";
 const CACHE_FORMAT: &str = "<http://purl.org/HDT/hdt#cacheV4>";
 
 /// Cached structures for HybridTripleAccess
 ///
 /// ## Storage Strategy:
-/// - **In cache (in memory)**: op_index.sequence, wavelet_y - computed/built structures loaded into memory
-/// - **In cache (on disk)**: op_index.bitmap - written at end of cache file, offset returned by read_from_file()
+/// - **In cache (in memory)**: wavelet_y - computed/built structures loaded into memory
+/// - **In cache (on disk)**: op_index.bitmap and op_index.sequence - written at end of cache file, offsets returned by read_from_file()
 /// - **HDT file offsets**: bitmap_y, bitmap_z, sequence_z, dictionary sections - read from HDT file on-demand
 /// - **Metadata in ControlInfo**: order, numTriples, headerSize stored in properties
 pub struct HybridCache {
     /// Control information containing metadata (order, numTriples, headerSize)
     pub control_info: ControlInfo,
-    /// Op-index sequence (stored in cache file, always loaded into memory)
-    /// TODO: significantly larger than OpIndex.bitmap, read from file instead?
-    pub op_index_sequence: CompactVector,
     /// Wavelet matrix (stored in cache file, always loaded into memory)
     pub wavelet_y: WaveletMatrix<Rank9Sel>,
     /// File offset where bitmap_y begins in HDT file
@@ -95,9 +92,8 @@ impl fmt::Debug for HybridCache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "in-memory size {}: {{ {} op_sequence, {} wavelet_y }}",
-            ByteSize(self.op_index_sequence.size_in_bytes() as u64 + self.wavelet_y.size_in_bytes() as u64),
-            ByteSize(self.op_index_sequence.size_in_bytes() as u64),
+            "in-memory size {}: {{ {} wavelet_y }}",
+            ByteSize(self.wavelet_y.size_in_bytes() as u64),
             ByteSize(self.wavelet_y.size_in_bytes() as u64),
         )
     }
@@ -279,13 +275,6 @@ impl HybridCache {
         // Write ControlInfo
         control_info.write(&mut writer).expect("Failed to write ControlInfo");
 
-        // Write op_index.sequence
-        triples_bitmap
-            .op_index
-            .sequence
-            .serialize_into(&mut writer)
-            .expect("Failed to serialize op_index.sequence");
-
         // Write wavelet_y
         triples_bitmap.wavelet_y.serialize_into(&mut writer).expect("Failed to serialize wavelet_y");
 
@@ -300,17 +289,30 @@ impl HybridCache {
         writer.write_all(&dict_objects_offset.to_le_bytes()).expect("Failed to write dict_objects_offset");
         writer.write_all(&triples_offset.to_le_bytes()).expect("Failed to write triples_offset");
 
-        let op_index_bitmap_offset = writer.stream_position().expect("failed to get op index bitmap offset");
-        // Write op_index.bitmap at the END of the file
-        // (offset returned by read_from_file(), can be mmap'd or loaded into memory)
+        let op_index_offset = writer.stream_position().expect("failed to get op index offset");
+        println!("Writing op_index at offset: {}", op_index_offset);
+        println!("OpIndex bitmap has {} bits", triples_bitmap.op_index.bitmap.inner().len());
+
+        // Write op_index.bitmap, then op_index.sequence at the END of the file
+        // (offset returned by read_from_file(), both can be accessed on-demand)
         triples_bitmap.op_index.bitmap.inner().write(&mut writer).expect("Failed to serialize op_index.bitmap");
+        let after_bitmap_pos = writer.stream_position().expect("failed to get position after bitmap");
+        println!("After bitmap write, position: {} (wrote {} bytes)", after_bitmap_pos, after_bitmap_pos - op_index_offset);
+
+        triples_bitmap
+            .op_index
+            .sequence
+            .inner()
+            .serialize_into(&mut writer)
+            .expect("Failed to serialize op_index.sequence");
+        let after_sequence_pos = writer.stream_position().expect("failed to get position after sequence");
+        println!("After sequence write, position: {}", after_sequence_pos);
 
         writer.flush().expect("Failed to flush writer");
 
         // Create and return the cache structure
         let cache = Self {
             control_info,
-            op_index_sequence: triples_bitmap.op_index.sequence.clone(),
             wavelet_y: triples_bitmap.wavelet_y.clone(),
             bitmap_y_offset,
             bitmap_z_offset,
@@ -325,15 +327,16 @@ impl HybridCache {
 
         debug!("Cache generated and saved to: {}", cache_path.display());
         debug!("{cache:#?}");
-        (cache, op_index_bitmap_offset)
+        (cache, op_index_offset)
     }
 
-    /// Read cache from file, returning the cache structure and the offset to the OpIndex bitmap
+    /// Read cache from file, returning the cache structure and the offset to the OpIndex data
     ///
     /// # Returns
     /// Returns a tuple `(HybridCache, u64)` where:
-    /// - `HybridCache`: The loaded cache with in-memory structures (op_index.sequence, wavelet_y)
-    /// - `u64`: File offset in the cache file where the OpIndex bitmap begins (can be used with MmapBitmap::new(), InMemoryBitmap, or FileBasedBitmap constructors)
+    /// - `HybridCache`: The loaded cache with in-memory structures (wavelet_y only)
+    /// - `u64`: File offset in the cache file where the OpIndex data begins (bitmap then sequence).
+    ///   Callers can use this offset to construct both bitmap and sequence accessors.
     pub fn read_from_file<P: AsRef<Path>>(path: P) -> Result<(Self, u64), Box<dyn std::error::Error>> {
         use crate::containers::ControlType;
         let file = File::open(path)?;
@@ -361,9 +364,6 @@ impl HybridCache {
         }
 
         // Read computed structures (in-memory)
-        // Read op_index.sequence
-        let op_index_sequence = CompactVector::deserialize_from(&mut reader)?;
-
         // Read wavelet_y
         let wavelet_y = WaveletMatrix::deserialize_from(&mut reader)?;
 
@@ -404,13 +404,11 @@ impl HybridCache {
         reader.read_exact(&mut triples_offset_bytes)?;
         let triples_offset = u64::from_le_bytes(triples_offset_bytes);
 
-        // The OpIndex bitmap starts right after all the offsets
-        // (it's the last thing in the file)
-        let op_index_bitmap_offset = reader.stream_position()?;
+        // The OpIndex data (bitmap then sequence) starts right after all the offsets
+        let op_index_offset = reader.stream_position()?;
 
         let cache = Self {
             control_info,
-            op_index_sequence,
             wavelet_y,
             bitmap_y_offset,
             bitmap_z_offset,
@@ -423,7 +421,7 @@ impl HybridCache {
             triples_offset,
         };
 
-        Ok((cache, op_index_bitmap_offset))
+        Ok((cache, op_index_offset))
     }
 }
 
@@ -449,12 +447,11 @@ mod tests {
 
         // Verify both caches are identical
         assert_eq!(cache1.order()? as u8, cache2.order()? as u8);
-        assert_eq!(cache1.op_index_sequence.len(), cache2.op_index_sequence.len());
         assert_eq!(cache1.wavelet_y.len(), cache2.wavelet_y.len());
         assert_eq!(cache1.bitmap_y_offset, cache2.bitmap_y_offset);
         assert_eq!(cache1.bitmap_z_offset, cache2.bitmap_z_offset);
         assert_eq!(cache1.sequence_z_offset, cache2.sequence_z_offset);
-        assert_eq!(offset1, offset2, "OpIndex bitmap offsets should match");
+        assert_eq!(offset1, offset2, "OpIndex offsets should match");
 
         println!("\nBoth caches are identical!");
 

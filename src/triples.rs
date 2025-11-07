@@ -1,7 +1,8 @@
 use crate::ControlInfo;
 use crate::containers::{
-    AdjListGeneric, Bitmap, BitmapAccess, FileBasedBitmap, FileBasedSequence, InMemoryBitmap, InMemorySequence,
-    Sequence, SequenceAccess, bitmap, control_info, sequence,
+    AdjListGeneric, Bitmap, BitmapAccess, CompactVectorAccess, FileBasedBitmap, FileBasedCompactVector,
+    FileBasedSequence, InMemoryBitmap, InMemoryCompactVector, InMemorySequence, Sequence, SequenceAccess, bitmap,
+    control_info, sequence,
 };
 use bytesize::ByteSize;
 use log::error;
@@ -65,20 +66,22 @@ impl TryFrom<u32> for Order {
 /// Used for logarithmic (?) time access instead of linear time sequential search.
 /// See Martínez-Prieto, M., M. Arias, and J. Fernández (2012). Exchange and Consumption of Huge RDF Data. Pages 8--10.
 ///
-/// Generic over B: BitmapAccess to support both in-memory and file-based bitmaps.
-pub struct OpIndexGeneric<B: BitmapAccess> {
+/// Generic over:
+/// - C: CompactVectorAccess for the sequence (InMemoryCompactVector or FileBasedCompactVector)
+/// - B: BitmapAccess for the bitmap (InMemoryBitmap, FileBasedBitmap, or MmapBitmap)
+pub struct OpIndexGeneric<C: CompactVectorAccess, B: BitmapAccess> {
     /// Compact integer vector of object positions.
     /// "[...] integer sequence: SoP, which stores, for each object, a sorted list of references to the predicate-subject pairs (sorted by predicate) related to it."
-    pub sequence: CompactVector,
+    pub sequence: C,
     /// Bitmap with a one bit for every new object to allow finding the starting point for a given object id.
     pub bitmap: B,
 }
 
 /// Type alias for traditional in-memory OpIndex.
 /// This maintains backward compatibility with existing code.
-pub type OpIndex = OpIndexGeneric<InMemoryBitmap>;
+pub type OpIndex = OpIndexGeneric<InMemoryCompactVector, InMemoryBitmap>;
 
-impl<B: BitmapAccess> fmt::Debug for OpIndexGeneric<B> {
+impl<C: CompactVectorAccess, B: BitmapAccess> fmt::Debug for OpIndexGeneric<C, B> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "total size {} {{", ByteSize(self.size_in_bytes() as u64))?;
         writeln!(
@@ -91,9 +94,9 @@ impl<B: BitmapAccess> fmt::Debug for OpIndexGeneric<B> {
     }
 }
 
-impl<B: BitmapAccess> OpIndexGeneric<B> {
+impl<C: CompactVectorAccess, B: BitmapAccess> OpIndexGeneric<C, B> {
     /// Create a new OpIndex with the given sequence and bitmap
-    pub fn new(sequence: CompactVector, bitmap: B) -> Self {
+    pub fn new(sequence: C, bitmap: B) -> Self {
         Self { sequence, bitmap }
     }
 
@@ -114,7 +117,6 @@ impl<B: BitmapAccess> OpIndexGeneric<B> {
 
     /// Get the value at the given index
     pub fn get(&self, index: usize) -> usize {
-        use sucds::int_vectors::Access;
         self.sequence.access(index).expect("index out of bounds")
     }
 
@@ -133,35 +135,36 @@ impl<B: BitmapAccess> OpIndexGeneric<B> {
 ///
 /// Generic over:
 /// - S: SequenceAccess (InMemorySequence or FileBasedSequence)
+/// - C: CompactVectorAccess (InMemoryCompactVector or FileBasedCompactVector)
 /// - B: BitmapAccess (InMemoryBitmap, FileBasedBitmap, or MmapBitmap)
 ///
-/// **Note:** OpIndex bitmap now uses the same BitmapAccess type B as the other bitmaps.
-/// This allows HdtHybrid to use MmapBitmap for the OpIndex while Hdt uses InMemoryBitmap.
+/// **Note:** OpIndex now uses both CompactVectorAccess type C for the sequence and BitmapAccess type B for the bitmap.
+/// This allows HdtHybrid to use file-based/mmap access for OpIndex components, while Hdt uses fully in-memory access.
 ///
 /// ## Main Variants:
 /// 1. **All in-memory**: TriplesBitmap (traditional, fast, high memory)
 /// 2. **File-based**: TriplesBitmapFileBased (streaming, slow, minimal memory)
-/// 3. **Hybrid with mmap**: Uses MmapBitmap for efficient multi-file scenarios
+/// 3. **Hybrid with mmap**: Uses MmapBitmap and FileBasedCompactVector for efficient multi-file scenarios
 //#[derive(Clone)]
-pub struct TriplesBitmapGeneric<S: SequenceAccess, B: BitmapAccess> {
+pub struct TriplesBitmapGeneric<S: SequenceAccess, C: CompactVectorAccess, B: BitmapAccess> {
     order: Order,
     /// bitmap to find positions in the wavelet matrix (generic: in-memory or file-based)
     pub bitmap_y: B,
     /// adjacency list storing the object IDs (generic: in-memory or file-based)
     pub adjlist_z: AdjListGeneric<S, B>,
-    /// Index for object-based access. Uses same BitmapAccess type B
-    pub op_index: OpIndexGeneric<B>,
+    /// Index for object-based access. Generic over both sequence and bitmap access
+    pub op_index: OpIndexGeneric<C, B>,
     /// wavelet matrix for predicate-based access (generic: in-memory or file-based)
     pub wavelet_y: sucds::char_sequences::WaveletMatrix<Rank9Sel>,
 }
 
 /// Type alias for the traditional TriplesBitmap with all in-memory structures.
 /// This maintains backward compatibility with existing code.
-pub type TriplesBitmap = TriplesBitmapGeneric<InMemorySequence, InMemoryBitmap>;
+pub type TriplesBitmap = TriplesBitmapGeneric<InMemorySequence, InMemoryCompactVector, InMemoryBitmap>;
 
 /// Type alias for file-based TriplesBitmap with streaming from disk.
 /// Minimal memory footprint but slower query performance.
-pub type TriplesBitmapFileBased = TriplesBitmapGeneric<FileBasedSequence, FileBasedBitmap>;
+pub type TriplesBitmapFileBased = TriplesBitmapGeneric<FileBasedSequence, FileBasedCompactVector, FileBasedBitmap>;
 
 #[derive(Debug)]
 pub enum Level {
@@ -204,7 +207,7 @@ pub enum Error {
     SequenceError(#[from] sequence::Error),
 }
 
-impl<S: SequenceAccess, B: BitmapAccess> fmt::Debug for TriplesBitmapGeneric<S, B> {
+impl<S: SequenceAccess, C: CompactVectorAccess, B: BitmapAccess> fmt::Debug for TriplesBitmapGeneric<S, C, B> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "total size {}", ByteSize(self.size_in_bytes() as u64))?;
         writeln!(f, "adjlist_z {:#?}", self.adjlist_z)?;
@@ -213,11 +216,11 @@ impl<S: SequenceAccess, B: BitmapAccess> fmt::Debug for TriplesBitmapGeneric<S, 
     }
 }
 
-impl<S: SequenceAccess, B: BitmapAccess> TriplesBitmapGeneric<S, B> {
+impl<S: SequenceAccess, C: CompactVectorAccess, B: BitmapAccess> TriplesBitmapGeneric<S, C, B> {
     /// Create a new TriplesBitmapGeneric with the given components.
     /// This constructor is used for creating hybrid/streaming implementations.
     pub fn from_components(
-        order: Order, bitmap_y: B, adjlist_z: AdjListGeneric<S, B>, op_index: OpIndexGeneric<B>,
+        order: Order, bitmap_y: B, adjlist_z: AdjListGeneric<S, B>, op_index: OpIndexGeneric<C, B>,
         wavelet_y: WaveletMatrix<Rank9Sel>,
     ) -> Self {
         Self { order, bitmap_y, adjlist_z, op_index, wavelet_y }
@@ -357,7 +360,8 @@ impl TriplesBitmap {
         }
         let bitmap_index = Bitmap { dict: Rank9Sel::new(bitmap_index_bitvector) };
         let bitmap_index_wrapped = InMemoryBitmap::new(bitmap_index);
-        let op_index = OpIndex::new(cv, bitmap_index_wrapped);
+        let cv_wrapped = InMemoryCompactVector::new(cv);
+        let op_index = OpIndex::new(cv_wrapped, bitmap_index_wrapped);
         Self { order, bitmap_y: bitmap_y_wrapped, adjlist_z, op_index, wavelet_y }
     }
 }

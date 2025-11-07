@@ -168,14 +168,36 @@ impl Bitmap {
         let checksum = hasher.finalize();
         w.write_all(&checksum.to_le_bytes())?;
 
-        // write data
+        // write data (matching the read format: full words + byte-by-byte last word)
         let crc32 = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI);
         let mut hasher = crc32.digest();
 
         let words = self.dict.bit_vector().words();
-        let bytes: Vec<u8> = words.iter().flat_map(|&val| val.to_le_bytes()).collect();
-        w.write_all(&bytes)?;
-        hasher.update(&bytes);
+        let num_bits = self.dict.len();
+
+        if num_bits > 0 {
+            // Write all but the last word as full 8-byte words
+            let num_full_words = (num_bits - 1) / 64;
+            for i in 0..num_full_words {
+                let word_bytes = words[i].to_le_bytes();
+                w.write_all(&word_bytes)?;
+                hasher.update(&word_bytes);
+            }
+
+            // Write the last word byte-by-byte based on remaining bits
+            if num_full_words < words.len() {
+                let last_word = words[num_full_words];
+                let last_word_bits = ((num_bits - 1) % 64) + 1;
+                let last_word_bytes = ((last_word_bits - 1) / 8) + 1;
+
+                for byte_idx in 0..last_word_bytes {
+                    let byte_val = ((last_word >> (byte_idx * 8)) & 0xFF) as u8;
+                    w.write_all(&[byte_val])?;
+                    hasher.update(&[byte_val]);
+                }
+            }
+        }
+
         let crc_code = hasher.finalize();
         let crc_code = crc_code.to_le_bytes();
         w.write_all(&crc_code)?;

@@ -1,4 +1,4 @@
-use crate::containers::{ControlInfo, control_info};
+use crate::containers::{Bitmap, ControlInfo, FileBasedCompactVector, control_info};
 use crate::containers::{FileBasedBitmap, FileBasedSequence, MmapBitmap};
 use crate::four_sect_dict::{self, IdKind};
 use crate::header::Header;
@@ -35,15 +35,24 @@ pub struct Hdt {
     pub triples: TriplesBitmap,
 }
 
-/// Type alias for hybrid/streaming HDT implementation using file-based sequences, bitmaps, and dictionaries, but in-memory wavelet.
-/// Uses FileBasedSequence for adjlist_z (streaming), FileBasedBitmap for bitmaps, FileBasedDictSectPfc for dictionaries, and OpIndex is always in-memory.
+/// Type alias for hybrid/streaming HDT implementation using file-based sequences, bitmaps, compact vectors, and dictionaries, but in-memory wavelet.
+/// Uses FileBasedSequence for adjlist_z (streaming), FileBasedCompactVector for OpIndex sequence, MmapBitmap for bitmaps, and FileBasedDictSectPfc for dictionaries.
 /// Used with HybridCache for memory-efficient querying of large HDT files.
-pub type HdtHybrid = HdtGeneric<FileBasedSequence, MmapBitmap, crate::dict_sect_pfc::FileBasedDictSectPfc>;
+pub type HdtHybrid = HdtGeneric<
+    FileBasedSequence,
+    crate::containers::FileBasedCompactVector,
+    MmapBitmap,
+    crate::dict_sect_pfc::FileBasedDictSectPfc,
+>;
 
 /// Type alias for fully file-based HDT implementation.
-/// Uses file-based sequences, bitmaps, AND dictionary sections for maximum memory efficiency.
-pub type HdtFullyFileBased =
-    HdtGeneric<FileBasedSequence, FileBasedBitmap, crate::dict_sect_pfc::FileBasedDictSectPfc>;
+/// Uses file-based sequences, bitmaps, compact vectors, AND dictionary sections for maximum memory efficiency.
+pub type HdtFullyFileBased = HdtGeneric<
+    FileBasedSequence,
+    crate::containers::FileBasedCompactVector,
+    FileBasedBitmap,
+    crate::dict_sect_pfc::FileBasedDictSectPfc,
+>;
 
 /// Generic HDT structure that can work with different TriplesBitmap and Dictionary implementations.
 ///
@@ -54,21 +63,23 @@ pub type HdtFullyFileBased =
 #[derive(Debug)]
 pub struct HdtGeneric<
     S: crate::containers::SequenceAccess,
+    C: crate::containers::CompactVectorAccess,
     B: crate::containers::BitmapAccess,
     D: crate::dict_sect_pfc::DictSectPfcAccess,
 > {
     header: Header,
     pub dict: crate::four_sect_dict::FourSectDictGeneric<D>,
-    pub triples: TriplesBitmapGeneric<S, B>,
+    pub triples: TriplesBitmapGeneric<S, C, B>,
 }
 
 type StringTriple = [Arc<str>; 3];
 
 impl<
     S: crate::containers::SequenceAccess,
+    C: crate::containers::CompactVectorAccess,
     B: crate::containers::BitmapAccess,
     D: crate::dict_sect_pfc::DictSectPfcAccess,
-> HdtGeneric<S, B, D>
+> HdtGeneric<S, C, B, D>
 {
     /// Recursive size in bytes on the heap.
     pub fn size_in_bytes(&self) -> usize {
@@ -188,10 +199,11 @@ impl<
 struct TripleCacheGeneric<
     'a,
     S: crate::containers::SequenceAccess,
+    C: crate::containers::CompactVectorAccess,
     B: crate::containers::BitmapAccess,
     D: crate::dict_sect_pfc::DictSectPfcAccess,
 > {
-    hdt: &'a HdtGeneric<S, B, D>,
+    hdt: &'a HdtGeneric<S, C, B, D>,
     tid: TripleId,
     arc: [Option<Arc<str>>; 3],
 }
@@ -199,12 +211,13 @@ struct TripleCacheGeneric<
 impl<
     'a,
     S: crate::containers::SequenceAccess,
+    C: crate::containers::CompactVectorAccess,
     B: crate::containers::BitmapAccess,
     D: crate::dict_sect_pfc::DictSectPfcAccess,
-> TripleCacheGeneric<'a, S, B, D>
+> TripleCacheGeneric<'a, S, C, B, D>
 {
     /// Build a new [`TripleCacheGeneric`] for the given [`HdtGeneric`]
-    const fn new(hdt: &'a HdtGeneric<S, B, D>) -> Self {
+    const fn new(hdt: &'a HdtGeneric<S, C, B, D>) -> Self {
         TripleCacheGeneric { hdt, tid: [0; 3], arc: [None, None, None] }
     }
 
@@ -300,6 +313,7 @@ impl Hdt {
         hdt_path: &Path, _skip_dict_validation: bool,
     ) -> core::result::Result<HdtHybrid, Box<dyn std::error::Error>> {
         use crate::containers::AdjListGeneric;
+        use std::io::Seek;
 
         // Load the HybridCache and get the offset to the OpIndex bitmap in the cache file
         let (cache, op_index_bitmap_offset) = HybridCache::from_hdt_path(hdt_path)?;
@@ -331,7 +345,21 @@ impl Hdt {
         // Use the cached op_index sequence (already built and stored in cache)
         // For HdtHybrid, we use MmapBitmap for the OpIndex bitmap (stored at end of cache file)
         let op_index_bitmap = MmapBitmap::new(&cache_path, op_index_bitmap_offset)?;
-        let op_index = OpIndexGeneric::new(cache.op_index_sequence, op_index_bitmap);
+        let file = std::fs::File::open(&cache_path)?;
+        let mut reader = std::io::BufReader::new(file);
+        reader.seek(std::io::SeekFrom::Start(op_index_bitmap_offset))?;
+        println!("Reading op_index bitmap starting at offset: {}", op_index_bitmap_offset);
+        println!("Reader position before read: {}", reader.stream_position()?);
+        let bitmap_read_result = Bitmap::read(&mut reader)?;
+        let after_bitmap_read_pos = reader.stream_position()?;
+        println!("After bitmap read, position: {} (read {} bytes, bitmap has {} bits)",
+                 after_bitmap_read_pos, after_bitmap_read_pos - op_index_bitmap_offset, bitmap_read_result.len());
+        println!("Reading op_index sequence at position: {}", after_bitmap_read_pos);
+        // let op_index_seq =
+        let op_index = OpIndexGeneric::new(
+            FileBasedCompactVector::new(&cache_path, reader.stream_position().expect("msg")).expect("msg"),
+            op_index_bitmap,
+        );
 
         // Build the TriplesBitmapGeneric
         let triples = TriplesBitmapGeneric::from_components(order, bitmap_y, adjlist_z, op_index, cache.wavelet_y);
@@ -411,15 +439,30 @@ impl Hdt {
                 reader.seek(SeekFrom::Start(cache.bitmap_z_offset))?;
                 let bitmap_z = crate::containers::Bitmap::read(&mut reader)?;
 
-                // Use cached op_index sequence and load bitmap from cache file
-                // For Hdt (fully in-memory), we load the OpIndex bitmap into memory
+                // Load OpIndex bitmap and sequence from cache file
+                // For Hdt (fully in-memory), we load both into memory
                 let cache_path = HybridCache::get_cache_path(f);
                 let cache_file = File::open(cache_path)?;
                 let mut cache_reader = std::io::BufReader::new(cache_file);
+                log::debug!("Seeking to op_index_bitmap_offset: {}", op_index_bitmap_offset);
                 cache_reader.seek(SeekFrom::Start(op_index_bitmap_offset))?;
+
+                // Read bitmap first
+                log::debug!("Reading bitmap from position: {}", cache_reader.stream_position()?);
                 let op_index_bitmap = crate::containers::Bitmap::read(&mut cache_reader)?;
+                let after_bitmap_read_pos = cache_reader.stream_position()?;
+                log::debug!("After bitmap read, position: {}", after_bitmap_read_pos);
                 let op_index_bitmap_wrapped = InMemoryBitmap::new(op_index_bitmap);
-                let op_index = OpIndex::new(cache.op_index_sequence, op_index_bitmap_wrapped);
+
+                // Read sequence second (it's right after the bitmap)
+                use sucds::Serializable;
+                log::debug!("Reading sequence from position: {}", cache_reader.stream_position()?);
+                let op_index_sequence_cv = sucds::int_vectors::CompactVector::deserialize_from(&mut cache_reader)?;
+                let after_sequence_read_pos = cache_reader.stream_position()?;
+                log::debug!("After sequence read, position: {}", after_sequence_read_pos);
+                let op_index_sequence = crate::containers::InMemoryCompactVector::new(op_index_sequence_cv);
+
+                let op_index = OpIndex::new(op_index_sequence, op_index_bitmap_wrapped);
 
                 let adjlist_z =
                     AdjListGeneric::new(InMemorySequence::new(sequence_z), InMemoryBitmap::new(bitmap_z));
@@ -816,11 +859,10 @@ pub mod tests {
     /// Run this once to create the cache file needed by compare_load_times test.
     #[test]
     fn generate_test_cache() -> Result<()> {
-        use crate::triples::hybrid_cache::CACHE_EXT;
         init();
 
         let hdt_path = Path::new("tests/resources/snikmeta.hdt");
-        let cache_name = format!("{}.{CACHE_EXT}", hdt_path.to_str().unwrap());
+        let cache_name = HybridCache::get_cache_path(hdt_path);
 
         println!("Generating HybridCache for {hdt_path:?}...");
         // Generate cache
@@ -833,6 +875,10 @@ pub mod tests {
         // Verify the cache can be loaded
         let _loaded_cache =
             HybridCache::read_from_file(cache_name).map_err(|e| std::io::Error::other(format!("{e}")))?;
+
+        // Verify a HDT can be created from cache
+        let _hdt_hybrid =
+            Hdt::new_hybrid_cache(hdt_path, false).map_err(|e| std::io::Error::other(format!("{e}")))?;
         Ok(())
     }
 
@@ -925,13 +971,14 @@ pub mod tests {
         Ok(())
     }
 
-    /// Generic version of snikmeta_check that works with HdtGeneric<S, B, D, W> (for HdtHybrid, etc.)
+    /// Generic version of snikmeta_check that works with HdtGeneric<S, C, B, D> (for HdtHybrid, etc.)
     pub fn snikmeta_check_generic<
         S: crate::containers::SequenceAccess,
+        C: crate::containers::CompactVectorAccess,
         B: crate::containers::BitmapAccess,
         D: crate::dict_sect_pfc::DictSectPfcAccess,
     >(
-        hdt: &HdtGeneric<S, B, D>,
+        hdt: &HdtGeneric<S, C, B, D>,
     ) -> Result<()> {
         let triples = &hdt.triples;
         assert_eq!(triples.bitmap_y.num_ones(), 49, "{:?}", triples.bitmap_y); // one for each subjecct
