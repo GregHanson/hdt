@@ -178,8 +178,8 @@ impl Bitmap {
         if num_bits > 0 {
             // Write all but the last word as full 8-byte words
             let num_full_words = (num_bits - 1) / 64;
-            for i in 0..num_full_words {
-                let word_bytes = words[i].to_le_bytes();
+            for word in words.iter().take(num_full_words) {
+                let word_bytes = word.to_le_bytes();
                 w.write_all(&word_bytes)?;
                 hasher.update(&word_bytes);
             }

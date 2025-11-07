@@ -290,14 +290,10 @@ impl HybridCache {
         writer.write_all(&triples_offset.to_le_bytes()).expect("Failed to write triples_offset");
 
         let op_index_offset = writer.stream_position().expect("failed to get op index offset");
-        println!("Writing op_index at offset: {}", op_index_offset);
-        println!("OpIndex bitmap has {} bits", triples_bitmap.op_index.bitmap.inner().len());
 
         // Write op_index.bitmap, then op_index.sequence at the END of the file
         // (offset returned by read_from_file(), both can be accessed on-demand)
         triples_bitmap.op_index.bitmap.inner().write(&mut writer).expect("Failed to serialize op_index.bitmap");
-        let after_bitmap_pos = writer.stream_position().expect("failed to get position after bitmap");
-        println!("After bitmap write, position: {} (wrote {} bytes)", after_bitmap_pos, after_bitmap_pos - op_index_offset);
 
         triples_bitmap
             .op_index
@@ -305,8 +301,6 @@ impl HybridCache {
             .inner()
             .serialize_into(&mut writer)
             .expect("Failed to serialize op_index.sequence");
-        let after_sequence_pos = writer.stream_position().expect("failed to get position after sequence");
-        println!("After sequence write, position: {}", after_sequence_pos);
 
         writer.flush().expect("Failed to flush writer");
 

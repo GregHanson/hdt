@@ -1,4 +1,4 @@
-use crate::containers::{Bitmap, ControlInfo, FileBasedCompactVector, control_info};
+use crate::containers::{ControlInfo, FileBasedCompactVector, control_info};
 use crate::containers::{FileBasedBitmap, FileBasedSequence, MmapBitmap};
 use crate::four_sect_dict::{self, IdKind};
 use crate::header::Header;
@@ -305,15 +305,10 @@ impl Hdt {
     ///
     /// # Returns
     /// Returns an `HdtHybrid` instance using file-based sequences and bitmaps for memory efficiency.
-    ///
-    /// # Performance
-    /// - With validation: Full CRC32 checks on all 4 dictionary sections
-    /// - Without validation: Only CRC8 metadata checks, ~400-1200ms faster
     pub fn new_hybrid_cache(
         hdt_path: &Path, _skip_dict_validation: bool,
     ) -> core::result::Result<HdtHybrid, Box<dyn std::error::Error>> {
         use crate::containers::AdjListGeneric;
-        use std::io::Seek;
 
         // Load the HybridCache and get the offset to the OpIndex bitmap in the cache file
         let (cache, op_index_bitmap_offset) = HybridCache::from_hdt_path(hdt_path)?;
@@ -345,19 +340,14 @@ impl Hdt {
         // Use the cached op_index sequence (already built and stored in cache)
         // For HdtHybrid, we use MmapBitmap for the OpIndex bitmap (stored at end of cache file)
         let op_index_bitmap = MmapBitmap::new(&cache_path, op_index_bitmap_offset)?;
-        let file = std::fs::File::open(&cache_path)?;
-        let mut reader = std::io::BufReader::new(file);
-        reader.seek(std::io::SeekFrom::Start(op_index_bitmap_offset))?;
-        println!("Reading op_index bitmap starting at offset: {}", op_index_bitmap_offset);
-        println!("Reader position before read: {}", reader.stream_position()?);
-        let bitmap_read_result = Bitmap::read(&mut reader)?;
-        let after_bitmap_read_pos = reader.stream_position()?;
-        println!("After bitmap read, position: {} (read {} bytes, bitmap has {} bits)",
-                 after_bitmap_read_pos, after_bitmap_read_pos - op_index_bitmap_offset, bitmap_read_result.len());
-        println!("Reading op_index sequence at position: {}", after_bitmap_read_pos);
-        // let op_index_seq =
+
+        // Calculate where the CompactVector begins (right after the bitmap)
+        // Instead of reading the bitmap, we calculate its size from the MmapBitmap metadata
+        let bitmap_size = op_index_bitmap.serialized_size_bytes() as u64;
+        let op_index_sequence_offset = op_index_bitmap_offset + bitmap_size;
+
         let op_index = OpIndexGeneric::new(
-            FileBasedCompactVector::new(&cache_path, reader.stream_position().expect("msg")).expect("msg"),
+            FileBasedCompactVector::new(&cache_path, op_index_sequence_offset)?,
             op_index_bitmap,
         );
 
@@ -394,6 +384,7 @@ impl Hdt {
         use crate::containers::{AdjListGeneric, InMemoryBitmap, InMemorySequence};
         use crate::triples::OpIndex;
         use log::warn;
+        use sucds::Serializable;
 
         // Try to use HybridCache for faster loading (avoids recomputing op_index and wavelet_y)
         // But return a fully in-memory Hdt (not HdtHybrid)
@@ -444,22 +435,14 @@ impl Hdt {
                 let cache_path = HybridCache::get_cache_path(f);
                 let cache_file = File::open(cache_path)?;
                 let mut cache_reader = std::io::BufReader::new(cache_file);
-                log::debug!("Seeking to op_index_bitmap_offset: {}", op_index_bitmap_offset);
                 cache_reader.seek(SeekFrom::Start(op_index_bitmap_offset))?;
 
                 // Read bitmap first
-                log::debug!("Reading bitmap from position: {}", cache_reader.stream_position()?);
                 let op_index_bitmap = crate::containers::Bitmap::read(&mut cache_reader)?;
-                let after_bitmap_read_pos = cache_reader.stream_position()?;
-                log::debug!("After bitmap read, position: {}", after_bitmap_read_pos);
                 let op_index_bitmap_wrapped = InMemoryBitmap::new(op_index_bitmap);
 
                 // Read sequence second (it's right after the bitmap)
-                use sucds::Serializable;
-                log::debug!("Reading sequence from position: {}", cache_reader.stream_position()?);
                 let op_index_sequence_cv = sucds::int_vectors::CompactVector::deserialize_from(&mut cache_reader)?;
-                let after_sequence_read_pos = cache_reader.stream_position()?;
-                log::debug!("After sequence read, position: {}", after_sequence_read_pos);
                 let op_index_sequence = crate::containers::InMemoryCompactVector::new(op_index_sequence_cv);
 
                 let op_index = OpIndex::new(op_index_sequence, op_index_bitmap_wrapped);

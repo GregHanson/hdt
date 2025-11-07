@@ -77,6 +77,8 @@ pub struct FileBasedSequence {
     file: std::sync::Arc<std::sync::Mutex<PositionedReader>>,
 }
 
+pub const USIZE_BITS: usize = usize::BITS as usize;
+
 impl fmt::Debug for FileBasedSequence {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}, sequence read directly from file", ByteSize(self.size_in_bytes() as u64))
@@ -218,7 +220,6 @@ impl FileBasedSequence {
             data.push(val);
         }
 
-        const USIZE_BITS: usize = usize::BITS as usize;
         let scaled_index_in_buffer = bit_in_byte;
         let block_index = scaled_index_in_buffer / USIZE_BITS;
         let bit_index = scaled_index_in_buffer % USIZE_BITS;

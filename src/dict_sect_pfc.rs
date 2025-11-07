@@ -425,11 +425,9 @@ impl fmt::Debug for FileBasedDictSectPfc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "total size {}, {} strings, sequence: {:?}, packed data: {}",
+            "total size {}, {} strings, dictionary read directly from file",
             ByteSize(self.size_in_bytes() as u64),
             self.num_strings,
-            self.sequence,
-            self.packed_data_len
         )
     }
 }

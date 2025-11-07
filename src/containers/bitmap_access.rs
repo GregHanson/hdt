@@ -492,6 +492,44 @@ impl MmapBitmap {
         }
     }
 
+    /// Calculate the total serialized size of this bitmap on disk.
+    ///
+    /// This includes:
+    /// - 1 byte: bitmap type
+    /// - N bytes: vbyte-encoded num_bits
+    /// - 1 byte: CRC8 checksum
+    /// - M bytes: bitmap data (byte-aligned words)
+    /// - 4 bytes: CRC32 checksum
+    ///
+    /// Returns the total number of bytes this bitmap occupies when serialized.
+    pub fn serialized_size_bytes(&self) -> usize {
+        use crate::containers::vbyte::encode_vbyte;
+
+        // Metadata: type (1) + vbyte(num_bits) + crc8 (1)
+        let vbyte_size = encode_vbyte(self.num_bits).len();
+        let metadata_size = 1 + vbyte_size + 1;
+
+        // Data: byte-aligned words
+        let data_size = if self.num_words == 0 {
+            0
+        } else {
+            // Full words
+            let full_words = self.num_words - 1;
+            let full_words_bytes = full_words * 8;
+
+            // Last word (byte-aligned)
+            let last_word_bits = ((self.num_bits - 1) % 64) + 1;
+            let last_word_bytes = last_word_bits.div_ceil(8);
+
+            full_words_bytes + last_word_bytes
+        };
+
+        // CRC32 trailer
+        let crc_size = 4;
+
+        metadata_size + data_size + crc_size
+    }
+
     /// Find the k-th one bit in a 64-bit word (helper function)
     fn select1_in_word(word: u64, k: usize) -> Option<usize> {
         let mut ones_seen = 0usize;

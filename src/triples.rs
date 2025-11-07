@@ -84,12 +84,7 @@ pub type OpIndex = OpIndexGeneric<InMemoryCompactVector, InMemoryBitmap>;
 impl<C: CompactVectorAccess, B: BitmapAccess> fmt::Debug for OpIndexGeneric<C, B> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "total size {} {{", ByteSize(self.size_in_bytes() as u64))?;
-        writeln!(
-            f,
-            "    sequence: {} with {} bits,",
-            ByteSize(self.sequence.size_in_bytes() as u64),
-            self.sequence.width()
-        )?;
+        writeln!(f, "    sequence: {:#?},", self.sequence)?;
         write!(f, "    bitmap: {:#?}\n}}", self.bitmap)
     }
 }
