@@ -1,4 +1,4 @@
-use crate::containers::{ControlInfo, FileBasedCompactVector, control_info};
+use crate::containers::{ControlInfo, FileBasedCompactVector, InMemoryBitmap, InMemorySequence, control_info};
 use crate::containers::{FileBasedBitmap, FileBasedSequence, MmapBitmap};
 use crate::four_sect_dict::{self, IdKind};
 use crate::header::Header;
@@ -22,18 +22,15 @@ pub type Result<T> = core::result::Result<T, Error>;
 /// Converting N-Triples to HDT, available only if HDT is built with the experimental `"nt"` feature.
 mod nt;
 
-/// In-memory representation of an RDF graph loaded from an HDT file.
-/// Allows queries by triple patterns.
-#[derive(Debug)]
-pub struct Hdt {
-    //global_ci: ControlInfo,
-    // header is not necessary for querying but shouldn't waste too much space and we need it for writing in the future, may also make it optional
-    header: Header,
-    /// in-memory representation of dictionary
-    pub dict: FourSectDict,
-    /// in-memory representation of triples
-    pub triples: TriplesBitmap,
-}
+/// Type alias for hybrid/streaming HDT implementation using file-based sequences, bitmaps, compact vectors, and dictionaries, but in-memory wavelet.
+/// Uses FileBasedSequence for adjlist_z (streaming), FileBasedCompactVector for OpIndex sequence, MmapBitmap for bitmaps, and FileBasedDictSectPfc for dictionaries.
+/// Used with HybridCache for memory-efficient querying of large HDT files.
+pub type Hdt = HdtGeneric<
+    InMemorySequence,
+    crate::containers::InMemoryCompactVector,
+    InMemoryBitmap,
+    crate::dict_sect_pfc::DictSectPFC,
+>;
 
 /// Type alias for hybrid/streaming HDT implementation using file-based sequences, bitmaps, compact vectors, and dictionaries, but in-memory wavelet.
 /// Uses FileBasedSequence for adjlist_z (streaming), FileBasedCompactVector for OpIndex sequence, MmapBitmap for bitmaps, and FileBasedDictSectPfc for dictionaries.
@@ -482,162 +479,12 @@ impl Hdt {
         write.flush()?;
         Ok(())
     }
-
-    /// Recursive size in bytes on the heap.
-    pub fn size_in_bytes(&self) -> usize {
-        self.dict.size_in_bytes() + self.triples.size_in_bytes()
-    }
-
-    /// An iterator visiting *all* triples as strings in order.
-    /// Using this method with a filter can be inefficient for large graphs,
-    /// because the strings are stored in compressed form and must be decompressed and allocated.
-    /// Whenever possible, use [`Hdt::triples_with_pattern`] instead.
-    /// # Example
-    /// ```
-    /// fn print_first_triple(hdt: hdt::Hdt) {
-    ///     println!("{:?}", hdt.triples_all().next().expect("no triple in the graph"));
-    /// }
-    /// ```
-    pub fn triples_all(&self) -> impl Iterator<Item = StringTriple> + '_ {
-        let mut triple_cache = TripleCache::new(self);
-        self.triples.into_iter().map(move |ids| triple_cache.translate(ids).unwrap())
-    }
-
-    /// Get all subjects with the given property and object (?PO pattern).
-    /// Use this over `triples_with_pattern(None,Some(p),Some(o))` if you don't need whole triples.
-    /// # Example
-    /// Who was born in Leipzig?
-    /// ```
-    /// fn query(dbpedia: hdt::Hdt) {
-    ///     for person in dbpedia.subjects_with_po(
-    ///       "http://dbpedia.org/ontology/birthPlace", "http://dbpedia.org/resource/Leipzig") {
-    ///       println!("{person:?}");
-    ///     }
-    /// }
-    /// ```
-    pub fn subjects_with_po(&self, p: &str, o: &str) -> Box<dyn Iterator<Item = String> + '_> {
-        let pid = self.dict.string_to_id(p, IdKind::Predicate);
-        let oid = self.dict.string_to_id(o, IdKind::Object);
-        // predicate or object not in dictionary, iterator would interpret 0 as variable
-        if pid == 0 || oid == 0 {
-            return Box::new(iter::empty());
-        }
-        // needed for extending the lifetime of the parameters into the iterator for error messages
-        let p_owned = p.to_owned();
-        let o_owned = o.to_owned();
-        Box::new(
-            PredicateObjectIter::new(&self.triples, pid, oid)
-                .map(move |sid| self.dict.id_to_string(sid, IdKind::Subject))
-                .filter_map(move |r| {
-                    r.map_err(|e| error!("Error on triple with property {p_owned} and object {o_owned}: {e}")).ok()
-                }),
-        )
-    }
-
-    /// Get all triples that fit the given triple patterns, where `None` stands for a variable.
-    /// For example, `triples_with_pattern(Some(s), Some(p), None)` answers an SP? pattern.
-    /// # Example
-    /// What is the capital of the United States of America?
-    /// ```
-    /// fn query(dbpedia: hdt::Hdt) {
-    ///   println!("{:?}", dbpedia.triples_with_pattern(
-    ///     Some("http://dbpedia.org/resource/United_States"), Some("http://dbpedia.org/ontology/capital"), None)
-    ///     .next().expect("no capital found")[2]);
-    /// }
-    /// ```
-    pub fn triples_with_pattern<'a>(
-        &'a self, sp: Option<&'a str>, pp: Option<&'a str>, op: Option<&'a str>,
-    ) -> Box<dyn Iterator<Item = StringTriple> + 'a> {
-        let pattern: [Option<(Arc<str>, usize)>; 3] = [(0, sp), (1, pp), (2, op)]
-            .map(|(i, x)| x.map(|x| (Arc::from(x), self.dict.string_to_id(x, IdKind::KINDS[i]))));
-        // at least one term does not exist in the graph
-        if pattern.iter().flatten().any(|x| x.1 == 0) {
-            return Box::new(iter::empty());
-        }
-        // TODO: improve error handling
-        let mut cache = TripleCache::new(self);
-        match pattern {
-            [Some(s), Some(p), Some(o)] => {
-                if SubjectIter::with_pattern(&self.triples, [s.1, p.1, o.1]).next().is_some() {
-                    Box::new(iter::once([s.0, p.0, o.0]))
-                } else {
-                    Box::new(iter::empty())
-                }
-            }
-            [Some(s), Some(p), None] => {
-                Box::new(SubjectIter::with_pattern(&self.triples, [s.1, p.1, 0]).map(move |t| {
-                    [s.0.clone(), p.0.clone(), Arc::from(self.dict.id_to_string(t[2], IdKind::Object).unwrap())]
-                }))
-            }
-            [Some(s), None, Some(o)] => {
-                Box::new(SubjectIter::with_pattern(&self.triples, [s.1, 0, o.1]).map(move |t| {
-                    [s.0.clone(), Arc::from(self.dict.id_to_string(t[1], IdKind::Predicate).unwrap()), o.0.clone()]
-                }))
-            }
-            [Some(s), None, None] => Box::new(
-                SubjectIter::with_pattern(&self.triples, [s.1, 0, 0])
-                    .map(move |t| [s.0.clone(), cache.get(1, t[1]).unwrap(), cache.get(2, t[2]).unwrap()]),
-            ),
-            [None, Some(p), Some(o)] => {
-                Box::new(PredicateObjectIter::new(&self.triples, p.1, o.1).map(move |sid| {
-                    [Arc::from(self.dict.id_to_string(sid, IdKind::Subject).unwrap()), p.0.clone(), o.0.clone()]
-                }))
-            }
-            [None, Some(p), None] => Box::new(
-                PredicateIter::new(&self.triples, p.1)
-                    .map(move |t| [cache.get(0, t[0]).unwrap(), p.0.clone(), cache.get(2, t[2]).unwrap()]),
-            ),
-            [None, None, Some(o)] => Box::new(
-                ObjectIter::new(&self.triples, o.1)
-                    .map(move |t| [cache.get(0, t[0]).unwrap(), cache.get(1, t[1]).unwrap(), o.0.clone()]),
-            ),
-            [None, None, None] => Box::new(self.triples_all()),
-        }
-    }
-}
-
-/// A TripleCache stores the `Arc<str>` of the last returned triple
-#[derive(Clone, Debug)]
-struct TripleCache<'a> {
-    hdt: &'a Hdt,
-    tid: TripleId,
-    arc: [Option<Arc<str>>; 3],
-}
-
-impl<'a> TripleCache<'a> {
-    /// Build a new [`TripleCache`] for the given [`Hdt`]
-    const fn new(hdt: &'a super::Hdt) -> Self {
-        TripleCache { hdt, tid: [0; 3], arc: [None, None, None] }
-    }
-
-    /// Translate a triple of indexes into a triple of strings.
-    fn translate(&mut self, t: TripleId) -> core::result::Result<StringTriple, TranslateError> {
-        // refactor when try_map for arrays becomes stable
-        Ok([
-            self.get(0, t[0]).map_err(|e| TranslateError { e, t })?,
-            self.get(1, t[1]).map_err(|e| TranslateError { e, t })?,
-            self.get(2, t[2]).map_err(|e| TranslateError { e, t })?,
-        ])
-    }
-
-    fn get(&mut self, pos: usize, id: Id) -> core::result::Result<Arc<str>, four_sect_dict::ExtractError> {
-        debug_assert!(id != 0);
-        debug_assert!(pos < 3);
-        if self.tid[pos] == id {
-            Ok(self.arc[pos].as_ref().unwrap().clone())
-        } else {
-            let ret: Arc<str> = self.hdt.dict.id_to_string(id, IdKind::KINDS[pos])?.into();
-            self.arc[pos] = Some(ret.clone());
-            self.tid[pos] = id;
-            Ok(ret)
-        }
-    }
 }
 
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::{containers::BitmapAccess, tests::init};
+    use crate::tests::init;
     use color_eyre::Result;
     use fs_err::File;
     use pretty_assertions::{assert_eq, assert_ne};
@@ -653,11 +500,11 @@ pub mod tests {
     fn write() -> Result<()> {
         init();
         let hdt = snikmeta()?;
-        snikmeta_check(&hdt)?;
+        snikmeta_check_generic(&hdt)?;
         let mut buf = Vec::<u8>::new();
         hdt.write(&mut buf)?;
         let hdt2 = Hdt::read(std::io::Cursor::new(buf))?;
-        snikmeta_check(&hdt2)?;
+        snikmeta_check_generic(&hdt2)?;
         Ok(())
     }
 
@@ -678,10 +525,10 @@ pub mod tests {
         // force fresh cache
         let _ = remove_file(&path_cache);
         let hdt1 = Hdt::read_from_path(path)?;
-        snikmeta_check(&hdt1)?;
+        snikmeta_check_generic(&hdt1)?;
         // now it should be cached
         let hdt2 = Hdt::read_from_path(path)?;
-        snikmeta_check(&hdt2)?;
+        snikmeta_check_generic(&hdt2)?;
         #[cfg(feature = "nt")]
         {
             // create a cache for an empty HDT
@@ -704,7 +551,7 @@ pub mod tests {
             fs_err::rename(path_empty_cache, &path_cache)?;
             // mismatch should be detected and handled
             let hdt3 = Hdt::read_from_path(path)?;
-            snikmeta_check(&hdt3)?;
+            snikmeta_check_generic(&hdt3)?;
         }
         Ok(())
     }
@@ -825,7 +672,7 @@ pub mod tests {
         // Note: Can't easily query HdtHybrid without implementing iterator traits
         println!("  In-memory triple count: {in_memory_count}");
         let start = Instant::now();
-        snikmeta_check(&hdt_in_memory)?;
+        snikmeta_check_generic(&hdt_in_memory)?;
         let in_memory_time = start.elapsed();
 
         let start = Instant::now();
@@ -883,74 +730,12 @@ pub mod tests {
 
         assert_eq!(nt_triples, hdt_triples);
         assert_eq!(snikmeta.triples.bitmap_y.inner().dict, snikmeta_nt.triples.bitmap_y.inner().dict);
-        snikmeta_check(&snikmeta_nt)?;
+        snikmeta_check_generic(&snikmeta_nt)?;
         let path = std::path::Path::new("tests/resources/empty.nt");
         let hdt_empty = Hdt::read_nt(path)?;
         let mut buf = Vec::<u8>::new();
         hdt_empty.write(&mut buf)?;
         Hdt::read(std::io::Cursor::new(buf))?;
-        Ok(())
-    }
-
-    pub fn snikmeta_check(hdt: &Hdt) -> Result<()> {
-        let triples = &hdt.triples;
-        assert_eq!(triples.bitmap_y.num_ones(), 49, "{:?}", triples.bitmap_y); // one for each subjecct
-        //assert_eq!();
-        let v: Vec<StringTriple> = hdt.triples_all().collect();
-        assert_eq!(v.len(), 328);
-        assert_eq!(hdt.dict.shared.num_strings(), 43);
-        assert_eq!(hdt.dict.subjects.num_strings(), 6);
-        assert_eq!(hdt.dict.predicates.num_strings(), 23);
-        assert_eq!(hdt.dict.objects.num_strings(), 133);
-        assert_eq!(v, hdt.triples_with_pattern(None, None, None).collect::<Vec<_>>(), "all triples not equal ???");
-        assert_ne!(0, hdt.dict.string_to_id("http://www.snik.eu/ontology/meta", IdKind::Subject));
-        for uri in ["http://www.snik.eu/ontology/meta/Top", "http://www.snik.eu/ontology/meta", "doesnotexist"] {
-            let filtered: Vec<_> = v.clone().into_iter().filter(|triple| triple[0].as_ref() == uri).collect();
-            let with_s: Vec<_> = hdt.triples_with_pattern(Some(uri), None, None).collect();
-            assert_eq!(filtered, with_s, "results differ between triples_all() and S?? query for {}", uri);
-        }
-        let s = "http://www.snik.eu/ontology/meta/Top";
-        let p = "http://www.w3.org/2000/01/rdf-schema#label";
-        let o = "\"top class\"@en";
-        let triple_vec = vec![[Arc::from(s), Arc::from(p), Arc::from(o)]];
-        // triple patterns with 2-3 terms
-        assert_eq!(triple_vec, hdt.triples_with_pattern(Some(s), Some(p), Some(o)).collect::<Vec<_>>(), "SPO");
-        assert_eq!(triple_vec, hdt.triples_with_pattern(Some(s), Some(p), None).collect::<Vec<_>>(), "SP?");
-        assert_eq!(triple_vec, hdt.triples_with_pattern(Some(s), None, Some(o)).collect::<Vec<_>>(), "S?O");
-        assert_eq!(triple_vec, hdt.triples_with_pattern(None, Some(p), Some(o)).collect::<Vec<_>>(), "?PO");
-        let et = "http://www.snik.eu/ontology/meta/EntityType";
-        let meta = "http://www.snik.eu/ontology/meta";
-        let subjects = ["ApplicationComponent", "Method", "RepresentationType", "SoftwareProduct"]
-            .map(|s| meta.to_owned() + "/" + s)
-            .to_vec();
-        assert_eq!(
-            subjects,
-            hdt.subjects_with_po("http://www.w3.org/2000/01/rdf-schema#subClassOf", et).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            12,
-            hdt.triples_with_pattern(None, Some("http://www.w3.org/2000/01/rdf-schema#subClassOf"), None).count()
-        );
-        assert_eq!(20, hdt.triples_with_pattern(None, None, Some(et)).count());
-        let snikeu = "http://www.snik.eu";
-        let triple_vec = [
-            "http://purl.org/dc/terms/publisher", "http://purl.org/dc/terms/source",
-            "http://xmlns.com/foaf/0.1/homepage",
-        ]
-        .into_iter()
-        .map(|p| [Arc::from(meta), Arc::from(p), Arc::from(snikeu)])
-        .collect::<Vec<_>>();
-        assert_eq!(
-            triple_vec,
-            hdt.triples_with_pattern(Some(meta), None, Some(snikeu)).collect::<Vec<_>>(),
-            "S?O multiple"
-        );
-        let s = "http://www.snik.eu/ontology/meta/хобби-N-0";
-        assert_eq!(hdt.dict.string_to_id(s, IdKind::Subject), 49);
-        assert_eq!(hdt.dict.id_to_string(49, IdKind::Subject)?, s);
-        let o = "\"ХОББИ\"@ru";
-        let triple_vec = vec![[Arc::from(s), Arc::from(p), Arc::from(o)]];
-        assert_eq!(hdt.triples_with_pattern(Some(s), Some(p), None).collect::<Vec<_>>(), triple_vec);
         Ok(())
     }
 

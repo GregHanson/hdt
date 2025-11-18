@@ -276,7 +276,7 @@ fn build_dict_from_terms(pool: &IndexPool, block_size: usize) -> FourSectDict {
 #[cfg(test)]
 pub mod tests {
     use super::super::StringTriple;
-    use super::super::tests::snikmeta_check;
+    use super::super::tests::snikmeta_check_generic;
     use super::Hdt;
     use crate::hdt::tests::snikmeta;
     use crate::tests::init;
@@ -301,7 +301,7 @@ pub mod tests {
 
         assert_eq!(nt_triples, hdt_triples);
         assert_eq!(snikmeta.triples.bitmap_y.inner().dict, snikmeta_nt.triples.bitmap_y.inner().dict);
-        snikmeta_check(&snikmeta_nt)?;
+        snikmeta_check_generic(&snikmeta_nt)?;
         let path = Path::new("tests/resources/empty.nt");
         let hdt_empty = Hdt::read_nt(path)?;
         let mut buf = Vec::<u8>::new();
