@@ -110,6 +110,8 @@ pub mod sparql;
 pub mod triples;
 /// Constants for triple terms
 pub mod vocab;
+#[cfg(target_arch = "wasm32")]
+pub mod wasm;
 
 pub use crate::hdt::Hdt;
 use containers::ControlInfo;
