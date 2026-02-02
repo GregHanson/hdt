@@ -2,8 +2,9 @@ use crate::ControlInfo;
 use crate::containers::{AdjList, Bitmap, Sequence, bitmap, control_info, sequence};
 use bytesize::ByteSize;
 use log::error;
+use mem_dbg::{MemSize, SizeFlags};
 use qwt::QWT512;
-use qwt::{AccessUnsigned, BitVector, BitVectorMut, SpaceUsage, bitvector::rs_narrow::RSNarrow};
+use qwt::{AccessUnsigned, BitVector, BitVectorMut, bitvector::rs_narrow::RSNarrow};
 use std::cmp::Ordering;
 use std::fmt;
 use std::io::BufRead;
@@ -155,7 +156,7 @@ impl fmt::Debug for TriplesBitmap {
         writeln!(f, "total size {}", ByteSize(self.size_in_bytes() as u64))?;
         writeln!(f, "adjlist_z {:#?}", self.adjlist_z)?;
         writeln!(f, "op_index {:#?}", self.op_index)?;
-        write!(f, "wavelet_y {}", ByteSize(self.wavelet_y.space_usage_byte() as u64))
+        write!(f, "wavelet_y {}", ByteSize(self.wavelet_y.mem_size(SizeFlags::default()) as u64))
     }
 }
 
@@ -303,7 +304,9 @@ impl TriplesBitmap {
 
     /// Size in bytes on the heap.
     pub fn size_in_bytes(&self) -> usize {
-        self.adjlist_z.size_in_bytes() + self.op_index.size_in_bytes() + self.wavelet_y.space_usage_byte()
+        self.adjlist_z.size_in_bytes()
+            + self.op_index.size_in_bytes()
+            + self.wavelet_y.mem_size(SizeFlags::default())
     }
 
     /// Position in the wavelet index of the first predicate for the given subject ID.

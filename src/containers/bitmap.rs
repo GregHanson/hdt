@@ -1,7 +1,8 @@
 //! Bitmap with rank and select support read from an HDT file.
 use crate::containers::vbyte::{encode_vbyte, read_vbyte};
 use bytesize::ByteSize;
-use qwt::{AccessBin, BitVector, BitVectorMut, RankBin, SelectBin, SpaceUsage, bitvector::rs_narrow::RSNarrow};
+use mem_dbg::{MemSize, SizeFlags};
+use qwt::{AccessBin, BitVector, BitVectorMut, RankBin, SelectBin, bitvector::rs_narrow::RSNarrow};
 #[cfg(feature = "cache")]
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -64,7 +65,7 @@ impl Bitmap {
 
     /// Size in bytes on the heap.
     pub fn size_in_bytes(&self) -> usize {
-        self.dict.space_usage_byte()
+        self.dict.mem_size(SizeFlags::default())
     }
 
     /// Number of bits in the bitmap, multiple of 64
