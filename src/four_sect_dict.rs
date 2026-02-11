@@ -5,6 +5,7 @@ use crate::dict_sect_pfc;
 use crate::triples::Id;
 use crate::{ControlInfo, DictSectPFC};
 use std::io::BufRead;
+use std::path::Path;
 #[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
 use std::thread::JoinHandle;
 use thiserror::Error;
@@ -26,22 +27,30 @@ impl IdKind {
     pub const KINDS: [IdKind; 3] = [IdKind::Subject, IdKind::Predicate, IdKind::Object];
 }
 
-/// Four section dictionary with plain front coding.
+/// Generic four section dictionary with plain front coding.
 /// Dictionary with shared, subject, predicate and object sections.
 /// Types specified as <http://purl.org/HDT/hdt#dictionaryFour>.
 /// See <https://www.rdfhdt.org/hdt-internals/#dictionary>.
-#[cfg_attr(test, derive(PartialEq))]
+///
+/// Generic over dictionary section implementation (D) to support both in-memory and file-based access.
 #[derive(Debug)]
-pub struct FourSectDict {
+#[cfg_attr(test, derive(PartialEq))]
+pub struct FourSectDictGeneric<D: dict_sect_pfc::DictSectPfcAccess> {
     /// The shared section contains URIs that occur both in subject and object position. Its IDs start at one.
-    pub shared: DictSectPFC,
+    pub shared: D,
     /// URIs that only occur as subjects. Their IDs start at the last ID of the shared section + 1.
-    pub subjects: DictSectPFC,
+    pub subjects: D,
     /// The predicate section has its own separate numbering starting from 1.
-    pub predicates: DictSectPFC,
+    pub predicates: D,
     /// URIs and literals that only occur as objects . Their IDs start at the last ID of the shared section + 1.
-    pub objects: DictSectPFC,
+    pub objects: D,
 }
+
+/// Type alias for the standard in-memory four section dictionary
+pub type FourSectDict = FourSectDictGeneric<DictSectPFC>;
+
+/// Type alias for file-based four section dictionary
+pub type FourSectDictFileBased = FourSectDictGeneric<dict_sect_pfc::FileBasedDictSectPfc>;
 
 /// Designates one of the four sections.
 #[derive(Debug)]
@@ -92,7 +101,8 @@ pub struct EncodedTripleId {
     pub object: Id,
 }
 
-impl FourSectDict {
+/// Generic implementation for all dictionary section types
+impl<D: dict_sect_pfc::DictSectPfcAccess> FourSectDictGeneric<D> {
     /// Get the string value of a given ID of a given type.
     /// String representation of URIs, literals and blank nodes is defined in <https://www.w3.org/Submission/2011/SUBM-HDT-20110330/#dictionaryEncoding>>..
     pub fn id_to_string(&self, id: Id, id_kind: IdKind) -> core::result::Result<String, ExtractError> {
@@ -149,6 +159,17 @@ impl FourSectDict {
         }
     }
 
+    /// size in bytes of the in memory four section dictionary
+    pub fn size_in_bytes(&self) -> usize {
+        self.shared.size_in_bytes()
+            + self.subjects.size_in_bytes()
+            + self.predicates.size_in_bytes()
+            + self.objects.size_in_bytes()
+    }
+}
+
+/// Implementation specific to in-memory FourSectDict
+impl FourSectDict {
     /// read the whole dictionary section including control information
     pub fn read<R: BufRead>(reader: &mut R) -> Result<UnvalidatedFourSectDict> {
         use SectKind::*;
@@ -171,12 +192,27 @@ impl FourSectDict {
         Ok(())
     }
 
-    /// size in bytes of the in memory four section dictionary
-    pub fn size_in_bytes(&self) -> usize {
-        self.shared.size_in_bytes()
-            + self.subjects.size_in_bytes()
-            + self.predicates.size_in_bytes()
-            + self.objects.size_in_bytes()
+    /// Create a file-based dictionary from cache metadata
+    pub fn from_cache(
+        hdt_path: &Path,
+        shared_offset: u64,
+        subject_offset: u64,
+        predicate_offset: u64,
+        object_offset: u64,
+    ) -> Result<FourSectDictFileBased> {
+        use crate::four_sect_dict::SectKind::*;
+        use dict_sect_pfc::FileBasedDictSectPfc;
+        let buf = &hdt_path.to_path_buf();
+        Ok(FourSectDictGeneric {
+            shared: FileBasedDictSectPfc::new(buf, shared_offset)
+                .map_err(|e| DictSectError { e, sect_kind: Shared })?,
+            subjects: FileBasedDictSectPfc::new(buf, subject_offset)
+                .map_err(|e| DictSectError { e, sect_kind: Subject })?,
+            predicates: FileBasedDictSectPfc::new(buf, predicate_offset)
+                .map_err(|e| DictSectError { e, sect_kind: Predicate })?,
+            objects: FileBasedDictSectPfc::new(buf, object_offset)
+                .map_err(|e| DictSectError { e, sect_kind: Object })?,
+        })
     }
 }
 

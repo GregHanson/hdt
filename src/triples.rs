@@ -484,9 +484,9 @@ impl TriplesBitmap {
     }
 }
 
-impl<'a> IntoIterator for &'a TriplesBitmap {
+impl<'a, S: SequenceAccess, B: BitmapAccess> IntoIterator for &'a TriplesBitmapGeneric<S, B> {
     type Item = TripleId;
-    type IntoIter = SubjectIter<'a, InMemorySequence, InMemoryBitmap>;
+    type IntoIter = SubjectIter<'a, S, B>;
 
     fn into_iter(self) -> Self::IntoIter {
         SubjectIter::new(self)

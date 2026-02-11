@@ -1,6 +1,7 @@
 #![allow(missing_docs)] // temporariy while we figure out what should be public in the end
 /// Dictionary section with plain front coding.
 /// See <https://www.rdfhdt.org/hdt-binary-format/#DictionarySectionPlainFrontCoding>.
+use crate::containers::sequence_access::PositionedReader;
 use crate::containers::vbyte::{decode_vbyte_delta, encode_vbyte, read_vbyte};
 use crate::containers::{Sequence, sequence};
 use crate::triples::Id;
@@ -19,7 +20,24 @@ pub type Result<T> = core::result::Result<T, Error>;
 /// Type alias for the internal read result to reduce complexity
 type ReadInternalResult = (usize, usize, Sequence, Arc<[u8]>, [u8; 4]);
 
-/// Dictionary section with plain front coding.
+/// Trait for dictionary section access (both in-memory and file-based).
+/// Provides the core operations needed to query a dictionary section.
+pub trait DictSectPfcAccess: fmt::Debug + Send + Sync {
+    /// Get the total number of strings stored in this section
+    fn num_strings(&self) -> usize;
+
+    /// Get the size in bytes of this dictionary section
+    fn size_in_bytes(&self) -> usize;
+
+    /// Find the ID for a given string, returns 0 if not found
+    fn string_to_id(&self, element: &str) -> Id;
+
+    /// Extract the string with the given ID (1-indexed)
+    fn extract(&self, id: Id) -> core::result::Result<String, ExtractError>;
+}
+
+/// In-memory dictionary section with plain front coding.
+/// This is the default implementation that loads all data into memory.
 //#[derive(Clone)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct DictSectPFC {
@@ -382,6 +400,335 @@ impl DictSectPFC {
             sequence: Sequence::new(&offsets),
             packed_data: Arc::from(compressed_terms),
         }
+    }
+}
+
+/// Implement DictSectPfcAccess for DictSectPFC (in-memory)
+impl DictSectPfcAccess for DictSectPFC {
+    fn num_strings(&self) -> usize {
+        self.num_strings
+    }
+
+    fn size_in_bytes(&self) -> usize {
+        self.sequence.size_in_bytes() + self.packed_data.len()
+    }
+
+    fn string_to_id(&self, element: &str) -> Id {
+        DictSectPFC::string_to_id(self, element)
+    }
+
+    fn extract(&self, id: Id) -> core::result::Result<String, ExtractError> {
+        DictSectPFC::extract(self, id)
+    }
+}
+
+/// File-based dictionary section that reads strings on-demand from disk.
+///
+/// This implementation keeps only the sequence (for block positions) in memory,
+/// and reads packed_data from disk when needed. This dramatically reduces memory
+/// usage for large dictionaries at the cost of slower lookups.
+pub struct FileBasedDictSectPfc {
+    /// Total number of strings in this section
+    num_strings: usize,
+    /// Block size for plain front coding
+    block_size: usize,
+    /// In-memory sequence for block positions (relatively small)
+    sequence: Sequence,
+    /// Offset where packed data starts (after sequence)
+    packed_data_offset: u64,
+    /// Length of packed data in bytes
+    packed_data_len: usize,
+    /// Cached file handle with position tracking for efficient reading
+    file: std::sync::Arc<std::sync::Mutex<PositionedReader>>,
+}
+
+impl fmt::Debug for FileBasedDictSectPfc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "total size {}, {} strings, dictionary read directly from file",
+            ByteSize(self.size_in_bytes() as u64),
+            self.num_strings,
+        )
+    }
+}
+
+impl FileBasedDictSectPfc {
+    /// Create a new file-based dictionary section.
+    ///
+    /// # Arguments
+    /// * `file_path` - Path to the HDT file
+    /// * `section_offset` - Offset to the start of this dictionary section (including type/metadata)
+    ///
+    /// # Returns
+    /// A file-based dictionary section that reads strings on-demand
+    pub fn new(file_path: &std::path::PathBuf, section_offset: u64) -> Result<Self> {
+        use std::fs::File;
+        use std::io::{BufReader, Read, Seek, SeekFrom};
+
+        let file = File::open(file_path)?;
+        let mut reader = BufReader::new(file);
+        reader.seek(SeekFrom::Start(section_offset))?;
+
+        // Read metadata (similar to read_skip_validation but don't load packed_data)
+        let mut preamble = [0_u8];
+        reader.read_exact(&mut preamble)?;
+        if preamble[0] != 2 {
+            return Err(Error::DictSectNotPfc(preamble[0]));
+        }
+
+        // Read section metadata with CRC8 validation
+        let crc8 = crc::Crc::<u8>::new(&crc::CRC_8_SMBUS);
+        let mut digest8 = crc8.digest();
+        digest8.update(&[0x02]);
+
+        let (num_strings, bytes_read) = read_vbyte(&mut reader)?;
+        digest8.update(&bytes_read);
+        let (packed_length, bytes_read) = read_vbyte(&mut reader)?;
+        digest8.update(&bytes_read);
+        let (block_size, bytes_read) = read_vbyte(&mut reader)?;
+        digest8.update(&bytes_read);
+
+        let mut crc_code8 = [0_u8];
+        reader.read_exact(&mut crc_code8)?;
+        let crc_code8 = crc_code8[0];
+
+        let crc_calculated8 = digest8.finalize();
+        if crc_calculated8 != crc_code8 {
+            return Err(Error::InvalidCrc8Checksum(crc_calculated8, crc_code8));
+        }
+
+        // Read sequence (needs to be in memory for efficient block lookups)
+        let sequence =
+            Sequence::read(&mut reader).map_err(|e| std::io::Error::other(format!("Sequence read error: {e}")))?;
+
+        // Calculate packed data offset
+        let current_pos = reader.stream_position()?;
+        let packed_data_offset = current_pos;
+
+        // Open a new file handle for the cached reader
+        let data_file = File::open(file_path)?;
+        let data_reader = BufReader::new(data_file);
+        let positioned_reader = PositionedReader::new(data_reader);
+        let file = std::sync::Arc::new(std::sync::Mutex::new(positioned_reader));
+
+        Ok(FileBasedDictSectPfc {
+            num_strings,
+            block_size,
+            sequence,
+            packed_data_offset,
+            packed_data_len: packed_length,
+            file,
+        })
+    }
+
+    /// Read a range of bytes from the packed data
+    fn read_packed_range(&self, start: usize, len: usize) -> std::io::Result<Vec<u8>> {
+        let mut reader = self.file.lock().unwrap();
+        let offset = self.packed_data_offset + start as u64;
+        reader.seek_to(offset)?;
+        let mut buf = vec![0u8; len];
+        reader.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Read bytes from a position until a null terminator
+    fn read_until_null(&self, start: usize) -> std::io::Result<Vec<u8>> {
+        let mut reader = self.file.lock().unwrap();
+        let offset = self.packed_data_offset + start as u64;
+        reader.seek_to(offset)?;
+
+        let mut result = Vec::new();
+        let mut buf = [0u8; 1];
+        loop {
+            reader.read_exact(&mut buf)?;
+            if buf[0] == 0 {
+                break;
+            }
+            result.push(buf[0]);
+        }
+        Ok(result)
+    }
+
+    /// Get the length of a null-terminated string starting at position
+    fn strlen(&self, position: usize) -> usize {
+        // Read one byte at a time until null
+        let mut len = 0;
+        let mut reader = self.file.lock().unwrap();
+        let offset = self.packed_data_offset + position as u64;
+        if reader.seek_to(offset).is_err() {
+            return 0;
+        }
+
+        let mut buf = [0u8; 1];
+        while reader.read_exact(&mut buf).is_ok() && buf[0] != 0 {
+            len += 1;
+        }
+        len
+    }
+
+    /// Get the string at a block index (for binary search)
+    fn index_str(&self, index: usize) -> Option<String> {
+        let position: usize = self.sequence.get(index);
+        let data = self.read_until_null(position).ok()?;
+        String::from_utf8(data).ok()
+    }
+}
+
+impl DictSectPfcAccess for FileBasedDictSectPfc {
+    fn num_strings(&self) -> usize {
+        self.num_strings
+    }
+
+    fn size_in_bytes(&self) -> usize {
+        // Only in-memory size: sequence + metadata
+        self.sequence.size_in_bytes() + std::mem::size_of::<Self>()
+    }
+
+    fn string_to_id(&self, element: &str) -> Id {
+        if self.num_strings == 0 {
+            return 0;
+        }
+
+        // Binary search on block headers
+        let mut low: usize = 0;
+        let mut high = self.sequence.entries.saturating_sub(2);
+        let max = high;
+        let mut mid = high;
+
+        while low <= high {
+            mid = usize::midpoint(low, high);
+
+            let cmp: Ordering = if mid > max {
+                mid = max;
+                break;
+            } else {
+                match self.index_str(mid) {
+                    Some(text) => element.cmp(&text),
+                    None => break,
+                }
+            };
+            match cmp {
+                Ordering::Less => {
+                    if mid == 0 {
+                        return 0;
+                    }
+                    high = mid - 1;
+                }
+                Ordering::Greater => low = mid + 1,
+                Ordering::Equal => return ((mid * self.block_size) + 1) as Id,
+            }
+        }
+        if high < mid {
+            mid = high;
+        }
+
+        // Search within block (simplified - reads full block)
+        let idblock = self.locate_in_block(mid, element);
+        if idblock == 0 {
+            return 0;
+        }
+        ((mid * self.block_size) + idblock + 1) as Id
+    }
+
+    fn extract(&self, id: Id) -> core::result::Result<String, ExtractError> {
+        if id as usize > self.num_strings {
+            return Err(ExtractError::IdOutOfBounds { id, len: self.num_strings });
+        }
+        let block_index = id.saturating_sub(1) as usize / self.block_size;
+        let string_index = id.saturating_sub(1) as usize % self.block_size;
+        let mut position = self.sequence.get(block_index);
+
+        // Read first string in block
+        let first_str = self.read_until_null(position).map_err(|_| ExtractError::IdOutOfBounds { id, len: self.num_strings })?;
+        let mut string = first_str;
+        position += string.len() + 1;
+
+        // Follow delta encoding to target string
+        for _ in 0..string_index {
+            // Read vbyte delta
+            let delta_data = self.read_packed_range(position, 5).unwrap_or_default();
+            let (delta, vbyte_bytes) = decode_vbyte_delta(&delta_data, 0);
+            position += vbyte_bytes;
+
+            // Read suffix
+            let suffix = self.read_until_null(position).map_err(|_| ExtractError::IdOutOfBounds { id, len: self.num_strings })?;
+            string.truncate(delta);
+            string.extend_from_slice(&suffix);
+            position += suffix.len() + 1;
+        }
+
+        match str::from_utf8(&string) {
+            Ok(s) => Ok(String::from(s)),
+            Err(e) => Err(ExtractError::InvalidUtf8 {
+                source: e,
+                data: string.clone(),
+                recovered: String::from_utf8_lossy(&string).into_owned(),
+            }),
+        }
+    }
+}
+
+impl FileBasedDictSectPfc {
+    /// Search within a block for an element
+    fn locate_in_block(&self, block: usize, element: &str) -> usize {
+        if block >= self.sequence.entries {
+            return 0;
+        }
+        let element = element.as_bytes();
+        let mut pos = self.sequence.get(block);
+        let mut id_in_block = 0;
+        let mut cshared = 0;
+
+        // Read the first string in the block
+        let first_str = match self.read_until_null(pos) {
+            Ok(s) => s,
+            Err(_) => return 0,
+        };
+        let mut temp_string = first_str;
+        pos += temp_string.len() + 1;
+        id_in_block += 1;
+
+        while (id_in_block < self.block_size) && (pos < self.packed_data_len) {
+            // Decode prefix
+            let delta_data = self.read_packed_range(pos, 5).unwrap_or_default();
+            let (delta, vbyte_bytes) = decode_vbyte_delta(&delta_data, 0);
+            pos += vbyte_bytes;
+
+            // Read suffix
+            let suffix = match self.read_until_null(pos) {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            temp_string.truncate(delta);
+            temp_string.extend_from_slice(&suffix);
+
+            if delta >= cshared {
+                cshared += Self::longest_common_prefix(&temp_string[cshared..], &element[cshared..]);
+                if (cshared == element.len()) && (temp_string.len() == element.len()) {
+                    break;
+                }
+            } else {
+                id_in_block = 0;
+                break;
+            }
+            pos += suffix.len() + 1;
+            id_in_block += 1;
+        }
+
+        if pos >= self.packed_data_len || id_in_block == self.block_size {
+            id_in_block = 0;
+        }
+        id_in_block
+    }
+
+    fn longest_common_prefix(a: &[u8], b: &[u8]) -> usize {
+        let len = min(a.len(), b.len());
+        let mut delta = 0;
+        while delta < len && a[delta] == b[delta] {
+            delta += 1;
+        }
+        delta
     }
 }
 

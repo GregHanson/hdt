@@ -113,11 +113,12 @@ pub mod vocab;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
 
-pub use crate::hdt::Hdt;
+pub use crate::hdt::{Hdt, HdtGeneric};
 use containers::ControlInfo;
 use dict_sect_pfc::DictSectPFC;
+pub use dict_sect_pfc::{DictSectPfcAccess, FileBasedDictSectPfc};
 use four_sect_dict::FourSectDict;
-pub use four_sect_dict::IdKind;
+pub use four_sect_dict::{FourSectDictFileBased, FourSectDictGeneric, IdKind};
 
 #[cfg(test)]
 mod tests {
