@@ -37,6 +37,7 @@ oxttl = { version = "0.2.1", optional = true }
 lasso = { version = "0.7.3", features = ["multi-threaded"], optional = true }
 qwt = "0.3.4"
 mem_dbg = "0.3.4"
+memmap2 = "0.9"
 
 [features]
 default = ["sophia"]

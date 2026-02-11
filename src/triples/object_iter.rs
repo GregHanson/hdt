@@ -1,4 +1,5 @@
-use crate::triples::{Id, TripleId, TriplesBitmap};
+use crate::containers::{BitmapAccess, SequenceAccess};
+use crate::triples::{Id, TripleId, TriplesBitmapGeneric};
 use qwt::AccessUnsigned;
 
 // see "Exchange and Consumption of Huge RDF Data" by Martinez et al. 2012
@@ -7,26 +8,25 @@ use qwt::AccessUnsigned;
 // TODO test with other orders and fix if broken
 
 /// Iterator over all triples with a given object ID, answering an (?S,?P,O) query.
-pub struct ObjectIter<'a> {
-    triples: &'a TriplesBitmap,
+pub struct ObjectIter<'a, S: SequenceAccess, B: BitmapAccess> {
+    triples: &'a TriplesBitmapGeneric<S, B>,
     o: Id,
     pos_index: usize,
     max_index: usize,
 }
 
-impl<'a> ObjectIter<'a> {
+impl<'a, S: SequenceAccess, B: BitmapAccess> ObjectIter<'a, S, B> {
     /// Create a new iterator over all triples with the given object ID.
     /// Panics if the object does not exist.
-    pub fn new(triples: &'a TriplesBitmap, o: Id) -> Self {
+    pub fn new(triples: &'a TriplesBitmapGeneric<S, B>, o: Id) -> Self {
         assert!(o != 0, "object 0 does not exist, cant iterate");
         let pos_index = triples.op_index.find(o);
         let max_index = triples.op_index.last(o);
-        //println!("ObjectIter o={} pos_index={} max_index={}", o, pos_index, max_index);
         ObjectIter { triples, o, pos_index, max_index }
     }
 }
 
-impl Iterator for ObjectIter<'_> {
+impl<S: SequenceAccess, B: BitmapAccess> Iterator for ObjectIter<'_, S, B> {
     type Item = TripleId;
     fn next(&mut self) -> Option<Self::Item> {
         if self.pos_index > self.max_index {

@@ -1,4 +1,5 @@
-use crate::triples::{Id, TriplesBitmap};
+use crate::containers::{BitmapAccess, SequenceAccess};
+use crate::triples::{Id, TriplesBitmapGeneric};
 use qwt::AccessUnsigned;
 use std::cmp::Ordering;
 
@@ -6,16 +7,16 @@ use std::cmp::Ordering;
 // https://link.springer.com/chapter/10.1007/978-3-642-30284-8_36
 
 /// Iterator over all subject IDs with a given predicate and object ID, answering an (?S,P,O) query.
-pub struct PredicateObjectIter<'a> {
-    triples: &'a TriplesBitmap,
+pub struct PredicateObjectIter<'a, S: SequenceAccess, B: BitmapAccess> {
+    triples: &'a TriplesBitmapGeneric<S, B>,
     pos_index: usize,
     max_index: usize,
 }
 
-impl<'a> PredicateObjectIter<'a> {
+impl<'a, S: SequenceAccess, B: BitmapAccess> PredicateObjectIter<'a, S, B> {
     /// Create a new iterator over all triples with the given predicate and object ID.
     /// Panics if the predicate or object ID is 0.
-    pub fn new(triples: &'a TriplesBitmap, p: Id, o: Id) -> Self {
+    pub fn new(triples: &'a TriplesBitmapGeneric<S, B>, p: Id, o: Id) -> Self {
         assert_ne!(0, p, "predicate 0 does not exist, cant iterate");
         assert_ne!(0, o, "object 0 does not exist, cant iterate");
         let mut low = triples.op_index.find(o);
@@ -65,15 +66,13 @@ impl<'a> PredicateObjectIter<'a> {
     }
 }
 
-impl Iterator for PredicateObjectIter<'_> {
+impl<S: SequenceAccess, B: BitmapAccess> Iterator for PredicateObjectIter<'_, S, B> {
     type Item = Id;
     fn next(&mut self) -> Option<Self::Item> {
         if self.pos_index > self.max_index {
             return None;
         }
         let pos_y = self.triples.op_index.sequence.get(self.pos_index);
-        //let y = self.triples.wavelet_y.get(pos_y as usize) as Id;
-        //println!(" op p {y}");
         let s = self.triples.bitmap_y.rank(pos_y) as Id + 1;
         self.pos_index += 1;
         Some(s)

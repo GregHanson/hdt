@@ -386,6 +386,7 @@ impl<'a> TripleCache<'a> {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use crate::containers::BitmapAccess;
     use crate::tests::init;
     use color_eyre::Result;
     use fs_err::File;

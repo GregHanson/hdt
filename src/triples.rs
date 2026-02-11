@@ -1,5 +1,8 @@
 use crate::ControlInfo;
-use crate::containers::{AdjList, Bitmap, Sequence, bitmap, control_info, sequence};
+use crate::containers::{
+    AdjList, AdjListGeneric, Bitmap, BitmapAccess, FileBasedBitmap, FileBasedSequence, InMemoryBitmap,
+    InMemorySequence, MmapBitmap, Sequence, SequenceAccess, bitmap, control_info, sequence,
+};
 use bytesize::ByteSize;
 use log::error;
 use mem_dbg::{MemSize, SizeFlags};
@@ -17,6 +20,10 @@ mod predicate_object_iter;
 pub use predicate_object_iter::PredicateObjectIter;
 mod object_iter;
 pub use object_iter::ObjectIter;
+
+mod hybrid_cache;
+pub use hybrid_cache::{CacheMetadata, HybridCache};
+
 #[cfg(feature = "cache")]
 use serde::{self, Deserialize, Serialize};
 
@@ -56,66 +63,116 @@ impl TryFrom<u32> for Order {
     }
 }
 
-/// Inverse index from object id to positions in the object adjacency list.
+/// Generic inverse index from object id to positions in the object adjacency list.
 /// This object-based index allows to traverse from the leaves and support ??O and ?PO queries.
 /// Used for logarithmic (?) time access instead of linear time sequential search.
 /// See Martínez-Prieto, M., M. Arias, and J. Fernández (2012). Exchange and Consumption of Huge RDF Data. Pages 8--10.
-#[cfg_attr(feature = "cache", derive(Deserialize, Serialize))]
-pub struct OpIndex {
+///
+/// Generic over:
+/// - S: SequenceAccess for the sequence (InMemorySequence or FileBasedSequence)
+/// - B: BitmapAccess for the bitmap (InMemoryBitmap, FileBasedBitmap, or MmapBitmap)
+pub struct OpIndexGeneric<S: SequenceAccess, B: BitmapAccess> {
     /// Compact integer vector of object positions.
     /// "[...] integer sequence: SoP, which stores, for each object, a sorted list of references to the predicate-subject pairs (sorted by predicate) related to it."
-    // we don't use our own Sequence type because CompactVector is easier to construct step by step (should we rename it but if yes to what?)
-    // update: as we replaced sucds with QWT, we need to use our own type for now.
-    pub sequence: Sequence,
+    pub sequence: S,
     /// Bitmap with a one bit for every new object to allow finding the starting point for a given object id.
-    pub bitmap: Bitmap,
+    pub bitmap: B,
 }
 
-impl fmt::Debug for OpIndex {
+/// Type alias for traditional in-memory OpIndex.
+/// This maintains backward compatibility with existing code.
+pub type OpIndex = OpIndexGeneric<InMemorySequence, InMemoryBitmap>;
+
+/// Type alias for file-based OpIndex with streaming from disk.
+pub type OpIndexFileBased = OpIndexGeneric<FileBasedSequence, FileBasedBitmap>;
+
+/// Type alias for mmap-based OpIndex.
+pub type OpIndexMmap = OpIndexGeneric<FileBasedSequence, MmapBitmap>;
+
+impl<S: SequenceAccess, B: BitmapAccess> fmt::Debug for OpIndexGeneric<S, B> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "total size {} {{", ByteSize(self.size_in_bytes() as u64))?;
         writeln!(
             f,
             "    sequence: {} with {} bits,",
             ByteSize(self.sequence.size_in_bytes() as u64),
-            self.sequence.bits_per_entry
+            self.sequence.bits_per_entry()
         )?;
         write!(f, "    bitmap: {:#?}\n}}", self.bitmap)
     }
 }
 
-impl OpIndex {
+impl<S: SequenceAccess, B: BitmapAccess> OpIndexGeneric<S, B> {
+    /// Create a new OpIndex with the given sequence and bitmap
+    pub fn new(sequence: S, bitmap: B) -> Self {
+        Self { sequence, bitmap }
+    }
+
     /// Size in bytes on the heap.
     pub fn size_in_bytes(&self) -> usize {
-        //self.sequence.len() * self.sequence.width() / 8 + self.bitmap.size_in_bytes()
         self.sequence.size_in_bytes() + self.bitmap.size_in_bytes()
     }
+
     /// Find the first position in the OP index of the given object ID.
     pub fn find(&self, o: Id) -> usize {
         self.bitmap.select1(o - 1).unwrap() as usize
     }
+
     /// Find the last position in the object index of the given object ID.
     pub fn last(&self, o: Id) -> usize {
         self.bitmap.select1(o).map_or_else(|| self.bitmap.len() - 1, |index| index as usize - 1)
+    }
+
+    /// Get the value at the given index
+    pub fn get(&self, index: usize) -> usize {
+        self.sequence.get(index)
+    }
+
+    /// Number of entries in the sequence
+    pub fn len(&self) -> usize {
+        self.sequence.len()
+    }
+
+    /// Whether the sequence is empty
+    pub fn is_empty(&self) -> bool {
+        self.sequence.is_empty()
     }
 }
 
 type WT = QWT512<usize>;
 
-/// `BitmapTriples` variant of the triples section.
-//#[derive(Clone)]
-#[cfg_attr(feature = "cache", derive(Serialize, Deserialize))]
-pub struct TriplesBitmap {
+/// Generic `BitmapTriples` variant of the triples section.
+///
+/// Generic over:
+/// - S: SequenceAccess (InMemorySequence or FileBasedSequence)
+/// - B: BitmapAccess (InMemoryBitmap, FileBasedBitmap, or MmapBitmap)
+///
+/// ## Main Variants:
+/// 1. **All in-memory**: TriplesBitmap (traditional, fast, high memory)
+/// 2. **File-based**: TriplesBitmapFileBased (streaming, slow, minimal memory)
+/// 3. **Hybrid with mmap**: Uses MmapBitmap for efficient multi-file scenarios
+pub struct TriplesBitmapGeneric<S: SequenceAccess, B: BitmapAccess> {
     order: Order,
-    /// bitmap to find positions in the wavelet matrix
-    pub bitmap_y: Bitmap,
-    /// adjacency list storing the object IDs
-    pub adjlist_z: AdjList,
-    /// Index for object-based access. Points to the predicate layer.
-    pub op_index: OpIndex,
+    /// bitmap to find positions in the wavelet matrix (generic: in-memory or file-based)
+    pub bitmap_y: B,
+    /// adjacency list storing the object IDs (generic: in-memory or file-based)
+    pub adjlist_z: AdjListGeneric<S, B>,
+    /// Index for object-based access. Generic over both sequence and bitmap access
+    pub op_index: OpIndexGeneric<S, B>,
     /// wavelet matrix for predicate-based access
     pub wavelet_y: WT,
 }
+
+/// Type alias for the traditional TriplesBitmap with all in-memory structures.
+/// This maintains backward compatibility with existing code.
+pub type TriplesBitmap = TriplesBitmapGeneric<InMemorySequence, InMemoryBitmap>;
+
+/// Type alias for file-based TriplesBitmap with streaming from disk.
+/// Minimal memory footprint but slower query performance.
+pub type TriplesBitmapFileBased = TriplesBitmapGeneric<FileBasedSequence, FileBasedBitmap>;
+
+/// Type alias for mmap-based TriplesBitmap.
+pub type TriplesBitmapMmap = TriplesBitmapGeneric<FileBasedSequence, MmapBitmap>;
 
 #[derive(Debug)]
 pub enum Level {
@@ -149,9 +206,19 @@ pub enum Error {
     #[error("cache decode error")]
     #[cfg(feature = "cache")]
     Decode(#[from] bincode::error::DecodeError),
+    #[error("IO error")]
+    Io(#[from] std::io::Error),
+    #[error("Header error")]
+    Header(#[from] crate::header::Error),
+    #[error("Four section dictionary error")]
+    FourSectDict(#[from] crate::four_sect_dict::Error),
+    #[error("Bitmap error")]
+    BitmapError(#[from] bitmap::Error),
+    #[error("Sequence error")]
+    SequenceError(#[from] sequence::Error),
 }
 
-impl fmt::Debug for TriplesBitmap {
+impl<S: SequenceAccess, B: BitmapAccess> fmt::Debug for TriplesBitmapGeneric<S, B> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "total size {}", ByteSize(self.size_in_bytes() as u64))?;
         writeln!(f, "adjlist_z {:#?}", self.adjlist_z)?;
@@ -160,146 +227,18 @@ impl fmt::Debug for TriplesBitmap {
     }
 }
 
-impl TriplesBitmap {
-    /// builds the necessary indexes and constructs TriplesBitmap
-    pub fn new(order: Order, sequence_y: &Sequence, bitmap_y: Bitmap, adjlist_z: AdjList) -> Self {
-        //let wavelet_thread = std::thread::spawn(move || WT::from_iter(&sequence_y));
-        let wavelet_y = WT::from_iter(sequence_y);
-
-        let entries = adjlist_z.sequence.entries;
-        // if it takes too long to calculate, can also pass in as parameter
-        let max_object = adjlist_z.sequence.into_iter().max().unwrap_or(0).to_owned();
-        // limited to < 2^32 objects
-        let mut indicess = vec![Vec::<u32>::with_capacity(4); max_object];
-        // Count the indexes of appearance of each object
-        // In https://github.com/rdfhdt/hdt-cpp/blob/develop/libhdt/src/triples/BitmapTriples.cpp
-        // they count the number of appearances in a sequence instead, which saves memory
-        // temporarily but they need to loop over it an additional time.
-        for pos_z in 0..entries {
-            let object = adjlist_z.sequence.get(pos_z);
-            if object == 0 {
-                error!("ERROR: There is a zero value in the Z level.");
-                continue;
-            }
-            let pos_y = adjlist_z.bitmap.rank(pos_z.to_owned());
-            indicess[object - 1].push(pos_y as u32); // hdt index counts from 1 but we count from 0 for simplicity
-        }
-        // reduce memory consumption of index by using adjacency list
-        let mut bitmap_index_bitvector = BitVectorMut::new();
-        //#[allow(clippy::redundant_closure_for_method_calls)] // false positive, anyhow transitive dep
-        /*let mut cv = CompactVector::with_capacity(entries, sucds::utils::needed_bits(entries))
-        .expect("Failed to create OPS index compact vector.");
-        */
-        let mut cv = Vec::<_>::new();
-        // temporarily disable threading for wasm support
-        //let wavelet_y = wavelet_thread.join().unwrap(); // join as late as possible for max parallelization
-        for mut indices in indicess {
-            let mut first = true;
-            // sort by predicate
-            indices.sort_by_cached_key(|pos_y| wavelet_y.get(*pos_y as usize).unwrap());
-            for index in indices {
-                bitmap_index_bitvector.push(first);
-                first = false;
-                cv.push(index as usize);
-            }
-        }
-        let bv = BitVector::from(bitmap_index_bitvector);
-        let bitmap_index = Bitmap { dict: RSNarrow::from(bv) };
-        let op_index = OpIndex { sequence: Sequence::new(&cv), bitmap: bitmap_index };
+// Generic implementation for all TriplesBitmapGeneric variants
+impl<S: SequenceAccess, B: BitmapAccess> TriplesBitmapGeneric<S, B> {
+    /// Create a new TriplesBitmapGeneric with the given components.
+    /// This constructor is used for creating hybrid/streaming implementations.
+    pub fn from_components(
+        order: Order,
+        bitmap_y: B,
+        adjlist_z: AdjListGeneric<S, B>,
+        op_index: OpIndexGeneric<S, B>,
+        wavelet_y: WT,
+    ) -> Self {
         Self { order, bitmap_y, adjlist_z, op_index, wavelet_y }
-    }
-
-    /// Creates a new TriplesBitmap from a list of sorted RDF triples
-    pub fn from_triples(triples: &[TripleId]) -> Self {
-        let mut y_bitmap = BitVectorMut::new();
-        let mut z_bitmap = BitVectorMut::new();
-        let mut array_y = Vec::new();
-        let mut array_z = Vec::new();
-
-        let mut last_x = 0;
-        let mut last_y = 0;
-        let mut last_z = 0;
-        let mut max_y = 1;
-        let mut max_z = 1;
-
-        for (i, triple) in triples.iter().enumerate() {
-            let [x, y, z] = *triple;
-
-            assert!(!(x == 0 || y == 0 || z == 0), "triple IDs should never be zero");
-            max_y = max_y.max(y);
-            max_z = max_z.max(z);
-
-            if i == 0 {
-                array_y.push(y);
-            } else if x != last_x {
-                assert!(x == last_x + 1, "the subjects must be correlative.");
-                //x unchanged
-                y_bitmap.push(true);
-                array_y.push(y);
-
-                z_bitmap.push(true);
-            } else if y != last_y {
-                assert!(y >= last_y, "the predicates must be in increasing order.");
-                // y unchanged
-                y_bitmap.push(false);
-                array_y.push(y);
-
-                z_bitmap.push(true);
-            } else {
-                assert!(z >= last_z, "the objects must be in increasing order");
-                // z changed
-                z_bitmap.push(false);
-            }
-            array_z.push(z);
-
-            last_x = x;
-            last_y = y;
-            last_z = z;
-        }
-        y_bitmap.push(true);
-        let n = y_bitmap.len();
-        // pad to the next multiple of 64 so our comparisons match
-        // TODO: can we just improve the comparisons instead?
-        y_bitmap.extend_with_zeros(n.div_ceil(64) * 64 - n);
-        z_bitmap.push(true);
-        let bitmap_y = Bitmap::from(y_bitmap);
-        let bitmap_z = Bitmap::from(z_bitmap);
-        // bit_width() only in nightly for now
-        /*let sequence_y = Sequence::new(&array_y, (Id::BITS - max_y.leading_zeros()) as usize);
-        let sequence_z = Sequence::new(&array_z, (Id::BITS - max_z.leading_zeros()) as usize);*/
-        let sequence_y = Sequence::new(&array_y);
-        let sequence_z = Sequence::new(&array_z);
-        let adjlist_z = AdjList::new(sequence_z, bitmap_z);
-        TriplesBitmap::new(Order::SPO, &sequence_y, bitmap_y, adjlist_z)
-    }
-
-    /// read the whole triple section including control information
-    // TODO: rename to "read" for consistency with the other components and rename existing read function accordingly
-    pub fn read_sect<R: BufRead>(reader: &mut R) -> Result<Self> {
-        let triples_ci = ControlInfo::read(reader)?;
-
-        match &triples_ci.format[..] {
-            "<http://purl.org/HDT/hdt#triplesBitmap>" => TriplesBitmap::read(reader, &triples_ci),
-            "<http://purl.org/HDT/hdt#triplesList>" => Err(Error::TriplesList),
-            f => Err(Error::UnknownTriplesFormat(f.to_owned())),
-        }
-    }
-
-    /// load the cached HDT index file, only supports TriplesBitmap
-    #[cfg(feature = "cache")]
-    pub fn load_cache<R: BufRead>(reader: &mut R, info: &ControlInfo) -> Result<Self> {
-        match &info.format[..] {
-            "<http://purl.org/HDT/hdt#triplesBitmap>" => TriplesBitmap::load(reader),
-            "<http://purl.org/HDT/hdt#triplesList>" => Err(Error::TriplesList),
-            f => Err(Error::UnknownTriplesFormat(f.to_owned())),
-        }
-    }
-
-    /// load the entire cached TriplesBitmap object
-    #[cfg(feature = "cache")]
-    pub fn load<R: BufRead>(reader: &mut R) -> Result<Self> {
-        let triples: TriplesBitmap = bincode::serde::decode_from_std_read(reader, bincode::config::standard())?;
-        Ok(triples)
     }
 
     /// Size in bytes on the heap.
@@ -346,16 +285,174 @@ impl TriplesBitmap {
         self.bin_search_y(property_id, self.find_y(subject_id), self.last_y(subject_id) + 1)
     }
 
-    /*
-        /// Get the predicate ID for the given z index position.
-    fn get_p(bitmap_z:  Bitmap, wavelet_y: WaveletMatrix, pos_z: usize) -> Id {
-                let pos_y = bitmap_z.dict.rank(pos_z, true);
-                wavelet_y.get(pos_y as usize) as Id
+    /// Transform the given IDs of the layers in triple section order to a triple ID.
+    /// Warning: At the moment only SPO is properly supported anyways, in which case this is equivalent to `[x,y,z]`.
+    /// Other orders may lead to undefined behaviour.
+    pub const fn coord_to_triple(&self, x: Id, y: Id, z: Id) -> Result<TripleId> {
+        if x == 0 || y == 0 || z == 0 {
+            return Err(Error::TripleComponentZero(x, y, z));
+        }
+        match self.order {
+            Order::SPO => Ok([x, y, z]),
+            Order::SOP => Ok([x, z, y]),
+            Order::PSO => Ok([y, x, z]),
+            Order::POS => Ok([y, z, x]),
+            Order::OSP => Ok([z, x, y]),
+            Order::OPS => Ok([z, y, x]),
+            Order::Unknown => Err(Error::UnknownTriplesOrder),
+        }
     }
-    */
+
+    /// Number of triples
+    pub fn len(&self) -> usize {
+        self.adjlist_z.len()
+    }
+
+    /// Whether there are no triples
+    pub fn is_empty(&self) -> bool {
+        self.adjlist_z.is_empty()
+    }
+
+    /// Get the order of the triples
+    pub fn order(&self) -> &Order {
+        &self.order
+    }
+}
+
+// Specialized implementation for in-memory TriplesBitmap
+// These methods build indexes and thus always use in-memory structures
+impl TriplesBitmap {
+    /// builds the necessary indexes and constructs TriplesBitmap
+    pub fn new(order: Order, sequence_y: &Sequence, bitmap_y: Bitmap, adjlist_z: AdjList) -> Self {
+        let wavelet_y = WT::from_iter(sequence_y);
+
+        let entries = adjlist_z.sequence.entries;
+        // if it takes too long to calculate, can also pass in as parameter
+        let max_object = adjlist_z.sequence.into_iter().max().unwrap_or(0).to_owned();
+        // limited to < 2^32 objects
+        let mut indicess = vec![Vec::<u32>::with_capacity(4); max_object];
+        // Count the indexes of appearance of each object
+        for pos_z in 0..entries {
+            let object = adjlist_z.sequence.get(pos_z);
+            if object == 0 {
+                error!("ERROR: There is a zero value in the Z level.");
+                continue;
+            }
+            let pos_y = adjlist_z.bitmap.rank(pos_z.to_owned());
+            indicess[object - 1].push(pos_y as u32);
+        }
+        // reduce memory consumption of index by using adjacency list
+        let mut bitmap_index_bitvector = BitVectorMut::new();
+        let mut cv = Vec::<usize>::new();
+        for mut indices in indicess {
+            let mut first = true;
+            // sort by predicate
+            indices.sort_by_cached_key(|pos_y| wavelet_y.get(*pos_y as usize).unwrap());
+            for index in indices {
+                bitmap_index_bitvector.push(first);
+                first = false;
+                cv.push(index as usize);
+            }
+        }
+        let bv = BitVector::from(bitmap_index_bitvector);
+        let bitmap_index = Bitmap { dict: RSNarrow::from(bv) };
+        let op_index_sequence = InMemorySequence::new(Sequence::new(&cv));
+        let op_index = OpIndexGeneric::new(op_index_sequence, InMemoryBitmap::new(bitmap_index));
+
+        // Wrap adjlist_z components in generic wrappers
+        let adjlist_z_generic = AdjListGeneric::new(
+            InMemorySequence::new(adjlist_z.sequence),
+            InMemoryBitmap::new(adjlist_z.bitmap),
+        );
+
+        Self {
+            order,
+            bitmap_y: InMemoryBitmap::new(bitmap_y),
+            adjlist_z: adjlist_z_generic,
+            op_index,
+            wavelet_y,
+        }
+    }
+
+    /// Creates a new TriplesBitmap from a list of sorted RDF triples
+    pub fn from_triples(triples: &[TripleId]) -> Self {
+        let mut y_bitmap = BitVectorMut::new();
+        let mut z_bitmap = BitVectorMut::new();
+        let mut array_y = Vec::new();
+        let mut array_z = Vec::new();
+
+        let mut last_x = 0;
+        let mut last_y = 0;
+        let mut last_z = 0;
+
+        for (i, triple) in triples.iter().enumerate() {
+            let [x, y, z] = *triple;
+
+            assert!(!(x == 0 || y == 0 || z == 0), "triple IDs should never be zero");
+
+            if i == 0 {
+                array_y.push(y);
+            } else if x != last_x {
+                assert!(x == last_x + 1, "the subjects must be correlative.");
+                y_bitmap.push(true);
+                array_y.push(y);
+                z_bitmap.push(true);
+            } else if y != last_y {
+                assert!(y >= last_y, "the predicates must be in increasing order.");
+                y_bitmap.push(false);
+                array_y.push(y);
+                z_bitmap.push(true);
+            } else {
+                assert!(z >= last_z, "the objects must be in increasing order");
+                z_bitmap.push(false);
+            }
+            array_z.push(z);
+
+            last_x = x;
+            last_y = y;
+            last_z = z;
+        }
+        y_bitmap.push(true);
+        let n = y_bitmap.len();
+        y_bitmap.extend_with_zeros(n.div_ceil(64) * 64 - n);
+        z_bitmap.push(true);
+        let bitmap_y = Bitmap::from(y_bitmap);
+        let bitmap_z = Bitmap::from(z_bitmap);
+        let sequence_y = Sequence::new(&array_y);
+        let sequence_z = Sequence::new(&array_z);
+        let adjlist_z = AdjList::new(sequence_z, bitmap_z);
+        TriplesBitmap::new(Order::SPO, &sequence_y, bitmap_y, adjlist_z)
+    }
+
+    /// read the whole triple section including control information
+    pub fn read_sect<R: BufRead>(reader: &mut R) -> Result<Self> {
+        let triples_ci = ControlInfo::read(reader)?;
+
+        match &triples_ci.format[..] {
+            "<http://purl.org/HDT/hdt#triplesBitmap>" => TriplesBitmap::read(reader, &triples_ci),
+            "<http://purl.org/HDT/hdt#triplesList>" => Err(Error::TriplesList),
+            f => Err(Error::UnknownTriplesFormat(f.to_owned())),
+        }
+    }
+
+    /// load the cached HDT index file, only supports TriplesBitmap
+    #[cfg(feature = "cache")]
+    pub fn load_cache<R: BufRead>(reader: &mut R, info: &ControlInfo) -> Result<Self> {
+        match &info.format[..] {
+            "<http://purl.org/HDT/hdt#triplesBitmap>" => TriplesBitmap::load(reader),
+            "<http://purl.org/HDT/hdt#triplesList>" => Err(Error::TriplesList),
+            f => Err(Error::UnknownTriplesFormat(f.to_owned())),
+        }
+    }
+
+    /// load the entire cached TriplesBitmap object
+    #[cfg(feature = "cache")]
+    pub fn load<R: BufRead>(reader: &mut R) -> Result<Self> {
+        let triples: TriplesBitmapSerde = bincode::serde::decode_from_std_read(reader, bincode::config::standard())?;
+        Ok(triples.into())
+    }
 
     fn read<R: BufRead>(reader: &mut R, triples_ci: &ControlInfo) -> Result<Self> {
-        //let order: Order = Order::try_from(triples_ci.get("order").unwrap().parse::<u32>());
         let order: Order;
         if let Some(n) = triples_ci.get("order").and_then(|v| v.parse::<u32>().ok()) {
             order = Order::try_from(n)?;
@@ -378,42 +475,18 @@ impl TriplesBitmap {
 
     pub fn write(&self, write: &mut impl std::io::Write) -> Result<()> {
         ControlInfo::bitmap_triples(self.order.clone() as u32, self.adjlist_z.len() as u32).write(write)?;
-        self.bitmap_y.write(write).map_err(|e| Error::Bitmap(Level::Y, e))?;
-        self.adjlist_z.bitmap.write(write).map_err(|e| Error::Bitmap(Level::Z, e))?;
+        self.bitmap_y.inner().write(write).map_err(|e| Error::Bitmap(Level::Y, e))?;
+        self.adjlist_z.bitmap.inner().write(write).map_err(|e| Error::Bitmap(Level::Z, e))?;
         let y = self.wavelet_y.iter().collect::<Vec<_>>();
         Sequence::new(&y).write(write).map_err(|e| Error::Sequence(Level::Y, e))?;
-        //Sequence::new(&y, self.wavelet_y.alph_width()).write(write).map_err(|e| Error::Sequence(Level::Y, e))?;
-        self.adjlist_z.sequence.write(write).map_err(|e| Error::Sequence(Level::Z, e))?;
+        self.adjlist_z.sequence.inner().write(write).map_err(|e| Error::Sequence(Level::Z, e))?;
         Ok(())
-    }
-
-    /// Transform the given IDs of the layers in triple section order to a triple ID.
-    /// Warning: At the moment only SPO is properly supported anyways, in which case this is equivalent to `[x,y,z]`.
-    /// Other orders may lead to undefined behaviour.
-    pub const fn coord_to_triple(&self, x: Id, y: Id, z: Id) -> Result<TripleId> {
-        if x == 0 || y == 0 || z == 0 {
-            return Err(Error::TripleComponentZero(x, y, z));
-        }
-        match self.order {
-            Order::SPO => Ok([x, y, z]),
-            Order::SOP => Ok([x, z, y]),
-            Order::PSO => Ok([y, x, z]),
-            Order::POS => Ok([y, z, x]),
-            Order::OSP => Ok([z, x, y]),
-            Order::OPS => Ok([z, y, x]),
-            Order::Unknown => Err(Error::UnknownTriplesOrder),
-        }
-    }
-
-    /// Number of triples
-    pub const fn len(&self) -> usize {
-        self.adjlist_z.sequence.entries
     }
 }
 
 impl<'a> IntoIterator for &'a TriplesBitmap {
     type Item = TripleId;
-    type IntoIter = SubjectIter<'a>;
+    type IntoIter = SubjectIter<'a, InMemorySequence, InMemoryBitmap>;
 
     fn into_iter(self) -> Self::IntoIter {
         SubjectIter::new(self)
@@ -435,8 +508,63 @@ pub type Id = usize;
 /// Predicate index starting at 1 in the combined shared and object section.
 /// When used as a triple, 0 values are invalid.
 /// When used as a pattern, 0 values in a position match all values.
-//#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub type TripleId = [Id; 3];
+
+/// Serde-compatible version of TriplesBitmap for cache serialization
+#[cfg(feature = "cache")]
+#[derive(Serialize, Deserialize)]
+struct TriplesBitmapSerde {
+    order: Order,
+    bitmap_y: Bitmap,
+    adjlist_z_sequence: Sequence,
+    adjlist_z_bitmap: Bitmap,
+    op_index_sequence: Sequence,
+    op_index_bitmap: Bitmap,
+    #[serde(with = "wavelet_serde")]
+    wavelet_y: WT,
+}
+
+#[cfg(feature = "cache")]
+impl From<TriplesBitmapSerde> for TriplesBitmap {
+    fn from(serde: TriplesBitmapSerde) -> Self {
+        Self {
+            order: serde.order,
+            bitmap_y: InMemoryBitmap::new(serde.bitmap_y),
+            adjlist_z: AdjListGeneric::new(
+                InMemorySequence::new(serde.adjlist_z_sequence),
+                InMemoryBitmap::new(serde.adjlist_z_bitmap),
+            ),
+            op_index: OpIndexGeneric::new(
+                InMemorySequence::new(serde.op_index_sequence),
+                InMemoryBitmap::new(serde.op_index_bitmap),
+            ),
+            wavelet_y: serde.wavelet_y,
+        }
+    }
+}
+
+#[cfg(feature = "cache")]
+mod wavelet_serde {
+    use super::WT;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(wavelet: &WT, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // Collect wavelet values and serialize
+        let values: Vec<usize> = wavelet.iter().collect();
+        values.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<WT, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let values: Vec<usize> = Vec::deserialize(deserializer)?;
+        Ok(WT::from_iter(&values))
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -449,7 +577,11 @@ mod tests {
     use std::io::BufReader;
 
     /// Iterator over all triples with a given ID in the specified position (subject, predicate or object).
-    fn triples_with_id<'a>(t: &'a TriplesBitmap, id: usize, k: IdKind) -> Box<dyn Iterator<Item = TripleId> + 'a> {
+    fn triples_with_id<'a>(
+        t: &'a TriplesBitmap,
+        id: usize,
+        k: IdKind,
+    ) -> Box<dyn Iterator<Item = TripleId> + 'a> {
         match k {
             IdKind::Subject => Box::new(SubjectIter::with_s(t, id)),
             IdKind::Predicate => Box::new(PredicateIter::new(t, id)),
@@ -479,8 +611,7 @@ mod tests {
             for i in 1..=lens[j] {
                 filtered = v.iter().filter(|tid| funs[j](**tid) == i).copied().collect();
                 filtered.sort_unstable();
-                let mut triples_with_id =
-                    triples_with_id(&triples, i, IdKind::KINDS[j]).collect::<Vec<TripleId>>();
+                let mut triples_with_id = triples_with_id(&triples, i, IdKind::KINDS[j]).collect::<Vec<TripleId>>();
                 triples_with_id.sort_unstable();
                 assert_eq!(filtered, triples_with_id, "triples_with({},{:?})", i, IdKind::KINDS[j]);
             }
@@ -505,12 +636,4 @@ mod tests {
         assert_eq!(0, SubjectIter::with_pattern(&triples, [12, 14, 154]).count());
         Ok(())
     }
-
-    /*
-      #[test]
-        fn from_triples() -> color_eyre::Result<()> {
-            //let triples: Vec<TripleId> = vec![[1, 2, 3], TripleId::new(1, 2, 4), TripleId::new(2, 3, 5)]; // TODO: add more or read existing ones from file
-            todo!("not yet implemented");
-        }
-    */
 }

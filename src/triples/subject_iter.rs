@@ -1,11 +1,11 @@
-use super::{Id, TripleId, TriplesBitmap};
+use super::{Id, TripleId, TriplesBitmapGeneric};
+use crate::containers::{BitmapAccess, SequenceAccess};
 use qwt::AccessUnsigned;
 
 /// Iterator over triples fitting an SPO, SP? S?? or ??? triple pattern.
-//#[derive(Debug)]
-pub struct SubjectIter<'a> {
+pub struct SubjectIter<'a, S: SequenceAccess, B: BitmapAccess> {
     // triples data
-    triples: &'a TriplesBitmap,
+    triples: &'a TriplesBitmapGeneric<S, B>,
     // x-coordinate identifier
     x: Id,
     // current position
@@ -16,9 +16,9 @@ pub struct SubjectIter<'a> {
     search_z: usize, // for S?O
 }
 
-impl<'a> SubjectIter<'a> {
+impl<'a, S: SequenceAccess, B: BitmapAccess> SubjectIter<'a, S, B> {
     /// Create an iterator over all triples.
-    pub fn new(triples: &'a TriplesBitmap) -> Self {
+    pub fn new(triples: &'a TriplesBitmapGeneric<S, B>) -> Self {
         SubjectIter {
             triples,
             x: 1, // was 0 in the old code but it should start at 1
@@ -31,13 +31,13 @@ impl<'a> SubjectIter<'a> {
     }
 
     /// Use when no results are found.
-    pub const fn empty(triples: &'a TriplesBitmap) -> Self {
+    pub const fn empty(triples: &'a TriplesBitmapGeneric<S, B>) -> Self {
         SubjectIter { triples, x: 1, pos_y: 0, pos_z: 0, max_y: 0, max_z: 0, search_z: 0 }
     }
 
     /// Convenience method for the S?? triple pattern.
     /// See <https://github.com/rdfhdt/hdt-cpp/blob/develop/libhdt/src/triples/BitmapTriplesIterators.cpp>.
-    pub fn with_s(triples: &'a TriplesBitmap, subject_id: Id) -> Self {
+    pub fn with_s(triples: &'a TriplesBitmapGeneric<S, B>, subject_id: Id) -> Self {
         let min_y = triples.find_y(subject_id - 1);
         let min_z = triples.adjlist_z.find(min_y as Id);
         let max_y = triples.find_y(subject_id);
@@ -58,7 +58,7 @@ impl<'a> SubjectIter<'a> {
     /// SubjectIter::with_pattern(triples, TripleId(1, 2, 3);
     /// ```
     // Translated from <https://github.com/rdfhdt/hdt-cpp/blob/develop/libhdt/src/triples/BitmapTriplesIterators.cpp>.
-    pub fn with_pattern(triples: &'a TriplesBitmap, pat: TripleId) -> Self {
+    pub fn with_pattern(triples: &'a TriplesBitmapGeneric<S, B>, pat: TripleId) -> Self {
         let [pat_x, pat_y, pat_z] = pat;
         let (min_y, max_y, min_z, max_z);
         let mut x = 1;
@@ -107,7 +107,7 @@ impl<'a> SubjectIter<'a> {
     }
 }
 
-impl Iterator for SubjectIter<'_> {
+impl<S: SequenceAccess, B: BitmapAccess> Iterator for SubjectIter<'_, S, B> {
     type Item = TripleId;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -138,7 +138,7 @@ impl Iterator for SubjectIter<'_> {
         // theoretically the second condition should only be true if the first is as well but in practise it wasn't, which screwed up the subject identifiers
         // fixed by moving the second condition inside the first one but there may be another reason for the bug occuring in the first place
         if self.triples.adjlist_z.at_last_sibling(self.pos_z) {
-            if self.triples.bitmap_y.at_last_sibling(self.pos_y) {
+            if self.triples.bitmap_y.access(self.pos_y) {
                 self.x += 1;
             }
             self.pos_y += 1;
