@@ -5,72 +5,77 @@
 [![Documentation](https://docs.rs/hdt/badge.svg)](https://docs.rs/hdt/)
 [![Benchmarks](https://img.shields.io/badge/Benchmarks--x.svg?style=social)](https://github.com/KonradHoeffner/hdt_benchmark/blob/master/benchmark_results.ipynb)
 [![HDT Rust @ LD Party Video](https://img.shields.io/badge/video-8A2BE2)](https://www.youtube.com/watch?v=R-S0o_UwPMk)
-[![DOI](https://joss.theoj.org/papers/10.21105/joss.05114/status.svg)](https://doi.org/10.21105/joss.05114)
+[![Paper DOI](https://joss.theoj.org/papers/10.21105/joss.05114/status.svg)](https://doi.org/10.21105/joss.05114)
+[![Software DOI](https://zenodo.org/badge/541577178.svg)](https://doi.org/10.5281/zenodo.7871065)
+[![SWH](https://archive.softwareheritage.org/badge/swh:1:dir:943737774c84d8386b6f11b227ad0f085734776e/)](https://archive.softwareheritage.org/swh:1:dir:943737774c84d8386b6f11b227ad0f085734776e;origin=https://github.com/KonradHoeffner/hdt;visit=swh:1:snp:830dd996a200043fd0312ce76574d0639285cc7b;anchor=swh:1:rev:28d49a2bd3ad2cb2322bff82836ca11930a9a619)
 
 A Rust library for the [Header Dictionary Triples](https://www.rdfhdt.org/) compressed RDF format, including:
 
 * loading the HDT default format as created by [hdt-cpp](https://github.com/rdfhdt/hdt-cpp)
+* converting N-Triples to HDT
 * efficient querying by triple patterns
 * serializing into other formats like RDF Turtle and N-Triples using the [Sophia](https://crates.io/crates/sophia) adapter
+* running SPARQL queries (with the experimental "sparql" feature but HDT is not optimized for that)
 
 However it cannot:
 
-* load other RDF formats
 * load other HDT variants
-
-For this functionality and acknowledgement of all the original authors, please look at the reference implementations in C++ and Java by the [https://github.com/rdfhdt](https://github.com/rdfhdt) organisation.
-
-It also cannot:
-
 * swap data to disk
 * modify the RDF graph in memory
-* run SPARQL queries
 
 If you need any of the those features, consider using a SPARQL endpoint instead.
+For acknowledgement of all the original authors, please look at the reference implementations in C++ and Java by the [https://github.com/rdfhdt](https://github.com/rdfhdt) organisation.
 
 ## Examples
 
-```rust
+```rust,no_run
 use hdt::Hdt;
 
 let file = std::fs::File::open("example.hdt").expect("error opening file");
-let hdt = Hdt::new(std::io::BufReader::new(file)).expect("error loading HDT");
+let hdt = Hdt::read(std::io::BufReader::new(file)).expect("error loading HDT");
 // query
 let majors = hdt.triples_with_pattern(Some("http://dbpedia.org/resource/Leipzig"), Some("http://dbpedia.org/ontology/major"),None);
 println!("{:?}", majors.collect::<Vec<_>>());
 ```
 
-You can also use the Sophia adapter to load HDT files and reduce memory consumption of an existing application based on Sophia, which is re-exported as `hdt::sophia`:
+You can also use the Sophia graph trait implementation to load HDT files and reduce memory consumption of an existing application based on Sophia, which is re-exported as `hdt::sophia`:
 
-```rust
-use hdt::{Hdt,HdtGraph};
+```rust,no_run
+use hdt::Hdt;
 use hdt::sophia::api::graph::Graph;
 use hdt::sophia::api::term::{IriRef, SimpleTerm, matcher::Any};
 
 let file = std::fs::File::open("dbpedia.hdt").expect("error opening file");
-let hdt = Hdt::new(std::io::BufReader::new(file)).expect("error loading HDT");
-let graph = HdtGraph::new(hdt);
+let hdt = Hdt::read(std::io::BufReader::new(file)).expect("error loading HDT");
 let s = SimpleTerm::Iri(IriRef::new_unchecked("http://dbpedia.org/resource/Leipzig".into()));
 let p = SimpleTerm::Iri(IriRef::new_unchecked("http://dbpedia.org/ontology/major".into()));
-let majors = graph.triples_matching(Some(s),Some(p),Any);
+let majors = hdt.triples_matching(Some(s),Some(p),Any);
 ```
 
-If you don't want to pull in the Sophia dependency, you can exclude the adapter:
+If you don't want to pull in the Sophia dependency, you can exclude it:
 
 ```toml
 [dependencies]
 hdt = { version = "...", default-features = false }
 ```
 
-There is also a runnable example [in the examples folder](https://github.com/KonradHoeffner/hdt/tree/main/examples), which you can run with `cargo run --example query`.
+There is also a [folder with runnable examples](https://github.com/KonradHoeffner/hdt/tree/main/examples), which you can run with `cargo run --example examplename` (e.g. `--example query`).
 
-Users can also choose to use the experimental `cache` feature. If enabled, the library will utilize a custom cached TriplesBitmap file if it exists or create one if it does not exist.
+## Experimental Features
+All features other than "sophia" are experimental and are neither guaranteed to work in all combinations nor adher to semver: they may change or be removed in future versions including minor or patch releases.
+
+### Cache
+
+If the experimental `cache` feature is enabled, the library will speed up repeated loading of the same file by utilizing a custom cached index file if it exists or create one if it does not exist.
+Theses index files are incompatible with those generated by the C++ and Java implementations.
 
 ```rust
-let hdt = hdt::Hdt::new_from_path(std::path::Path::new("tests/resources/snikmeta.hdt")).unwrap();
+let hdt = hdt::Hdt::read_from_path(std::path::Path::new("tests/resources/snikmeta.hdt")).expect("snikmeta.hdt not found");
 ```
 
-The `cache` feature is experimental and may change or be removed in future releases.
+### SPARQL
+
+The `sparql` feature implements [spareval](https://crates.io/crates/spareval) .
 
 ## API Documentation
 
@@ -86,27 +91,34 @@ The provided test data is very small in order to keep the size of the crate down
 
 #### Example with perf and Firefox Profiler
 
-    $ cargo test --release
-    [...]
-    Running unittests src/lib.rs (target/release/deps/hdt-2b2f139dafe69681)
-    [...]
-    $ perf record --call-graph=dwarf target/release/deps/hdt-2b2f139dafe69681 hdt::tests::triples
-    $ perf script > /tmp/test.perf
+```sh
+$ cargo test --release
+[...]
+Running unittests src/lib.rs (target/release/deps/hdt-2b2f139dafe69681)
+[...]
+$ perf record --call-graph=dwarf target/release/deps/hdt-2b2f139dafe69681 hdt::tests::triples
+$ perf script > /tmp/test.perf
+```
 
 Then go to <https://profiler.firefox.com/> and open `/tmp/test.perf`.
 
 ## Criterion benchmark
 
-    cargo bench --bench criterion
+```sh
+$ cargo bench --bench criterion
+```
 
 * requires [persondata\_en.hdt](https://github.com/KonradHoeffner/hdt/releases/download/benchmarkdata/persondata_en.hdt.bz2) placed in `tests/resources`
 
 ## iai benchmark
 
-    cargo bench --bench iai
+```sh
+cargo bench --bench iai
+```
 
 * requires [persondata\_en\_10k.hdt](https://github.com/KonradHoeffner/hdt/releases/download/benchmarkdata/persondata_en_10k.hdt.bz2) placed in `tests/resources`
 * requires [Valgrind](https://valgrind.org/) to be installed
+* may require a conservative target CPU like `RUSTFLAGS="-C target-cpu=x86-64" cargo bench --bench iai`
 
 ## Comparative benchmark suite
 

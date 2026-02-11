@@ -1,7 +1,6 @@
 use io::ErrorKind::UnexpectedEof;
 use std::collections::HashMap;
-use std::io::BufRead;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::str;
 
 pub type Result<T> = core::result::Result<T, Error>;
@@ -40,7 +39,7 @@ impl TryFrom<u8> for ControlType {
 }
 
 /// <https://www.rdfhdt.org/hdt-binary-format/>: "preamble that describes a chunk of information".
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ControlInfo {
     /// Type of control information.
     pub control_type: ControlType,
@@ -60,8 +59,8 @@ pub struct Error(#[from] ControlInfoReadErrorKind);
 pub enum ControlInfoReadErrorKind {
     #[error("IO error")]
     Io(#[from] std::io::Error),
-    #[error("chunk {0:?} does not equal the HDT cookie '$HDT'")]
-    HdtCookie([u8; 4]),
+    #[error("chunk {0:?} '{1}' does not equal the HDT cookie '$HDT'")]
+    HdtCookie([u8; 4], String),
     #[error("invalid separator while reading format")]
     InvalidSeparator,
     #[error("invalid CRC16-ANSI checksum")]
@@ -126,7 +125,7 @@ impl ControlInfo {
         let mut hdt_cookie: [u8; 4] = [0; 4];
         reader.read_exact(&mut hdt_cookie)?;
         if &hdt_cookie != b"$HDT" {
-            return Err(HdtCookie(hdt_cookie));
+            return Err(HdtCookie(hdt_cookie, String::from_utf8_lossy(&hdt_cookie).to_string()));
         }
         digest.update(&hdt_cookie);
 

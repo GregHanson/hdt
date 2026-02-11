@@ -1,12 +1,9 @@
 use super::vbyte::encode_vbyte;
 use crate::containers::vbyte::read_vbyte;
 use bytesize::ByteSize;
-#[cfg(feature = "cache")]
-use serde::{self, Deserialize, Serialize};
 use std::fmt;
 use std::io::{BufRead, Write};
 use std::mem::size_of;
-use std::thread;
 
 const USIZE_BITS: usize = usize::BITS as usize;
 
@@ -14,8 +11,7 @@ pub type Result<T> = core::result::Result<T, Error>;
 
 /// Integer sequence with a given number of bits, which means numbers may be represented along byte boundaries.
 /// Also called "array" in the HDT spec, only Log64 is supported.
-//#[derive(Clone)]
-#[cfg_attr(feature = "cache", derive(Deserialize, Serialize))]
+#[derive(Clone)]
 pub struct Sequence {
     /// Number of integers in the sequence.
     pub entries: usize,
@@ -23,9 +19,6 @@ pub struct Sequence {
     pub bits_per_entry: usize,
     /// Data in blocks.
     pub data: Vec<usize>,
-    /// whether CRC check was successful
-    #[cfg_attr(feature = "cache", serde(skip))]
-    pub crc_handle: Option<thread::JoinHandle<bool>>,
 }
 
 enum SequenceType {
@@ -54,6 +47,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("Invalid CRC8-CCIT checksum {0}, expected {1}")]
     InvalidCrc8Checksum(u8, u8),
+    #[error("Invalid CRC32C checksum {0}, expected {1}")]
+    InvalidCrc32Checksum(u32, u32),
     #[error("Failed to turn raw bytes into usize")]
     TryFromSliceError(#[from] std::array::TryFromSliceError),
     #[error("invalid LogArray type {0} != 1")]
@@ -66,10 +61,11 @@ impl fmt::Debug for Sequence {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} with {} entries, {} bits per entry",
+            "{} with {} entries, {} bits per entry, starting with {:?}",
             ByteSize(self.size_in_bytes() as u64),
             self.entries,
-            self.bits_per_entry
+            self.bits_per_entry,
+            self.into_iter().take(10).collect::<Vec::<_>>()
         )
     }
 }
@@ -102,6 +98,7 @@ impl<'a> IntoIterator for &'a Sequence {
 
 impl Sequence {
     /// Get the integer at the given index, counting from 0.
+    /// Panics if the index is out of bounds.
     pub fn get(&self, index: usize) -> usize {
         let scaled_index = index * self.bits_per_entry;
         let block_index = scaled_index / USIZE_BITS;
@@ -122,7 +119,7 @@ impl Sequence {
     }
 
     /// Size in bytes on the heap.
-    pub fn size_in_bytes(&self) -> usize {
+    pub const fn size_in_bytes(&self) -> usize {
         (self.data.len() * USIZE_BITS) >> 3
     }
 
@@ -195,22 +192,23 @@ impl Sequence {
             bits_read += size_of::<usize>();
         }
         data.push(last_value);
-        // temporarily for bug fixing
-        // return Ok(Sequence { entries, bits_per_entry, data, crc_handle: None});
         // read entry body CRC32
         let mut crc_code = [0_u8; 4];
         reader.read_exact(&mut crc_code)?;
-        let crc_handle = Some(thread::spawn(move || {
-            let crc_code = u32::from_le_bytes(crc_code);
 
-            // validate entry body CRC32
-            let crc32 = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI);
-            let mut digest = crc32.digest();
-            digest.update(&history);
-            digest.finalize() == crc_code
-        }));
+        let crc_code32 = u32::from_le_bytes(crc_code);
+        //let start = std::time::Instant::now();
+        // validate entry body CRC32
+        let crc32 = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI);
+        let mut digest = crc32.digest();
+        digest.update(&history);
+        let crc_calculated32 = digest.finalize();
+        //println!("Sequence of {} validated in {:?}", ByteSize(history.len() as u64), start.elapsed());
+        if crc_calculated32 != crc_code32 {
+            return Err(Error::InvalidCrc32Checksum(crc_calculated32, crc_code32));
+        }
 
-        Ok(Sequence { entries, bits_per_entry, data, crc_handle })
+        Ok(Sequence { entries, bits_per_entry, data })
     }
 
     /// save sequence per HDT spec using CRC
@@ -236,7 +234,6 @@ impl Sequence {
         // Write data
         let crc32 = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI);
         let mut digest32 = crc32.digest();
-        //let offset_data = self.pack_bits();
         let bytes: Vec<u8> = self.data.iter().flat_map(|&val| val.to_le_bytes()).collect();
         //  unused zero bytes in the last usize are not written
         let num_bytes = (self.bits_per_entry * self.entries).div_ceil(8);
@@ -249,62 +246,17 @@ impl Sequence {
         Ok(())
     }
 
-    // could also determine bits per entry using max of numbers but that would take time
-    pub fn new(numbers: &[usize], bits_per_entry: usize) -> Sequence {
-        let numbers8 = Self::pack_bits(numbers, bits_per_entry);
-        // reuse pack_bits by Greg Hanson, which is designed for writing directly, and put it
-        // into usize chunks, could also rewrite pack_bits for usize later but first get a functioning prototype
-        let entries = numbers.len();
-        let bytes = numbers8.len();
-        let rest_byte_amount = bytes % size_of::<usize>();
-        let full_byte_amount = bytes - rest_byte_amount;
-        let mut data = Vec::<usize>::new();
-        let full_words = &numbers8[..full_byte_amount];
-        for word in full_words.chunks_exact(size_of::<usize>()) {
-            data.push(usize::from_le_bytes(<[u8; size_of::<usize>()]>::try_from(word).unwrap()));
+    /// Pack the given integers., which have to fit into the given number of bits.
+    pub fn new(nums: &[usize], bits_per_entry: usize) -> Sequence {
+        use sucds::int_vectors::CompactVector;
+        let entries = nums.len();
+        if entries == 0 && bits_per_entry == 0 {
+            return Sequence { entries, bits_per_entry, data: vec![] };
         }
-        if rest_byte_amount > 0 {
-            let mut last = [0u8; size_of::<usize>()];
-            last[..rest_byte_amount].copy_from_slice(&numbers8[full_byte_amount..]);
-            data.push(usize::from_le_bytes(last));
-        }
-        Sequence { entries, bits_per_entry, data, crc_handle: None }
-    }
-
-    // manual compact integer sequence, as sucds lib does not allow export of internal storage
-    fn pack_bits(numbers: &[usize], bits_per_entry: usize) -> Vec<u8> {
-        let mut output = Vec::new();
-        let mut current_byte = 0u8;
-        let mut bit_offset = 0;
-
-        for value in numbers {
-            let mut val = value & ((1 << bits_per_entry) - 1); // mask to get only relevant bits
-            let mut bits_left = bits_per_entry;
-
-            while bits_left > 0 {
-                let available = 8 - bit_offset;
-                let to_write = bits_left.min(available);
-
-                // Shift bits to align with current byte offset
-                current_byte |= ((val & ((1 << to_write) - 1)) as u8) << bit_offset;
-
-                bit_offset += to_write;
-                val >>= to_write;
-                bits_left -= to_write;
-
-                if bit_offset == 8 {
-                    output.push(current_byte);
-                    current_byte = 0;
-                    bit_offset = 0;
-                }
-            }
-        }
-
-        // Push final byte if there's remaining bits
-        if bit_offset > 0 {
-            output.push(current_byte);
-        }
-        output
+        let mut cv = CompactVector::with_capacity(nums.len(), bits_per_entry).expect("value too large");
+        cv.extend(nums.iter().copied()).unwrap();
+        let data = cv.into_bit_vector().into_words();
+        Sequence { entries, bits_per_entry, data }
     }
 }
 
@@ -323,10 +275,9 @@ mod tests {
     #[test]
     fn write_read() -> color_eyre::Result<()> {
         init();
-        let mut data = Vec::<usize>::new();
+        let data = vec![(5 << 16) + (4 << 12) + (3 << 8) + (2 << 4) + 1];
         // little endian
-        data.push((5 << 16) + (4 << 12) + (3 << 8) + (2 << 4) + 1);
-        let s = Sequence { entries: 5, bits_per_entry: 4, data: data.clone(), crc_handle: None };
+        let s = Sequence { entries: 5, bits_per_entry: 4, data: data.clone() };
         let numbers: Vec<usize> = s.into_iter().collect();
         //let expected = vec![1];
         let expected = vec![1, 2, 3, 4, 5];

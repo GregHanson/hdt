@@ -1,3 +1,4 @@
+#![cfg_attr(all(doc, feature = "cache"), doc = include_str!("../README.md"))]
 //! [![github]](https://github.com/konradhoeffner/hdt)&ensp;[![crates-io]](https://crates.io/crates/hdt)&ensp;[![docs-rs]](crate)
 //!
 //! [github]: https://img.shields.io/badge/github-8da0cb?style=for-the-badge&labelColor=555555&logo=github
@@ -18,7 +19,7 @@
 //! use hdt::Hdt;
 //! // Load an hdt file
 //! let file = std::fs::File::open("example.hdt").expect("error opening file");
-//! let hdt = Hdt::new(std::io::BufReader::new(file)).expect("error loading HDT");
+//! let hdt = Hdt::read(std::io::BufReader::new(file)).expect("error loading HDT");
 //! // query
 //! let majors = hdt.triples_with_pattern(Some("http://dbpedia.org/resource/Leipzig"), Some("http://dbpedia.org/ontology/major"),None);
 //! println!("{:?}", majors.collect::<Vec<_>>());
@@ -33,7 +34,7 @@ The **cache** feature is experimental and may change or be removed in future rel
 Creating and/or loading a HDT file leveraging a custom cache:
 
 ```no_run
-let hdt = hdt::Hdt::new_from_path(std::path::Path::new("tests/resources/snikmeta.hdt")).unwrap();
+let hdt = hdt::Hdt::read_from_path(std::path::Path::new("tests/resources/snikmeta.hdt")).unwrap();
 ``` 
 "#
 )]
@@ -42,19 +43,18 @@ let hdt = hdt::Hdt::new_from_path(std::path::Path::new("tests/resources/snikmeta
     doc = r#"
 # Additional Optional Features
 
-Using the **sophia** adapter:
+Using the **sophia** Graph trait implementation for Hdt: 
 
 ```
-use hdt::{Hdt,HdtGraph};
+use hdt::Hdt;
 use hdt::sophia::api::graph::Graph;
 use hdt::sophia::api::term::{IriRef, SimpleTerm, matcher::Any};
 
 fn query(hdt: Hdt)
 {
-  let graph = HdtGraph::new(hdt);
   let s = SimpleTerm::Iri(IriRef::new_unchecked("http://dbpedia.org/resource/Leipzig".into()));
   let p = SimpleTerm::Iri(IriRef::new_unchecked("http://dbpedia.org/ontology/major".into()));
-  let majors = graph.triples_matching(Some(s),Some(p),Any);
+  let majors = hdt.triples_matching(Some(s),Some(p),Any);
 }
 ```
 "#
@@ -103,18 +103,20 @@ pub use sophia;
 pub mod hdt_graph;
 /// Types for representing the header.
 pub mod header;
+#[cfg(feature = "sparql")]
+/// SPARQL queries.
+pub mod sparql;
 /// Types for representing and querying triples.
 pub mod triples;
-
-//pub mod rdf2hdt;
+/// Constants for triple terms
+pub mod vocab;
 
 pub use crate::hdt::Hdt;
 use containers::ControlInfo;
 use dict_sect_pfc::DictSectPFC;
 use four_sect_dict::FourSectDict;
-pub use four_sect_dict::IdKind;
-#[cfg(feature = "sophia")]
-pub use hdt_graph::HdtGraph;
+pub use dict_sect_pfc::{DictSectPfcAccess, FileBasedDictSectPfc, InMemoryDictSectPfc};
+pub use four_sect_dict::{FourSectDictFileBased, FourSectDictGeneric, IdKind};
 
 #[cfg(test)]
 mod tests {
@@ -125,7 +127,9 @@ mod tests {
     pub fn init() {
         INIT.call_once(|| {
             color_eyre::install().unwrap();
-            env_logger::init();
+            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+                .is_test(true)
+                .init();
         });
     }
 }

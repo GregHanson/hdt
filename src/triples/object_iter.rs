@@ -1,7 +1,5 @@
-use crate::triples::Id;
-use crate::triples::TripleId;
-use crate::triples::TriplesBitmap;
-use sucds::int_vectors::Access;
+use crate::containers::{BitmapAccess, SequenceAccess};
+use crate::triples::{Id, TripleId, TriplesBitmapGeneric};
 
 // see "Exchange and Consumption of Huge RDF Data" by Martinez et al. 2012
 // https://link.springer.com/chapter/10.1007/978-3-642-30284-8_36
@@ -9,17 +7,18 @@ use sucds::int_vectors::Access;
 // TODO test with other orders and fix if broken
 
 /// Iterator over all triples with a given object ID, answering an (?S,?P,O) query.
-pub struct ObjectIter<'a> {
-    triples: &'a TriplesBitmap,
+/// Generic over sequence access type S, compact vector access type C, and bitmap access type B for TriplesBitmapGeneric.
+pub struct ObjectIter<'a, S: SequenceAccess = crate::containers::InMemorySequence, C: crate::containers::CompactVectorAccess = crate::containers::InMemoryCompactVector, B: BitmapAccess = crate::containers::InMemoryBitmap> {
+    triples: &'a TriplesBitmapGeneric<S, C, B>,
     o: Id,
     pos_index: usize,
     max_index: usize,
 }
 
-impl<'a> ObjectIter<'a> {
+impl<'a, S: SequenceAccess, C: crate::containers::CompactVectorAccess, B: BitmapAccess> ObjectIter<'a, S, C, B> {
     /// Create a new iterator over all triples with the given object ID.
     /// Panics if the object does not exist.
-    pub fn new(triples: &'a TriplesBitmap, o: Id) -> Self {
+    pub fn new(triples: &'a TriplesBitmapGeneric<S, C, B>, o: Id) -> Self {
         assert!(o != 0, "object 0 does not exist, cant iterate");
         let pos_index = triples.op_index.find(o);
         let max_index = triples.op_index.last(o);
@@ -28,17 +27,16 @@ impl<'a> ObjectIter<'a> {
     }
 }
 
-impl Iterator for ObjectIter<'_> {
+impl<S: SequenceAccess, C: crate::containers::CompactVectorAccess, B: BitmapAccess> Iterator for ObjectIter<'_, S, C, B> {
     type Item = TripleId;
     fn next(&mut self) -> Option<Self::Item> {
         if self.pos_index > self.max_index {
             return None;
         }
-        let pos_y = self.triples.op_index.sequence.access(self.pos_index).unwrap();
+        let pos_y = self.triples.op_index.get(self.pos_index);
         let y = self.triples.wavelet_y.access(pos_y).unwrap() as Id;
         let x = self.triples.bitmap_y.rank(pos_y) as Id + 1;
         self.pos_index += 1;
-        Some(TripleId::new(x, y, self.o))
-        //Some(self.triples.coord_to_triple(x, y, self.o).unwrap())
+        Some([x, y, self.o])
     }
 }

@@ -1,13 +1,11 @@
 //! Bitmap with rank and select support read from an HDT file.
 use crate::containers::vbyte::{encode_vbyte, read_vbyte};
 use bytesize::ByteSize;
-#[cfg(feature = "cache")]
-use serde::ser::SerializeStruct;
 use std::fmt;
 use std::io::BufRead;
 use std::mem::size_of;
 use sucds::Serializable;
-use sucds::bit_vectors::{Access, BitVector, Rank, Rank9Sel, Select};
+use sucds::bit_vectors::{Access, BitVector, NumBits, Rank, Rank9Sel, Select};
 
 /// Compact bitmap representation with rank and select support.
 #[derive(Clone)]
@@ -33,46 +31,6 @@ pub enum Error {
     UnsupportedBitmapType(u8),
 }
 
-#[cfg(feature = "cache")]
-impl serde::Serialize for Bitmap {
-    fn serialize<S>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error>
-    where
-        S: serde::ser::Serializer,
-    {
-        let mut state: <S as serde::ser::Serializer>::SerializeStruct =
-            serializer.serialize_struct("Bitmap", 1)?;
-
-        //bitmap_y
-        let mut dict_buffer = Vec::new();
-        self.dict.serialize_into(&mut dict_buffer).map_err(serde::ser::Error::custom)?;
-        state.serialize_field("dict", &dict_buffer)?;
-
-        state.end()
-    }
-}
-
-#[cfg(feature = "cache")]
-impl<'de> serde::Deserialize<'de> for Bitmap {
-    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
-    where
-        D: serde::de::Deserializer<'de>,
-    {
-        #[derive(serde::Deserialize)]
-        struct BitmapData {
-            dict: Vec<u8>,
-        }
-
-        let data = BitmapData::deserialize(deserializer)?;
-
-        // Deserialize `sucds` structures
-        let mut bitmap_reader = std::io::BufReader::new(&data.dict[..]);
-        let rank9sel = Rank9Sel::deserialize_from(&mut bitmap_reader).map_err(serde::de::Error::custom)?;
-
-        let bitmap = Bitmap { dict: rank9sel };
-        Ok(bitmap)
-    }
-}
-
 impl fmt::Debug for Bitmap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}, {} bits", ByteSize(self.size_in_bytes() as u64), self.len())
@@ -81,10 +39,10 @@ impl fmt::Debug for Bitmap {
 
 impl Bitmap {
     /// Construct a bitmap from an existing bitmap in form of a vector, which doesn't have rank and select support.
-    pub fn new(data: Vec<u64>) -> Self {
+    pub fn new(data: Vec<usize>) -> Self {
         let mut v = BitVector::new();
         for d in data {
-            let _ = v.push_bits(d as usize, 64);
+            let _ = v.push_bits(d, std::mem::size_of::<usize>() * 8);
         }
         let dict = Rank9Sel::new(v).select1_hints();
         Bitmap { dict }
@@ -98,6 +56,11 @@ impl Bitmap {
     /// Number of bits in the bitmap, multiple of 64
     pub const fn len(&self) -> usize {
         self.dict.len()
+    }
+
+    /// Number of bits set
+    pub fn num_ones(&self) -> usize {
+        self.dict.num_ones()
     }
 
     /// Returns the position of the k-1-th one bit or None if there aren't that many.
@@ -147,14 +110,15 @@ impl Bitmap {
         }
 
         // read all but the last word, last word is byte aligned
-        let full_byte_amount = ((num_bits - 1) >> 6) * 8;
+        let full_byte_amount = if num_bits == 0 { 0 } else { ((num_bits - 1) >> 6) * 8 };
         let mut full_words = vec![0_u8; full_byte_amount];
         // div_ceil is unstable
-        let mut data: Vec<u64> = Vec::with_capacity(full_byte_amount / 8 + usize::from(full_byte_amount % 8 != 0));
+        let mut data: Vec<usize> =
+            Vec::with_capacity(full_byte_amount / 8 + usize::from(full_byte_amount % 8 != 0));
         reader.read_exact(&mut full_words)?;
 
-        for word in full_words.chunks_exact(size_of::<u64>()) {
-            data.push(u64::from_le_bytes(<[u8; 8]>::try_from(word)?));
+        for word in full_words.chunks_exact(size_of::<usize>()) {
+            data.push(usize::from_le_bytes(<[u8; 8]>::try_from(word)?));
         }
 
         // initiate computation of CRC32
@@ -163,14 +127,14 @@ impl Bitmap {
         digest.update(&full_words);
 
         let mut bits_read = 0;
-        let mut last_value: u64 = 0;
+        let mut last_value: usize = 0;
         let last_word_bits = if num_bits == 0 { 0 } else { ((num_bits - 1) % 64) + 1 };
 
         while bits_read < last_word_bits {
             let mut buffer = [0u8];
             reader.read_exact(&mut buffer)?;
             digest.update(&buffer);
-            last_value |= (buffer[0] as u64) << bits_read;
+            last_value |= (buffer[0] as usize) << bits_read;
             bits_read += 8;
         }
         data.push(last_value);
@@ -181,11 +145,11 @@ impl Bitmap {
         let crc_code = u32::from_le_bytes(crc_code);
 
         // validate entry body CRC32
+        // not worth it to spawn an extra thread as our bitmaps are comparatively small
         let crc_calculated = digest.finalize();
         if crc_calculated != crc_code {
             return Err(InvalidCrc32Checksum(crc_calculated, crc_code));
         }
-
         Ok(Self::new(data))
     }
 
@@ -204,14 +168,36 @@ impl Bitmap {
         let checksum = hasher.finalize();
         w.write_all(&checksum.to_le_bytes())?;
 
-        // write data
+        // write data (matching the read format: full words + byte-by-byte last word)
         let crc32 = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI);
         let mut hasher = crc32.digest();
 
         let words = self.dict.bit_vector().words();
-        let bytes: Vec<u8> = words.iter().flat_map(|&val| val.to_le_bytes()).collect();
-        w.write_all(&bytes)?;
-        hasher.update(&bytes);
+        let num_bits = self.dict.len();
+
+        if num_bits > 0 {
+            // Write all but the last word as full 8-byte words
+            let num_full_words = (num_bits - 1) / 64;
+            for word in words.iter().take(num_full_words) {
+                let word_bytes = word.to_le_bytes();
+                w.write_all(&word_bytes)?;
+                hasher.update(&word_bytes);
+            }
+
+            // Write the last word byte-by-byte based on remaining bits
+            if num_full_words < words.len() {
+                let last_word = words[num_full_words];
+                let last_word_bits = ((num_bits - 1) % 64) + 1;
+                let last_word_bytes = ((last_word_bits - 1) / 8) + 1;
+
+                for byte_idx in 0..last_word_bytes {
+                    let byte_val = ((last_word >> (byte_idx * 8)) & 0xFF) as u8;
+                    w.write_all(&[byte_val])?;
+                    hasher.update(&[byte_val]);
+                }
+            }
+        }
+
         let crc_code = hasher.finalize();
         let crc_code = crc_code.to_le_bytes();
         w.write_all(&crc_code)?;
@@ -228,7 +214,7 @@ mod tests {
     #[test]
     fn write() -> color_eyre::Result<()> {
         init();
-        let bits: Vec<u64> = vec![0b10111];
+        let bits: Vec<usize> = vec![0b10111];
         let bitmap = Bitmap::new(bits);
         assert_eq!(bitmap.len(), 64);
         // position of k-1th 1 bit
