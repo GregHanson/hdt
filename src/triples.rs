@@ -21,8 +21,10 @@ pub use predicate_object_iter::PredicateObjectIter;
 mod object_iter;
 pub use object_iter::ObjectIter;
 
+#[cfg(feature = "cache")]
 mod hybrid_cache;
-pub use hybrid_cache::{CacheMetadata, HybridCache};
+#[cfg(feature = "cache")]
+pub use hybrid_cache::{HybridCache, CACHE_EXT};
 
 #[cfg(feature = "cache")]
 use serde::{self, Deserialize, Serialize};
@@ -374,6 +376,58 @@ impl TriplesBitmap {
         }
     }
 
+    /// Creates a TriplesBitmap from cached components.
+    /// The wavelet_y is provided from cache, and the op_index is rebuilt.
+    #[cfg(feature = "cache")]
+    pub fn from_cache(
+        order: Order,
+        bitmap_y: Bitmap,
+        adjlist_z: AdjListGeneric<InMemorySequence, InMemoryBitmap>,
+        wavelet_y: WT,
+    ) -> Self {
+        let entries = adjlist_z.sequence.len();
+        // Calculate max_object from the sequence
+        let max_object = (0..entries).map(|i| adjlist_z.sequence.get(i)).max().unwrap_or(0);
+
+        // limited to < 2^32 objects
+        let mut indicess = vec![Vec::<u32>::with_capacity(4); max_object];
+        // Count the indexes of appearance of each object
+        for pos_z in 0..entries {
+            let object = adjlist_z.sequence.get(pos_z);
+            if object == 0 {
+                error!("ERROR: There is a zero value in the Z level.");
+                continue;
+            }
+            let pos_y = adjlist_z.bitmap.rank(pos_z);
+            indicess[object - 1].push(pos_y as u32);
+        }
+        // reduce memory consumption of index by using adjacency list
+        let mut bitmap_index_bitvector = BitVectorMut::new();
+        let mut cv = Vec::<usize>::new();
+        for mut indices in indicess {
+            let mut first = true;
+            // sort by predicate
+            indices.sort_by_cached_key(|pos_y| wavelet_y.get(*pos_y as usize).unwrap());
+            for index in indices {
+                bitmap_index_bitvector.push(first);
+                first = false;
+                cv.push(index as usize);
+            }
+        }
+        let bv = BitVector::from(bitmap_index_bitvector);
+        let bitmap_index = Bitmap { dict: RSNarrow::from(bv) };
+        let op_index_sequence = InMemorySequence::new(Sequence::new(&cv));
+        let op_index = OpIndexGeneric::new(op_index_sequence, InMemoryBitmap::new(bitmap_index));
+
+        Self {
+            order,
+            bitmap_y: InMemoryBitmap::new(bitmap_y),
+            adjlist_z,
+            op_index,
+            wavelet_y,
+        }
+    }
+
     /// Creates a new TriplesBitmap from a list of sorted RDF triples
     pub fn from_triples(triples: &[TripleId]) -> Self {
         let mut y_bitmap = BitVectorMut::new();
@@ -562,7 +616,7 @@ mod wavelet_serde {
         D: Deserializer<'de>,
     {
         let values: Vec<usize> = Vec::deserialize(deserializer)?;
-        Ok(WT::from_iter(&values))
+        Ok(WT::from_iter(values))
     }
 }
 

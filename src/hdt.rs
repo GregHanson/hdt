@@ -6,17 +6,10 @@ use crate::triples::{Id, ObjectIter, PredicateIter, PredicateObjectIter, Subject
 use crate::{DictSectPFC, FourSectDict, header};
 use bytesize::ByteSize;
 use log::{debug, error};
-#[cfg(feature = "cache")]
-use std::fs::File;
-#[cfg(feature = "cache")]
-use std::io::{Seek, SeekFrom, Write};
 use std::iter;
 use std::sync::Arc;
 
 pub type Result<T> = core::result::Result<T, Error>;
-
-#[cfg(feature = "cache")]
-const CACHE_EXT: &str = "index.v1-rust-cache";
 #[cfg(feature = "nt")]
 #[path = "nt.rs"]
 /// Converting N-Triples to HDT, available only if HDT is built with the experimental `"nt"` feature.
@@ -265,89 +258,70 @@ impl Hdt {
     /// ```
     #[cfg(feature = "cache")]
     pub fn read_from_path(f: &std::path::Path) -> Result<Self> {
+        use crate::containers::{Bitmap, Sequence};
+        use crate::triples::{HybridCache, TriplesBitmap};
         use log::warn;
+        use std::io::{Seek, SeekFrom};
 
-        let source = File::open(f)?;
-        let mut reader = std::io::BufReader::new(source);
-        ControlInfo::read(&mut reader)?;
-        let header = Header::read(&mut reader)?;
-        let unvalidated_dict = FourSectDict::read(&mut reader)?;
-        let mut abs_path = std::fs::canonicalize(f)?;
-        let _ = abs_path.pop();
-        let index_file_name = format!("{}.{CACHE_EXT}", f.file_name().unwrap().to_str().unwrap());
-        let index_file_path = abs_path.join(index_file_name);
-        let triples = if index_file_path.exists() {
-            let pos = reader.stream_position()?;
-            match Self::load_with_cache(&mut reader, &index_file_path, header.length) {
-                Ok(triples) => triples,
-                Err(e) => {
-                    warn!("error loading cache, overwriting: {e}");
-                    reader.seek(SeekFrom::Start(pos))?;
-                    Self::load_without_cache(&mut reader, &index_file_path, header.length)?
-                }
+        // Try to load or create cache
+        let (cache, _op_index_offset) = match HybridCache::from_hdt_path(f) {
+            Ok(result) => result,
+            Err(e) => {
+                warn!("Failed to load/create cache, falling back to standard read: {e}");
+                return Self::read(std::io::BufReader::new(std::fs::File::open(f)?));
             }
-        } else {
-            Self::load_without_cache(&mut reader, &index_file_path, header.length)?
         };
 
+        // Validate cache matches HDT file
+        let source = std::fs::File::open(f)?;
+        let mut reader = std::io::BufReader::new(source);
+
+        // Read and skip global control info
+        ControlInfo::read(&mut reader)?;
+
+        // Read header
+        let header = Header::read(&mut reader)?;
+
+        // Validate header size matches cache
+        if let Ok(cached_header_size) = cache.header_size() {
+            if header.length as u64 != cached_header_size {
+                warn!(
+                    "Cache header size mismatch (HDT: {}, cache: {}), regenerating cache",
+                    header.length, cached_header_size
+                );
+                // Force regenerate cache
+                let _ = std::fs::remove_file(HybridCache::get_cache_path(f));
+                return Self::read_from_path(f);
+            }
+        }
+
+        // Read dictionary
+        let unvalidated_dict = FourSectDict::read(&mut reader)?;
         let dict = unvalidated_dict.validate()?;
+
+        // Read triples using cached offsets and wavelet
+        reader.seek(SeekFrom::Start(cache.bitmap_y_offset))?;
+        let bitmap_y = Bitmap::read(&mut reader).map_err(|e| Error::Io(std::io::Error::other(format!("{e}"))))?;
+
+        reader.seek(SeekFrom::Start(cache.bitmap_z_offset))?;
+        let bitmap_z = Bitmap::read(&mut reader).map_err(|e| Error::Io(std::io::Error::other(format!("{e}"))))?;
+
+        reader.seek(SeekFrom::Start(cache.sequence_z_offset))?;
+        let sequence_z = Sequence::read(&mut reader).map_err(|e| Error::Io(std::io::Error::other(format!("{e}"))))?;
+
+        // Build triples from cache
+        let order = cache.order().map_err(|e| Error::Io(std::io::Error::other(format!("{e}"))))?;
+        let adjlist_z = crate::containers::AdjListGeneric::new(
+            InMemorySequence::new(sequence_z),
+            InMemoryBitmap::new(bitmap_z),
+        );
+
+        let triples = TriplesBitmap::from_cache(order, bitmap_y, adjlist_z, cache.wavelet_y);
+
         let hdt = Hdt { header, dict, triples };
         debug!("HDT size in memory {}, details:", ByteSize(hdt.size_in_bytes() as u64));
         debug!("{hdt:#?}");
         Ok(hdt)
-    }
-
-    #[cfg(feature = "cache")]
-    fn load_without_cache<R: std::io::BufRead>(
-        mut reader: R, index_file_path: &std::path::PathBuf, header_length: usize,
-    ) -> Result<crate::triples::TriplesBitmap> {
-        use crate::triples::TriplesBitmap;
-        use log::warn;
-
-        debug!("no cache detected, generating index");
-        let triples = TriplesBitmap::read_sect(&mut reader)?;
-        debug!("index generated, saving cache to {}", index_file_path.display());
-        if let Err(e) = Self::write_cache(index_file_path, &triples, header_length) {
-            warn!("error trying to save cache to file: {e}");
-        }
-        Ok(triples)
-    }
-
-    #[cfg(feature = "cache")]
-    fn load_with_cache<R: std::io::BufRead>(
-        mut reader: R, index_file_path: &std::path::PathBuf, header_length: usize,
-    ) -> core::result::Result<crate::triples::TriplesBitmap, Box<dyn std::error::Error>> {
-        use crate::triples::TriplesBitmap;
-        use std::io::Read;
-        // load cached index
-        debug!("hdt file cache detected, loading from {}", index_file_path.display());
-        let index_source = File::open(index_file_path)?;
-        let mut index_reader = std::io::BufReader::new(index_source);
-        let triples_ci = ControlInfo::read(&mut reader)?;
-        // we cannot rely on the numTriples property being present, see https://github.com/rdfhdt/hdt-cpp/issues/289
-        // let num_triples = triples_ci.get("numTriples").expect("numTriples key missing in triples CI");
-        // thus we use the number of bytes of the header data
-        let mut buf = [0u8; size_of::<usize>()];
-        index_reader.read_exact(&mut buf)?;
-        if header_length != usize::from_le_bytes(buf) {
-            return Err("failed index validation".into());
-        }
-        let triples = TriplesBitmap::load_cache(&mut index_reader, &triples_ci)?;
-        Ok(triples)
-    }
-
-    #[cfg(feature = "cache")]
-    /// Writes a custom cache file to improve load times. This cache file is usuable only by
-    /// this library and is not intended to be used with hdt-cpp or hdt-java versions of the HDT tooling
-    pub fn write_cache(
-        index_file_path: &std::path::PathBuf, triples: &crate::triples::TriplesBitmap, header_length: usize,
-    ) -> core::result::Result<(), Box<dyn std::error::Error>> {
-        let new_index_file = File::create(index_file_path)?;
-        let mut writer = std::io::BufWriter::new(new_index_file);
-        writer.write_all(&header_length.to_le_bytes())?;
-        bincode::serde::encode_into_std_write(triples, &mut writer, bincode::config::standard())?;
-        writer.flush()?;
-        Ok(())
     }
 
     pub fn write(&self, write: &mut impl std::io::Write) -> Result<()> {
@@ -431,6 +405,7 @@ pub mod tests {
     #[cfg(feature = "cache")]
     #[test]
     fn cache() -> Result<()> {
+        use crate::triples::CACHE_EXT;
         use fs_err::remove_file;
         use std::path::Path;
         init();
