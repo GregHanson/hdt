@@ -27,7 +27,6 @@ mownstr = "0.3"
 rayon = { version = "1.11.0", default-features = false }
 spareval = { version = "0.2" , optional = true }
 spargebra = { version = "0.4", optional = true, default-features = false }
-eyre = { version = "0.6", optional = true }
 color-eyre = { version = "0.6", optional = true }
 clap = { version = "4.5", optional = true, features = ["derive"] }
 fs-err = { version = "3.1.0", optional = true }
@@ -39,7 +38,7 @@ memmap2 = { version = "0.9" }
 [features]
 default = ["sophia", "nt"]
 sophia = ["dep:sophia"]
-cli = ["sophia", "nt", "dep:eyre", "dep:color-eyre", "dep:clap","dep:fs-err"]
+cli = ["sophia", "nt", "dep:color-eyre", "dep:clap","dep:fs-err"]
 cache = []
 sparql = ["dep:spareval", "dep:spargebra"]
 nt = ["dep:lasso","dep:oxttl","dep:bitset-core"]
