@@ -242,6 +242,11 @@ impl HybridCache {
         }
         let adjlist_z = AdjList::new(sequence_z, bitmap_z);
 
+        // QWT library panics on empty data, so skip cache for empty HDT files
+        if adjlist_z.is_empty() {
+            return Err("HDT file has no triples, skipping cache creation".into());
+        }
+
         let triples_bitmap = TriplesBitmap::new(order, &sequence_y, bitmap_y, adjlist_z);
 
         // Prepare cache file for writing

@@ -114,6 +114,8 @@ pub mod vocab;
 pub mod wasm;
 
 pub use crate::hdt::{Hdt, HdtGeneric};
+#[cfg(feature = "cache")]
+pub use crate::hdt::HdtHybrid;
 use containers::ControlInfo;
 use dict_sect_pfc::DictSectPFC;
 pub use dict_sect_pfc::{DictSectPfcAccess, FileBasedDictSectPfc};
