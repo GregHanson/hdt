@@ -38,12 +38,13 @@ lasso = { version = "0.7.3", features = ["multi-threaded"], optional = true }
 qwt = "0.3.4"
 mem_dbg = "0.3.4"
 memmap2 = "0.9"
+fs2 = { version = "0.4", optional = true }
 
 [features]
 default = ["sophia", "cache"]
 sophia = ["dep:sophia"]
 cli = ["sophia", "nt", "dep:eyre", "dep:color-eyre", "dep:clap","dep:fs-err"]
-cache = ["dep:serde", "dep:bincode"]
+cache = ["dep:serde", "dep:bincode", "dep:fs2"]
 sparql = ["dep:spareval", "dep:spargebra"]
 nt = ["dep:lasso","dep:oxttl","dep:bitset-core"]
 

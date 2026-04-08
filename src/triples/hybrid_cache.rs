@@ -41,17 +41,69 @@ use crate::triples::Order;
 use crate::triples::TriplesBitmap;
 use crate::triples::WT;
 use bytesize::ByteSize;
+use fs2::FileExt;
 use log::debug;
 use log::warn;
 use mem_dbg::{MemSize, SizeFlags};
+use std::collections::hash_map::DefaultHasher;
 use std::fmt;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
+use std::hash::{Hash, Hasher};
 use std::io::Seek;
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const CACHE_EXT: &str = "index.v5-rust-cache";
 const CACHE_FORMAT: &str = "<http://purl.org/HDT/hdt#cacheV5>";
+
+fn boxed_io_error(message: impl Into<String>) -> Box<dyn std::error::Error> {
+    std::io::Error::other(message.into()).into()
+}
+
+/// Canonicalize the HDT path so that two callers that reach the same file
+/// via different relative paths still hash to the same lock file.
+fn canonical_hdt_path(path: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    path.canonicalize()
+        .map_err(|e| boxed_io_error(format!("failed to canonicalize HDT path {}: {e}", path.display())))
+}
+
+/// Build the path of the lock file used to serialize cache generation for
+/// the given canonical HDT path. Lives in the system temp directory under
+/// `hdt-hybrid-cache-locks/`, keyed by the FNV-style hash of the path.
+fn cache_lock_file_path(canonical_hdt_path: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let mut hasher = DefaultHasher::new();
+    canonical_hdt_path.as_os_str().hash(&mut hasher);
+    let lock_name = format!("hdt-hybrid-cache-{:016x}.lock", hasher.finish());
+    let lock_root = std::env::temp_dir().join("hdt-hybrid-cache-locks");
+    std::fs::create_dir_all(&lock_root).map_err(|e| {
+        boxed_io_error(format!("failed to create cache lock directory {}: {e}", lock_root.display()))
+    })?;
+    Ok(lock_root.join(lock_name))
+}
+
+fn open_cache_lock_file(canonical_hdt_path: &Path) -> Result<(File, PathBuf), Box<dyn std::error::Error>> {
+    let lock_path = cache_lock_file_path(canonical_hdt_path)?;
+    let lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| boxed_io_error(format!("failed to open cache lock file {}: {e}", lock_path.display())))?;
+    Ok((lock_file, lock_path))
+}
+
+fn unlock_cache_lock(
+    lock_file: &File, lock_path: &Path, hdt_path: &Path, mode: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    FileExt::unlock(lock_file).map_err(|e| {
+        boxed_io_error(format!(
+            "failed to release {mode} cache lock {} for {}: {e}",
+            lock_path.display(),
+            hdt_path.display()
+        ))
+    })
+}
 
 /// Cached structures for HybridTripleAccess
 ///
@@ -120,19 +172,27 @@ impl HybridCache {
 }
 
 impl HybridCache {
-    /// Smart constructor: Load cache if exists, otherwise create it
+    /// Smart constructor: Load cache if exists, otherwise create it.
     ///
-    /// This is the recommended way to create a HybridCache. It automatically:
-    /// 1. Checks if a cache file exists for the given HDT file
-    /// 2. If found, loads the existing cache
-    /// 3. If not found, generates the cache from the HDT file and saves it
+    /// Uses a cross-process advisory file lock keyed on the canonical HDT
+    /// path so that concurrent loaders never duplicate cache generation work
+    /// and never observe a half-written cache file. The lock pattern is:
+    ///
+    /// 1. Acquire a shared lock and try to read an existing cache.
+    /// 2. If the cache exists and parses, return it (shared lock allows
+    ///    multiple concurrent readers).
+    /// 3. Otherwise upgrade to an exclusive lock, re-check the cache, and
+    ///    only generate if it is still missing or unreadable.
+    /// 4. The writer always emits to a temporary file first and atomically
+    ///    renames it into place, so readers either see the previous cache
+    ///    or the next one — never a partial file.
     ///
     /// # Arguments
     /// * `hdt_path` - Path to the HDT file
     ///
     /// # Cache File Location
-    /// The cache file is stored in the same directory as the HDT file with the naming convention:
-    /// `<hdt_filename>.index.v5-rust-cache`
+    /// `<hdt_filename>.index.v5-rust-cache`, alongside the HDT file.
+    /// The lock file lives in `${TMPDIR}/hdt-hybrid-cache-locks/`.
     ///
     /// # Returns
     /// Returns a tuple `(HybridCache, u64)` where:
@@ -140,17 +200,28 @@ impl HybridCache {
     /// - `u64`: File offset in the cache file where the OpIndex bitmap begins
     pub fn from_hdt_path(hdt_path: impl AsRef<Path>) -> Result<(Self, u64), Box<dyn std::error::Error>> {
         let hdt_path = hdt_path.as_ref();
+        let canonical = canonical_hdt_path(hdt_path)?;
+        let (lock_file, lock_path) = open_cache_lock_file(&canonical)?;
 
-        // Construct cache file path
         let cache_path = Self::get_cache_path(hdt_path);
 
-        // Check if cache exists and is readable
+        // Reader path: shared lock allows many concurrent loaders to share an
+        // already-built cache without blocking each other.
+        FileExt::lock_shared(&lock_file).map_err(|e| {
+            boxed_io_error(format!(
+                "failed to acquire shared cache lock {} for {}: {e}",
+                lock_path.display(),
+                hdt_path.display()
+            ))
+        })?;
+
         if cache_path.exists() {
             debug!("Found existing cache: {}", cache_path.display());
             match Self::read_from_file(&cache_path) {
                 Ok((cache, op_index_bitmap_offset)) => {
                     debug!("Loaded cache successfully");
                     debug!("{cache:#?}");
+                    unlock_cache_lock(&lock_file, &lock_path, hdt_path, "shared")?;
                     return Ok((cache, op_index_bitmap_offset));
                 }
                 Err(e) => {
@@ -162,7 +233,32 @@ impl HybridCache {
             debug!("Cache not found, generating from HDT file...");
         }
 
-        Ok(Self::write_cache_from_hdt_file(hdt_path)?)
+        unlock_cache_lock(&lock_file, &lock_path, hdt_path, "shared")?;
+
+        // Writer path: serialize cache regeneration. We must release the
+        // shared lock first because flock() upgrade is not portable.
+        FileExt::lock_exclusive(&lock_file).map_err(|e| {
+            boxed_io_error(format!(
+                "failed to acquire exclusive cache lock {} for {}: {e}",
+                lock_path.display(),
+                hdt_path.display()
+            ))
+        })?;
+
+        // Re-check after acquiring the exclusive lock — another process may
+        // have generated the cache while we were waiting.
+        if cache_path.exists() {
+            debug!("Re-checking cache after acquiring exclusive lock");
+            if let Ok((cache, op_index_bitmap_offset)) = Self::read_from_file(&cache_path) {
+                unlock_cache_lock(&lock_file, &lock_path, hdt_path, "exclusive")?;
+                return Ok((cache, op_index_bitmap_offset));
+            }
+            warn!("Cache remained unreadable under exclusive lock; regenerating...");
+        }
+
+        let generated = Self::write_cache_from_hdt_file(hdt_path);
+        unlock_cache_lock(&lock_file, &lock_path, hdt_path, "exclusive")?;
+        generated
     }
 
     /// Get the cache file path for a given HDT file
@@ -249,9 +345,23 @@ impl HybridCache {
 
         let triples_bitmap = TriplesBitmap::new(order, &sequence_y, bitmap_y, adjlist_z);
 
-        // Prepare cache file for writing
+        // Prepare a temporary cache file in the same directory, then atomically
+        // rename it onto the final cache path once writing is complete. This
+        // ensures readers (which may have the cache mmaped) never see a partial
+        // file: a fresh inode appears under the final name, leaving any stale
+        // mapping pointing at the old inode until it is dropped.
         let cache_path = Self::get_cache_path(hdt_path);
-        let file = File::create(&cache_path)?;
+        let file_name = cache_path.file_name().and_then(|n| n.to_str()).unwrap_or("hdt-cache");
+        let tmp_cache_path = cache_path.with_file_name(format!(
+            "{file_name}.tmp-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_cache_path)?;
         let mut writer = BufWriter::new(file);
 
         // Create ControlInfo with metadata in properties
@@ -287,6 +397,25 @@ impl HybridCache {
         triples_bitmap.op_index.sequence.inner().write(&mut writer)?;
 
         writer.flush()?;
+        // Make sure every byte hits the disk before we swing the rename.
+        // Without sync_all() a crash between rename and journal commit could
+        // leave the new inode visible but empty.
+        let file = writer.into_inner().map_err(|e| boxed_io_error(format!("{e}")))?;
+        file.sync_all()?;
+        drop(file);
+
+        // Atomic publish: rename the temp file onto the final cache path.
+        // On Unix this is a single inode swap; on Windows, std uses MoveFileEx
+        // with MOVEFILE_REPLACE_EXISTING semantics so it overwrites in place.
+        std::fs::rename(&tmp_cache_path, &cache_path).map_err(|e| {
+            // Best-effort cleanup of the orphaned temp file.
+            let _ = std::fs::remove_file(&tmp_cache_path);
+            boxed_io_error(format!(
+                "failed to rename cache temp {} to {}: {e}",
+                tmp_cache_path.display(),
+                cache_path.display()
+            ))
+        })?;
 
         // Create and return the cache structure
         let cache = Self {
@@ -405,23 +534,38 @@ impl HybridCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Copy the snikmeta test HDT into a temp directory keyed on the test
+    /// name and current pid+timestamp so that concurrent tests cannot
+    /// collide on the same cache file.
+    fn setup_isolated_hdt(test_name: &str) -> Result<(PathBuf, PathBuf, PathBuf), Box<dyn std::error::Error>> {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let test_dir = std::env::temp_dir()
+            .join(format!("hdt-hybrid-cache-test-{test_name}-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&test_dir)?;
+
+        let hdt_path = test_dir.join("snikmeta.hdt");
+        std::fs::copy("tests/resources/snikmeta.hdt", &hdt_path)?;
+        let cache_path = HybridCache::get_cache_path(&hdt_path);
+        Ok((test_dir, hdt_path, cache_path))
+    }
 
     #[test]
     fn test_from_hdt_path() -> Result<(), Box<dyn std::error::Error>> {
         crate::tests::init();
-        let hdt_path = "tests/resources/snikmeta.hdt";
-        let cache_path = HybridCache::get_cache_path(hdt_path);
-
-        // Clean up any existing cache
+        let (test_dir, hdt_path, cache_path) = setup_isolated_hdt("single")?;
         let _ = std::fs::remove_file(&cache_path);
 
         println!("\n=== Test 1: First call (should generate cache) ===");
-        let (cache1, offset1) = HybridCache::from_hdt_path(hdt_path)?;
+        let (cache1, offset1) = HybridCache::from_hdt_path(&hdt_path)?;
         assert!(cache_path.exists(), "Cache file should be created");
         println!("Cache size: {} bytes", std::fs::metadata(&cache_path)?.len());
 
         println!("\n=== Test 2: Second call (should load existing cache) ===");
-        let (cache2, offset2) = HybridCache::from_hdt_path(hdt_path)?;
+        let (cache2, offset2) = HybridCache::from_hdt_path(&hdt_path)?;
 
         // Verify both caches are identical
         assert_eq!(cache1.order()? as u8, cache2.order()? as u8);
@@ -433,9 +577,43 @@ mod tests {
 
         println!("\nBoth caches are identical!");
 
-        // Clean up
-        std::fs::remove_file(&cache_path)?;
+        std::fs::remove_dir_all(test_dir)?;
+        Ok(())
+    }
 
+    /// Hammer `from_hdt_path` from many threads with no preexisting cache.
+    /// All workers should converge on a single valid cache without panics,
+    /// torn writes, or duplicate generation racing.
+    #[test]
+    fn test_from_hdt_path_parallel_threads() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::init();
+        let (test_dir, hdt_path, cache_path) = setup_isolated_hdt("parallel")?;
+        let _ = std::fs::remove_file(&cache_path);
+
+        let workers = 8_usize;
+        let barrier = Arc::new(Barrier::new(workers));
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let path = hdt_path.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || -> Result<(), String> {
+                barrier.wait();
+                HybridCache::from_hdt_path(&path).map(|_| ()).map_err(|e| e.to_string())
+            }));
+        }
+
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    return Err(boxed_io_error(format!("hybrid cache worker failed while loading cache: {e}")));
+                }
+                Err(_) => return Err(boxed_io_error("hybrid cache worker thread panicked")),
+            }
+        }
+
+        assert!(cache_path.exists(), "cache should exist after concurrent loads");
+        std::fs::remove_dir_all(test_dir)?;
         Ok(())
     }
 }
