@@ -108,6 +108,11 @@ impl fmt::Debug for MmapSequence {
 pub enum MmapSequenceError {
     #[error("sequence offset {offset} is past end of mmap (len {len})")]
     OffsetOutOfBounds { offset: u64, len: usize },
+    /// The serialized offset is larger than this platform's `usize`. On 32-bit
+    /// targets this fires for any offset above `u32::MAX` (~4 GiB). On 64-bit
+    /// it cannot fire — `u64::MAX as u64 == usize::MAX as u64`.
+    #[error("sequence offset {offset} exceeds platform usize::MAX ({usize_max}); this cache file requires a 64-bit target")]
+    OffsetTooLargeForPlatform { offset: u64, usize_max: u64 },
     #[error("unsupported sequence type {0}, expected 1 (Log64)")]
     UnsupportedType(u8),
     #[error("entry size of {0} bit too large (>64 bit)")]
@@ -142,6 +147,18 @@ impl MmapSequence {
     pub fn from_mmap(mmap: Arc<memmap2::Mmap>, sequence_offset: u64) -> std::io::Result<Self> {
         use crate::containers::vbyte::read_vbyte;
         use std::io::Cursor;
+
+        // Reject offsets that cannot be addressed on this platform before any
+        // truncating cast. On 64-bit `usize::MAX as u64 == u64::MAX` so this
+        // never fires; on 32-bit it surfaces a clean error instead of silently
+        // wrapping when offsets exceed 4 GiB.
+        if sequence_offset > usize::MAX as u64 {
+            return Err(MmapSequenceError::OffsetTooLargeForPlatform {
+                offset: sequence_offset,
+                usize_max: usize::MAX as u64,
+            }
+            .into());
+        }
 
         let mmap_len = mmap.len();
         if (sequence_offset as usize) > mmap_len {

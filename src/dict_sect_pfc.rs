@@ -63,6 +63,11 @@ pub enum Error {
     DictSectNotPfc(u8),
     #[error("sequence read error")]
     Sequence(#[from] sequence::Error),
+    /// The serialized dictionary section offset is larger than this platform's
+    /// `usize`. On 32-bit targets this fires for any offset above `u32::MAX`
+    /// (~4 GiB). On 64-bit it cannot fire.
+    #[error("dict section offset {offset} exceeds platform usize::MAX ({usize_max}); this cache file requires a 64-bit target")]
+    OffsetTooLargeForPlatform { offset: u64, usize_max: u64 },
 }
 
 impl fmt::Debug for DictSectPFC {
@@ -482,6 +487,14 @@ impl MmapDictSectPfc {
     /// proactive corruption checking is desired.
     pub fn from_mmap(mmap: Arc<memmap2::Mmap>, section_offset: u64) -> Result<Self> {
         use std::io::{BufRead, Cursor, Read};
+
+        // Reject offsets that cannot be addressed on this platform before any
+        // truncating cast. On 64-bit `usize::MAX as u64 == u64::MAX` so this
+        // never fires; on 32-bit it surfaces a clean error instead of silently
+        // wrapping when offsets exceed 4 GiB.
+        if section_offset > usize::MAX as u64 {
+            return Err(Error::OffsetTooLargeForPlatform { offset: section_offset, usize_max: usize::MAX as u64 });
+        }
 
         let mmap_len = mmap.len();
         if (section_offset as usize) > mmap_len {

@@ -135,6 +135,11 @@ impl fmt::Debug for MmapBitmap {
 pub enum MmapBitmapError {
     #[error("bitmap offset {offset} is past end of mmap (len {len})")]
     OffsetOutOfBounds { offset: u64, len: usize },
+    /// The serialized offset is larger than this platform's `usize`. On 32-bit
+    /// targets this fires for any offset above `u32::MAX` (~4 GiB). On 64-bit
+    /// it cannot fire — `u64::MAX as u64 == usize::MAX as u64`.
+    #[error("bitmap offset {offset} exceeds platform usize::MAX ({usize_max}); this cache file requires a 64-bit target")]
+    OffsetTooLargeForPlatform { offset: u64, usize_max: u64 },
     #[error("unsupported bitmap type {0}, expected 1")]
     UnsupportedType(u8),
     #[error("truncated bitmap header at offset {0}")]
@@ -171,6 +176,18 @@ impl MmapBitmap {
     pub fn from_mmap(mmap: Arc<memmap2::Mmap>, bitmap_offset: u64) -> std::io::Result<Self> {
         use crate::containers::vbyte::read_vbyte;
         use std::io::Cursor;
+
+        // Reject offsets that cannot be addressed on this platform before any
+        // truncating cast. On 64-bit `usize::MAX as u64 == u64::MAX` so this
+        // never fires; on 32-bit it surfaces a clean error instead of silently
+        // wrapping when offsets exceed 4 GiB.
+        if bitmap_offset > usize::MAX as u64 {
+            return Err(MmapBitmapError::OffsetTooLargeForPlatform {
+                offset: bitmap_offset,
+                usize_max: usize::MAX as u64,
+            }
+            .into());
+        }
 
         let mmap_len = mmap.len();
         if (bitmap_offset as usize) > mmap_len {
