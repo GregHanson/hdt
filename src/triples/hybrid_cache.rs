@@ -29,7 +29,7 @@
 //! - **Stored in cache (in memory)**: wavelet_y - computed structure, expensive to rebuild, always loaded
 //! - **Stored in cache (on disk)**: op_index.bitmap, op_index.sequence - can be accessed on-demand or mmapped
 //! - **File offsets only**: bitmap_y, bitmap_z - read directly from HDT file on-demand
-//! - **File offsets only**: sequence_z - metadata read during FileBasedSequence::new()
+//! - **File offsets only**: sequence_z - metadata parsed during MmapSequence::from_mmap()
 //! - **Version 5 changes**: Use ControlInfo structure, moved order/numTriples/headerSize to properties
 
 use crate::containers::AdjList;

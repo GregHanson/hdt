@@ -40,7 +40,7 @@ mem_dbg = "0.3.4"
 memmap2 = "0.9"
 
 [features]
-default = ["sophia"]
+default = ["sophia", "cache"]
 sophia = ["dep:sophia"]
 cli = ["sophia", "nt", "dep:eyre", "dep:color-eyre", "dep:clap","dep:fs-err"]
 cache = ["dep:serde", "dep:bincode"]

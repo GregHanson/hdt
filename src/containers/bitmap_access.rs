@@ -1,14 +1,12 @@
-//! Trait abstraction for bitmap access - allows both in-memory and file-based implementations
+//! Trait abstraction for bitmap access - allows in-memory and memory-mapped implementations
 
-use crate::containers::sequence_access::PositionedReader;
-use bytesize::ByteSize;
 use std::fmt::{self, Debug};
+use std::sync::Arc;
 
 /// Trait for accessing bitmaps with rank and select support
 ///
 /// This abstraction allows bitmaps to be either:
 /// - In-memory with RSNarrow indexes (fast O(1) operations)
-/// - File-based streaming from disk (slow O(n) operations, minimal memory)
 /// - Memory-mapped using OS page cache
 pub trait BitmapAccess: Debug + Send + Sync {
     /// Returns the position of the k-th one bit (0-indexed), or None if there aren't that many
@@ -81,478 +79,236 @@ impl BitmapAccess for InMemoryBitmap {
     }
 }
 
-/// File-based bitmap implementation (streams from disk, no precomputed indexes)
+/// Memory-mapped bitmap implementation using OS page cache.
 ///
-/// **WARNING:** This is SLOW compared to InMemoryBitmap:
-/// - rank() is O(n) instead of O(1)
-/// - select1() is O(n) instead of O(1)
+/// Holds an `Arc<Mmap>` so it can share a single mapping with other
+/// components that view the same file (dictionary sections, sequences, ...).
 ///
-/// Use this only when memory is extremely constrained and performance is not critical.
-pub struct FileBasedBitmap {
-    /// File offset where bitmap data starts (after metadata and CRC8)
-    data_offset: u64,
-    /// Total number of bits in the bitmap
-    num_bits: usize,
-    /// Number of 64-bit words in the bitmap
-    num_words: usize,
-    /// Number of one bits (cached during construction)
-    num_ones_cached: usize,
-    /// Cached file handle
-    file: std::sync::Arc<std::sync::Mutex<PositionedReader>>,
-}
-
-impl fmt::Debug for FileBasedBitmap {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}, bitmap read directly from file", ByteSize(self.size_in_bytes() as u64))
-    }
-}
-
-impl FileBasedBitmap {
-    /// Create a file-based bitmap
-    ///
-    /// # Arguments
-    /// * `file_path` - Path to the HDT file
-    /// * `bitmap_offset` - File offset to the START of the bitmap section (including metadata)
-    ///
-    /// The function will read and validate the metadata, then calculate the actual data offset.
-    pub fn new(file_path: &std::path::PathBuf, bitmap_offset: u64) -> std::io::Result<Self> {
-        use crate::containers::vbyte::read_vbyte;
-        use std::io::{Read, Seek, SeekFrom};
-
-        let file = std::fs::File::open(file_path)?;
-        let mut reader = std::io::BufReader::new(file);
-
-        // Seek to the start of the bitmap section
-        reader.seek(SeekFrom::Start(bitmap_offset))?;
-
-        let mut metadata_size = 0u64;
-
-        // Read and validate type (1 byte)
-        let mut type_buf = [0u8];
-        reader.read_exact(&mut type_buf)?;
-        metadata_size += 1;
-        if type_buf[0] != 1 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Unsupported bitmap type: {}, expected 1", type_buf[0]),
-            ));
-        }
-
-        // Read num_bits (vbyte encoded)
-        let (num_bits, vbyte_bytes) = read_vbyte(&mut reader)?;
-        metadata_size += vbyte_bytes.len() as u64;
-
-        // Skip CRC8 checksum (1 byte)
-        let mut crc_buf = [0u8];
-        reader.read_exact(&mut crc_buf)?;
-        metadata_size += 1;
-
-        // Calculate the actual data offset
-        let data_offset = bitmap_offset + metadata_size;
-
-        // Calculate number of words
-        let num_words = if num_bits == 0 { 0 } else { ((num_bits - 1) / 64) + 1 };
-
-        // Count the number of ones by reading all words (we need this for num_ones())
-        // This is expensive but only done once during construction
-        let num_ones_cached = Self::count_ones(&mut reader, num_bits, num_words)?;
-
-        // Re-open file for the cached reader
-        let file = std::fs::File::open(file_path)?;
-        let reader = std::io::BufReader::new(file);
-        let positioned_reader = PositionedReader::new(reader);
-
-        Ok(Self {
-            data_offset,
-            num_bits,
-            num_words,
-            num_ones_cached,
-            file: std::sync::Arc::new(std::sync::Mutex::new(positioned_reader)),
-        })
-    }
-
-    /// Count total number of one bits (helper for construction)
-    fn count_ones<R: std::io::Read>(reader: &mut R, num_bits: usize, num_words: usize) -> std::io::Result<usize> {
-        let mut count = 0usize;
-
-        if num_words == 0 {
-            return Ok(0);
-        }
-
-        // Read all full words
-        for _ in 0..(num_words - 1) {
-            let mut word_buf = [0u8; 8];
-            reader.read_exact(&mut word_buf)?;
-            let word = u64::from_le_bytes(word_buf);
-            count += word.count_ones() as usize;
-        }
-
-        // Read last word (byte-aligned)
-        let last_word_bits = if num_bits == 0 { 0 } else { ((num_bits - 1) % 64) + 1 };
-        let last_word_bytes = last_word_bits.div_ceil(8);
-        let mut last_word = 0u64;
-        for byte_idx in 0..last_word_bytes {
-            let mut byte_buf = [0u8];
-            reader.read_exact(&mut byte_buf)?;
-            last_word |= (byte_buf[0] as u64) << (byte_idx * 8);
-        }
-
-        // Only count bits up to num_bits
-        let mask = if last_word_bits == 64 { u64::MAX } else { (1u64 << last_word_bits) - 1 };
-        count += (last_word & mask).count_ones() as usize;
-
-        Ok(count)
-    }
-
-    /// Read a 64-bit word from the bitmap at the given word index
-    fn read_word(&self, word_index: usize) -> std::io::Result<u64> {
-        if word_index >= self.num_words {
-            return Ok(0);
-        }
-
-        let mut reader = self.file.lock().unwrap();
-
-        // Seek to the word position
-        let byte_offset = word_index * 8;
-        reader.seek_to(self.data_offset + byte_offset as u64)?;
-
-        // Read the word
-        if word_index == self.num_words - 1 {
-            // Last word is byte-aligned
-            let last_word_bits = if self.num_bits == 0 { 0 } else { ((self.num_bits - 1) % 64) + 1 };
-            let last_word_bytes = last_word_bits.div_ceil(8);
-            let mut word = 0u64;
-            for byte_idx in 0..last_word_bytes {
-                let mut byte_buf = [0u8];
-                reader.read_exact(&mut byte_buf)?;
-                word |= (byte_buf[0] as u64) << (byte_idx * 8);
-            }
-            Ok(word)
-        } else {
-            let mut word_buf = [0u8; 8];
-            reader.read_exact(&mut word_buf)?;
-            Ok(u64::from_le_bytes(word_buf))
-        }
-    }
-
-    /// Find the k-th one bit in a 64-bit word (helper function)
-    fn select1_in_word(word: u64, k: usize) -> Option<usize> {
-        let mut ones_seen = 0usize;
-        for bit_pos in 0..64 {
-            if (word & (1u64 << bit_pos)) != 0 {
-                if ones_seen == k {
-                    return Some(bit_pos);
-                }
-                ones_seen += 1;
-            }
-        }
-        None
-    }
-}
-
-impl BitmapAccess for FileBasedBitmap {
-    fn select1(&self, k: usize) -> Option<usize> {
-        // O(n) operation - scan words until we find the k-th one bit
-        let mut ones_seen = 0usize;
-
-        for word_idx in 0..self.num_words {
-            let word = self.read_word(word_idx).ok()?;
-            let ones_in_word = word.count_ones() as usize;
-
-            if ones_seen + ones_in_word > k {
-                // The k-th one is in this word
-                let target_in_word = k - ones_seen;
-                let bit_pos = Self::select1_in_word(word, target_in_word)?;
-                return Some(word_idx * 64 + bit_pos);
-            }
-
-            ones_seen += ones_in_word;
-        }
-
-        None
-    }
-
-    fn rank(&self, pos: usize) -> usize {
-        // O(n) operation - count ones up to position
-        if pos >= self.num_bits {
-            return self.num_ones_cached;
-        }
-
-        let word_index = pos / 64;
-        let bit_in_word = pos % 64;
-        let mut count = 0usize;
-
-        // Count full words before the target word
-        for idx in 0..word_index {
-            if let Ok(word) = self.read_word(idx) {
-                count += word.count_ones() as usize;
-            }
-        }
-
-        // Count bits in the target word up to bit_in_word
-        if let Ok(word) = self.read_word(word_index) {
-            let mask = if bit_in_word == 0 { 0 } else { (1u64 << bit_in_word) - 1 };
-            count += (word & mask).count_ones() as usize;
-        }
-
-        count
-    }
-
-    fn len(&self) -> usize {
-        self.num_bits
-    }
-
-    fn num_ones(&self) -> usize {
-        self.num_ones_cached
-    }
-
-    fn access(&self, pos: usize) -> bool {
-        if pos >= self.num_bits {
-            return false;
-        }
-
-        let word_index = pos / 64;
-        let bit_in_word = pos % 64;
-
-        if let Ok(word) = self.read_word(word_index) {
-            (word & (1u64 << bit_in_word)) != 0
-        } else {
-            false
-        }
-    }
-
-    fn size_in_bytes(&self) -> usize {
-        // Only counting metadata, not the file
-        std::mem::size_of::<Self>()
-    }
-}
-
-/// Memory-mapped bitmap implementation using OS page cache
+/// # Safety contract for callers
 ///
-/// This implementation uses mmap to map the bitmap file into virtual memory,
-/// allowing the OS to manage paging. This provides excellent performance for:
-/// - Multi-file scenarios (shared OS page cache)
-/// - Concurrent access (no locks needed for reads)
-/// - Spatial locality (OS prefetching)
+/// The mapped file must not be modified or truncated for the lifetime of this
+/// `MmapBitmap` (and any other accessors built from the same `Arc<Mmap>`).
+/// `memmap2::Mmap::map` is `unsafe` for exactly this reason: writing to a
+/// mapped file from another process can produce SIGBUS or undefined behavior.
+/// HDT files are immutable after generation, so this is fine in practice as
+/// long as nothing rewrites the file in place while a query process is live.
 ///
-/// Performance characteristics:
-/// - access(): O(1) - direct memory access
-/// - rank(): O(n) - scans words (no rank index yet)
-/// - select1(): O(n) - scans words (no select index yet)
+/// # Performance characteristics
+/// - `access()`: O(1) - direct slice indexing
+/// - `rank()`:   O(n) - scans words (no rank index)
+/// - `select1()`: O(n) - scans words (no select index)
 ///
-/// Memory usage:
-/// - Only metadata in heap (~100 bytes)
-/// - Bitmap data in OS page cache (demand-paged)
+/// # Memory usage
+/// - Heap: a few `usize` fields plus the `Arc<Mmap>` control block
+/// - Bitmap data lives in the OS page cache, demand-paged
 pub struct MmapBitmap {
-    /// Memory-mapped file
-    mmap: memmap2::Mmap,
-    /// Offset to bitmap data within the mmap
+    /// Shared memory map of the underlying file.
+    mmap: Arc<memmap2::Mmap>,
+    /// Offset to the first byte of bitmap data within the mmap.
     data_offset: usize,
-    /// Total number of bits
+    /// Total number of bits stored in this bitmap.
     num_bits: usize,
-    /// Number of 64-bit words
+    /// Number of 64-bit words covered by the bitmap. The last word may be
+    /// byte-aligned (i.e. fewer than 8 bytes if `num_bits % 64 != 0`).
     num_words: usize,
-    /// Cached count of one bits
+    /// Length of the metadata header (type + vbyte + CRC8) in bytes.
+    /// Used by `serialized_size_bytes` so callers can find the next section.
+    metadata_size: usize,
+    /// Pre-computed number of one bits. Computed at construction time so
+    /// `num_ones()` is O(1); the cost is a single sequential scan that the
+    /// OS will read ahead efficiently.
     num_ones_cached: usize,
 }
 
 impl fmt::Debug for MmapBitmap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}, memmaped from file", ByteSize(self.size_in_bytes() as u64))
+        write!(
+            f,
+            "{} bits, {} ones, mmaped from file",
+            self.num_bits, self.num_ones_cached
+        )
+    }
+}
+
+/// Errors that can occur while parsing a bitmap header out of a memory map.
+#[derive(thiserror::Error, Debug)]
+pub enum MmapBitmapError {
+    #[error("bitmap offset {offset} is past end of mmap (len {len})")]
+    OffsetOutOfBounds { offset: u64, len: usize },
+    #[error("unsupported bitmap type {0}, expected 1")]
+    UnsupportedType(u8),
+    #[error("truncated bitmap header at offset {0}")]
+    Truncated(u64),
+    #[error("invalid CRC8 over bitmap header: computed {computed}, stored {stored}")]
+    InvalidCrc8 { computed: u8, stored: u8 },
+    #[error("bitmap data extends past end of mmap: needs {needed} bytes from offset {offset}, mmap len {len}")]
+    DataPastEnd { offset: usize, needed: usize, len: usize },
+    #[error("vbyte decode error: {0}")]
+    Vbyte(#[from] std::io::Error),
+}
+
+impl From<MmapBitmapError> for std::io::Error {
+    fn from(e: MmapBitmapError) -> Self {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
     }
 }
 
 impl MmapBitmap {
-    /// Create a new memory-mapped bitmap from an HDT file
-    ///
-    /// # Arguments
-    /// * `file_path` - Path to the HDT file
-    /// * `bitmap_offset` - Byte offset where bitmap section begins in the file
-    ///
-    /// # Returns
-    /// A new MmapBitmap instance that maps the bitmap data into virtual memory
+    /// Convenience: open the file at `file_path` and mmap it, then parse the
+    /// bitmap header at `bitmap_offset`. Most callers should mmap the file
+    /// once themselves and call [`Self::from_mmap`] so multiple components
+    /// can share one mapping.
     pub fn new(file_path: impl AsRef<std::path::Path>, bitmap_offset: u64) -> std::io::Result<Self> {
-        use crate::containers::vbyte::read_vbyte;
-        use std::io::{Read, Seek, SeekFrom};
-
-        // First, read metadata to determine size
         let file = std::fs::File::open(file_path.as_ref())?;
-        let mut reader = std::io::BufReader::new(file);
-        reader.seek(SeekFrom::Start(bitmap_offset))?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        Self::from_mmap(Arc::new(mmap), bitmap_offset)
+    }
 
-        let mut metadata_size = 0u64;
+    /// Parse a bitmap header that begins at `bitmap_offset` within the given
+    /// shared mmap, validating CRC8 and bounds. The returned `MmapBitmap`
+    /// holds a clone of the `Arc`, so the mapping lives as long as any
+    /// accessor that references it.
+    pub fn from_mmap(mmap: Arc<memmap2::Mmap>, bitmap_offset: u64) -> std::io::Result<Self> {
+        use crate::containers::vbyte::read_vbyte;
+        use std::io::Cursor;
 
-        // Read and validate type (1 byte)
-        let mut type_buf = [0u8];
-        reader.read_exact(&mut type_buf)?;
-        metadata_size += 1;
-        if type_buf[0] != 1 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Unsupported bitmap type: {}, expected 1", type_buf[0]),
-            ));
+        let mmap_len = mmap.len();
+        if (bitmap_offset as usize) > mmap_len {
+            return Err(MmapBitmapError::OffsetOutOfBounds { offset: bitmap_offset, len: mmap_len }.into());
         }
 
-        // Read num_bits (vbyte encoded)
-        let (num_bits, vbyte_bytes) = read_vbyte(&mut reader)?;
-        metadata_size += vbyte_bytes.len() as u64;
+        // Parse the header: [type:u8] [num_bits:vbyte] [crc8:u8]. CRC8 covers
+        // type byte and the vbyte bytes (matching Bitmap::read).
+        let mut cursor = Cursor::new(&mmap[bitmap_offset as usize..]);
+        let mut history: Vec<u8> = Vec::with_capacity(8);
 
-        // Skip CRC8 checksum (1 byte)
-        let mut crc_buf = [0u8];
-        reader.read_exact(&mut crc_buf)?;
-        metadata_size += 1;
+        let type_byte = read_one_byte(&mut cursor, bitmap_offset)?;
+        history.push(type_byte);
+        if type_byte != 1 {
+            return Err(MmapBitmapError::UnsupportedType(type_byte).into());
+        }
 
-        // Calculate the actual data offset
-        let data_offset = (bitmap_offset + metadata_size) as usize;
+        let (num_bits, vbyte_bytes) =
+            read_vbyte(&mut cursor).map_err(|_| MmapBitmapError::Truncated(bitmap_offset))?;
+        history.extend_from_slice(&vbyte_bytes);
 
-        // Calculate number of words
+        let stored_crc = read_one_byte(&mut cursor, bitmap_offset)?;
+
+        let crc8 = crc::Crc::<u8>::new(&crc::CRC_8_SMBUS);
+        let mut digest = crc8.digest();
+        digest.update(&history);
+        let computed_crc = digest.finalize();
+        if computed_crc != stored_crc {
+            return Err(MmapBitmapError::InvalidCrc8 { computed: computed_crc, stored: stored_crc }.into());
+        }
+
+        let metadata_size = cursor.position() as usize;
+        let data_offset = bitmap_offset as usize + metadata_size;
         let num_words = if num_bits == 0 { 0 } else { ((num_bits - 1) / 64) + 1 };
 
-        // Open file for mmap
-        let file = std::fs::File::open(file_path.as_ref())?;
+        // Bounds check: every read we will ever perform must lie inside mmap.
+        let data_size = bitmap_data_size_bytes(num_bits, num_words);
+        if data_offset.saturating_add(data_size) > mmap_len {
+            return Err(MmapBitmapError::DataPastEnd { offset: data_offset, needed: data_size, len: mmap_len }.into());
+        }
 
-        // Create memory map
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        // Pre-compute num_ones. The constructor reads every byte once, which
+        // is the same work the legacy Bitmap::read does. Subsequent calls to
+        // num_ones() are then O(1).
+        let num_ones_cached =
+            count_ones_in_slice(&mmap[data_offset..data_offset + data_size], num_bits);
 
-        // Count ones by reading from mmap
-        let num_ones_cached = Self::count_ones_from_mmap(&mmap, data_offset, num_bits as usize, num_words);
-
-        Ok(Self { mmap, data_offset, num_bits, num_words, num_ones_cached })
+        Ok(Self { mmap, data_offset, num_bits, num_words, metadata_size, num_ones_cached })
     }
 
-    /// Count total number of one bits from memory-mapped data
-    fn count_ones_from_mmap(mmap: &memmap2::Mmap, data_offset: usize, num_bits: usize, num_words: usize) -> usize {
-        let mut count = 0usize;
-
-        if num_words == 0 {
-            return 0;
-        }
-
-        // Read all full words
-        for word_idx in 0..(num_words - 1) {
-            let byte_offset = data_offset + word_idx * 8;
-            if byte_offset + 8 <= mmap.len() {
-                let word_bytes = &mmap[byte_offset..byte_offset + 8];
-                let word = u64::from_le_bytes(word_bytes.try_into().unwrap());
-                count += word.count_ones() as usize;
-            }
-        }
-
-        // Read last word (byte-aligned)
-        let last_word_bits = if num_bits == 0 { 0 } else { ((num_bits - 1) % 64) + 1 };
-        let last_word_bytes = last_word_bits.div_ceil(8);
-        let byte_offset = data_offset + (num_words - 1) * 8;
-
-        if byte_offset + last_word_bytes <= mmap.len() {
-            let mut last_word = 0u64;
-            for byte_idx in 0..last_word_bytes {
-                last_word |= (mmap[byte_offset + byte_idx] as u64) << (byte_idx * 8);
-            }
-
-            // Only count bits up to num_bits
-            let mask = if last_word_bits == 64 { u64::MAX } else { (1u64 << last_word_bits) - 1 };
-            count += (last_word & mask).count_ones() as usize;
-        }
-
-        count
-    }
-
-    /// Read a 64-bit word from the memory-mapped bitmap
-    fn read_word(&self, word_index: usize) -> Option<u64> {
-        if word_index >= self.num_words {
-            return None;
-        }
-
+    /// Read a 64-bit word from the bitmap data. Always returns a value (the
+    /// constructor verified that all reads up to `num_words` are in bounds);
+    /// the last word may have fewer than 64 valid bits.
+    fn read_word(&self, word_index: usize) -> u64 {
+        debug_assert!(word_index < self.num_words);
         let byte_offset = self.data_offset + word_index * 8;
 
-        if word_index == self.num_words - 1 {
-            // Last word is byte-aligned
-            let last_word_bits = if self.num_bits == 0 { 0 } else { ((self.num_bits - 1) % 64) + 1 };
+        if word_index + 1 == self.num_words {
+            // Last word is byte-aligned, may be shorter than 8 bytes.
+            let last_word_bits = ((self.num_bits - 1) % 64) + 1;
             let last_word_bytes = last_word_bits.div_ceil(8);
-
-            if byte_offset + last_word_bytes > self.mmap.len() {
-                return None;
-            }
-
             let mut word = 0u64;
             for byte_idx in 0..last_word_bytes {
                 word |= (self.mmap[byte_offset + byte_idx] as u64) << (byte_idx * 8);
             }
-            Some(word)
+            word
         } else {
-            if byte_offset + 8 > self.mmap.len() {
+            let bytes: [u8; 8] = self.mmap[byte_offset..byte_offset + 8].try_into().unwrap();
+            u64::from_le_bytes(bytes)
+        }
+    }
+
+    /// Find the k-th one bit in a 64-bit word.
+    fn select1_in_word(word: u64, k: usize) -> Option<usize> {
+        let mut remaining = word;
+        for _ in 0..k {
+            // Clear the lowest set bit.
+            if remaining == 0 {
                 return None;
             }
-
-            let word_bytes = &self.mmap[byte_offset..byte_offset + 8];
-            Some(u64::from_le_bytes(word_bytes.try_into().unwrap()))
+            remaining &= remaining - 1;
         }
+        if remaining == 0 {
+            return None;
+        }
+        Some(remaining.trailing_zeros() as usize)
     }
 
-    /// Calculate the total serialized size of this bitmap on disk.
-    ///
-    /// This includes:
-    /// - 1 byte: bitmap type
-    /// - N bytes: vbyte-encoded num_bits
-    /// - 1 byte: CRC8 checksum
-    /// - M bytes: bitmap data (byte-aligned words)
-    /// - 4 bytes: CRC32 checksum
-    ///
-    /// Returns the total number of bytes this bitmap occupies when serialized.
+    /// Calculate the total serialized size of this bitmap on disk, including
+    /// the type byte, vbyte length, CRC8, the byte-aligned data and the
+    /// trailing CRC32. Used by `new_hybrid_cache` to find the offset of the
+    /// section that follows this bitmap in the cache file.
     pub fn serialized_size_bytes(&self) -> usize {
-        use crate::containers::vbyte::encode_vbyte;
-
-        // Metadata: type (1) + vbyte(num_bits) + crc8 (1)
-        let vbyte_size = encode_vbyte(self.num_bits).len();
-        let metadata_size = 1 + vbyte_size + 1;
-
-        // Data: byte-aligned words
-        let data_size = if self.num_words == 0 {
-            0
-        } else {
-            // Full words
-            let full_words = self.num_words - 1;
-            let full_words_bytes = full_words * 8;
-
-            // Last word (byte-aligned)
-            let last_word_bits = ((self.num_bits - 1) % 64) + 1;
-            let last_word_bytes = last_word_bits.div_ceil(8);
-
-            full_words_bytes + last_word_bytes
-        };
-
-        // CRC32 trailer
-        let crc_size = 4;
-
-        metadata_size + data_size + crc_size
+        let data_size = bitmap_data_size_bytes(self.num_bits, self.num_words);
+        // metadata + data + CRC32 trailer
+        self.metadata_size + data_size + 4
     }
 
-    /// Find the k-th one bit in a 64-bit word (helper function)
-    fn select1_in_word(word: u64, k: usize) -> Option<usize> {
-        let mut ones_seen = 0usize;
-        for bit_pos in 0..64 {
-            if (word & (1u64 << bit_pos)) != 0 {
-                if ones_seen == k {
-                    return Some(bit_pos);
-                }
-                ones_seen += 1;
-            }
+    /// Verify the CRC32 trailer over the bitmap data. This forces all data
+    /// pages into memory, so it is *not* called from the constructor. Use it
+    /// in long-running services that want to detect on-disk corruption
+    /// proactively.
+    pub fn verify_crc32(&self) -> Result<(), std::io::Error> {
+        let data_size = bitmap_data_size_bytes(self.num_bits, self.num_words);
+        let data = &self.mmap[self.data_offset..self.data_offset + data_size];
+        let trailer_offset = self.data_offset + data_size;
+        if trailer_offset + 4 > self.mmap.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "missing CRC32 trailer for bitmap",
+            ));
         }
-        None
+        let trailer: [u8; 4] = self.mmap[trailer_offset..trailer_offset + 4].try_into().unwrap();
+        let stored = u32::from_le_bytes(trailer);
+
+        let crc32 = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI);
+        let mut digest = crc32.digest();
+        digest.update(data);
+        let computed = digest.finalize();
+        if computed != stored {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid CRC32 over bitmap data: computed {computed}, stored {stored}"),
+            ));
+        }
+        Ok(())
     }
 }
 
 impl BitmapAccess for MmapBitmap {
     fn select1(&self, k: usize) -> Option<usize> {
-        // O(n) operation - scan words until we find the k-th one bit
         let mut ones_seen = 0usize;
 
         for word_idx in 0..self.num_words {
-            let word = self.read_word(word_idx)?;
+            let word = self.read_word(word_idx);
             let ones_in_word = word.count_ones() as usize;
 
             if ones_seen + ones_in_word > k {
-                // The k-th one is in this word
                 let target_in_word = k - ones_seen;
                 let bit_pos = Self::select1_in_word(word, target_in_word)?;
                 return Some(word_idx * 64 + bit_pos);
@@ -565,7 +321,6 @@ impl BitmapAccess for MmapBitmap {
     }
 
     fn rank(&self, pos: usize) -> usize {
-        // O(n) operation - count ones up to position
         if pos >= self.num_bits {
             return self.num_ones_cached;
         }
@@ -574,18 +329,13 @@ impl BitmapAccess for MmapBitmap {
         let bit_in_word = pos % 64;
         let mut count = 0usize;
 
-        // Count full words before the target word
         for idx in 0..word_index {
-            if let Some(word) = self.read_word(idx) {
-                count += word.count_ones() as usize;
-            }
+            count += self.read_word(idx).count_ones() as usize;
         }
 
-        // Count bits in the target word up to bit_in_word
-        if let Some(word) = self.read_word(word_index) {
-            let mask = if bit_in_word == 0 { 0 } else { (1u64 << bit_in_word) - 1 };
-            count += (word & mask).count_ones() as usize;
-        }
+        let word = self.read_word(word_index);
+        let mask = if bit_in_word == 0 { 0 } else { (1u64 << bit_in_word) - 1 };
+        count += (word & mask).count_ones() as usize;
 
         count
     }
@@ -602,20 +352,61 @@ impl BitmapAccess for MmapBitmap {
         if pos >= self.num_bits {
             return false;
         }
-
-        let word_index = pos / 64;
-        let bit_in_word = pos % 64;
-
-        if let Some(word) = self.read_word(word_index) {
-            (word & (1u64 << bit_in_word)) != 0
-        } else {
-            false
-        }
+        let byte_offset = self.data_offset + pos / 8;
+        let bit_in_byte = pos % 8;
+        (self.mmap[byte_offset] >> bit_in_byte) & 1 == 1
     }
 
     fn size_in_bytes(&self) -> usize {
-        // Only counting metadata in heap, not the mmap pages
-        // The OS manages the actual memory pages
+        // Heap footprint only: a few words plus the Arc control block.
+        // The mmap data lives in the OS page cache and is not counted.
         std::mem::size_of::<Self>()
     }
+}
+
+/// Number of bytes the bitmap data occupies on disk for `num_bits` /
+/// `num_words`. The last word is byte-aligned.
+fn bitmap_data_size_bytes(num_bits: usize, num_words: usize) -> usize {
+    if num_words == 0 {
+        return 0;
+    }
+    let full_words = num_words - 1;
+    let last_word_bits = ((num_bits - 1) % 64) + 1;
+    let last_word_bytes = last_word_bits.div_ceil(8);
+    full_words * 8 + last_word_bytes
+}
+
+/// Count one bits in a byte-aligned bitmap data slice for `num_bits` total.
+fn count_ones_in_slice(data: &[u8], num_bits: usize) -> usize {
+    if num_bits == 0 {
+        return 0;
+    }
+    let num_words = ((num_bits - 1) / 64) + 1;
+    let mut count = 0usize;
+
+    // Full 8-byte words.
+    for word_idx in 0..(num_words - 1) {
+        let byte_offset = word_idx * 8;
+        let bytes: [u8; 8] = data[byte_offset..byte_offset + 8].try_into().unwrap();
+        count += u64::from_le_bytes(bytes).count_ones() as usize;
+    }
+
+    // Last (possibly short) word.
+    let last_word_bits = ((num_bits - 1) % 64) + 1;
+    let last_word_bytes = last_word_bits.div_ceil(8);
+    let byte_offset = (num_words - 1) * 8;
+    let mut last_word = 0u64;
+    for i in 0..last_word_bytes {
+        last_word |= (data[byte_offset + i] as u64) << (i * 8);
+    }
+    let mask = if last_word_bits == 64 { u64::MAX } else { (1u64 << last_word_bits) - 1 };
+    count += (last_word & mask).count_ones() as usize;
+    count
+}
+
+fn read_one_byte<T: AsRef<[u8]>>(cursor: &mut std::io::Cursor<T>, base_offset: u64) -> Result<u8, MmapBitmapError> {
+    use std::io::Read;
+    let mut buf = [0u8];
+    cursor.read_exact(&mut buf).map_err(|_| MmapBitmapError::Truncated(base_offset))?;
+    Ok(buf[0])
 }

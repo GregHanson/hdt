@@ -16,9 +16,9 @@ pub mod sequence_access;
 pub mod control_info;
 
 pub use adj_list::AdjList;
-pub use adj_list_generic::{AdjListGeneric, AdjListFileBased, AdjListInMemory};
+pub use adj_list_generic::{AdjListGeneric, AdjListInMemory, AdjListMmap};
 pub use bitmap::Bitmap;
-pub use bitmap_access::{BitmapAccess, FileBasedBitmap, InMemoryBitmap, MmapBitmap};
+pub use bitmap_access::{BitmapAccess, InMemoryBitmap, MmapBitmap};
 pub use control_info::{ControlInfo, ControlType};
 pub use sequence::Sequence;
-pub use sequence_access::{FileBasedSequence, InMemorySequence, SequenceAccess};
+pub use sequence_access::{InMemorySequence, MmapSequence, SequenceAccess};

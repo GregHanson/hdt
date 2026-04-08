@@ -118,9 +118,9 @@ pub use crate::hdt::{Hdt, HdtGeneric};
 pub use crate::hdt::HdtHybrid;
 use containers::ControlInfo;
 use dict_sect_pfc::DictSectPFC;
-pub use dict_sect_pfc::{DictSectPfcAccess, FileBasedDictSectPfc};
+pub use dict_sect_pfc::{DictSectPfcAccess, MmapDictSectPfc};
 use four_sect_dict::FourSectDict;
-pub use four_sect_dict::{FourSectDictFileBased, FourSectDictGeneric, IdKind};
+pub use four_sect_dict::{FourSectDictGeneric, FourSectDictMmap, IdKind};
 
 #[cfg(test)]
 mod tests {

@@ -5,7 +5,8 @@ use crate::dict_sect_pfc;
 use crate::triples::Id;
 use crate::{ControlInfo, DictSectPFC};
 use std::io::BufRead;
-use std::path::Path;
+#[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
+use std::sync::Arc;
 #[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
 use std::thread::JoinHandle;
 use thiserror::Error;
@@ -49,8 +50,8 @@ pub struct FourSectDictGeneric<D: dict_sect_pfc::DictSectPfcAccess> {
 /// Type alias for the standard in-memory four section dictionary
 pub type FourSectDict = FourSectDictGeneric<DictSectPFC>;
 
-/// Type alias for file-based four section dictionary
-pub type FourSectDictFileBased = FourSectDictGeneric<dict_sect_pfc::FileBasedDictSectPfc>;
+/// Type alias for the memory-mapped four section dictionary used by `HdtHybrid`.
+pub type FourSectDictMmap = FourSectDictGeneric<dict_sect_pfc::MmapDictSectPfc>;
 
 /// Designates one of the four sections.
 #[derive(Debug)]
@@ -192,25 +193,26 @@ impl FourSectDict {
         Ok(())
     }
 
-    /// Create a file-based dictionary from cache metadata
-    pub fn from_cache(
-        hdt_path: &Path,
+    /// Build a memory-mapped four-section dictionary from a shared mmap
+    /// and the four section offsets recorded in the cache.
+    #[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
+    pub fn from_mmap(
+        mmap: Arc<memmap2::Mmap>,
         shared_offset: u64,
         subject_offset: u64,
         predicate_offset: u64,
         object_offset: u64,
-    ) -> Result<FourSectDictFileBased> {
+    ) -> Result<FourSectDictMmap> {
         use crate::four_sect_dict::SectKind::*;
-        use dict_sect_pfc::FileBasedDictSectPfc;
-        let buf = &hdt_path.to_path_buf();
+        use dict_sect_pfc::MmapDictSectPfc;
         Ok(FourSectDictGeneric {
-            shared: FileBasedDictSectPfc::new(buf, shared_offset)
+            shared: MmapDictSectPfc::from_mmap(Arc::clone(&mmap), shared_offset)
                 .map_err(|e| DictSectError { e, sect_kind: Shared })?,
-            subjects: FileBasedDictSectPfc::new(buf, subject_offset)
+            subjects: MmapDictSectPfc::from_mmap(Arc::clone(&mmap), subject_offset)
                 .map_err(|e| DictSectError { e, sect_kind: Subject })?,
-            predicates: FileBasedDictSectPfc::new(buf, predicate_offset)
+            predicates: MmapDictSectPfc::from_mmap(Arc::clone(&mmap), predicate_offset)
                 .map_err(|e| DictSectError { e, sect_kind: Predicate })?,
-            objects: FileBasedDictSectPfc::new(buf, object_offset)
+            objects: MmapDictSectPfc::from_mmap(mmap, object_offset)
                 .map_err(|e| DictSectError { e, sect_kind: Object })?,
         })
     }

@@ -1,9 +1,9 @@
 use crate::containers::{BitmapAccess, ControlInfo, InMemoryBitmap, InMemorySequence, SequenceAccess, control_info};
 #[cfg(feature = "cache")]
-use crate::containers::{AdjListGeneric, FileBasedSequence, MmapBitmap};
+use crate::containers::{AdjListGeneric, MmapBitmap, MmapSequence};
 use crate::dict_sect_pfc::DictSectPfcAccess;
 #[cfg(feature = "cache")]
-use crate::dict_sect_pfc::FileBasedDictSectPfc;
+use crate::dict_sect_pfc::MmapDictSectPfc;
 use crate::four_sect_dict::{self, FourSectDictGeneric, IdKind};
 use crate::header::Header;
 #[cfg(feature = "cache")]
@@ -45,11 +45,13 @@ pub struct HdtGeneric<D: DictSectPfcAccess, S: SequenceAccess, B: BitmapAccess> 
 /// Type alias for the standard in-memory HDT (backward compatible)
 pub type Hdt = HdtGeneric<DictSectPFC, InMemorySequence, InMemoryBitmap>;
 
-/// Type alias for hybrid HDT implementation using file-based sequences, mmap bitmaps, and file-based dictionaries.
-/// Used with HybridCache for memory-efficient querying of large HDT files.
-/// The wavelet tree is kept in memory (from cache), while other structures are accessed from disk.
+/// Type alias for the hybrid HDT implementation. All structures except the
+/// wavelet tree are mmaped from disk. A single shared `Arc<Mmap>` covers
+/// the dictionary, bitmaps and sequence inside the HDT file, while the
+/// op-index lives in a second `Arc<Mmap>` over the cache file. The wavelet
+/// tree itself is loaded into memory from the cache.
 #[cfg(feature = "cache")]
-pub type HdtHybrid = HdtGeneric<FileBasedDictSectPfc, FileBasedSequence, MmapBitmap>;
+pub type HdtHybrid = HdtGeneric<MmapDictSectPfc, MmapSequence, MmapBitmap>;
 
 type StringTriple = [Arc<str>; 3];
 
@@ -340,20 +342,18 @@ impl Hdt {
         Ok(hdt)
     }
 
-    /// Creates a hybrid HDT instance that keeps the wavelet tree in memory but accesses
-    /// other structures (dictionary, bitmaps, sequences) from disk via memory-mapped files.
-    ///
-    /// This provides a balance between memory usage and query performance:
-    /// - The wavelet tree (needed for predicate-based queries) is loaded from cache
-    /// - Dictionary sections are accessed on-demand from the HDT file
-    /// - Bitmaps use memory-mapped access for efficient random access
-    /// - Sequences are streamed from disk
+    /// Creates a hybrid HDT instance that keeps the wavelet tree in memory but
+    /// accesses every other structure (dictionary, bitmaps, sequences,
+    /// op-index) through memory-mapped files. The HDT file is mapped exactly
+    /// once and shared across the dictionary, sequence and bitmap accessors.
+    /// The cache file is mapped exactly once and shared across the op-index
+    /// accessors.
     ///
     /// # Arguments
     /// * `hdt_path` - Path to the HDT file
     ///
     /// # Returns
-    /// Returns an `HdtHybrid` instance, or an error if cache creation/loading fails
+    /// Returns an `HdtHybrid` instance, or an error if cache creation/loading fails.
     ///
     /// # Example
     /// ```no_run
@@ -362,51 +362,49 @@ impl Hdt {
     /// ```
     #[cfg(feature = "cache")]
     pub fn new_hybrid_cache(hdt_path: &Path) -> core::result::Result<HdtHybrid, Box<dyn std::error::Error>> {
-        // Load the HybridCache and get the offset to the OpIndex bitmap in the cache file
+        // Load the HybridCache (or create it). `op_index_bitmap_offset` is
+        // the offset within the cache file where the op-index bitmap begins.
         let (cache, op_index_bitmap_offset) = HybridCache::from_hdt_path(hdt_path)?;
         let cache_path = HybridCache::get_cache_path(hdt_path);
 
-        // Open HDT file and read header
+        // Mmap the HDT file once. Every accessor that views the HDT file
+        // shares this single Arc<Mmap>.
         let hdt_file = File::open(hdt_path)?;
-        let mut reader = std::io::BufReader::new(hdt_file);
+        let hdt_mmap: Arc<memmap2::Mmap> = Arc::new(unsafe { memmap2::Mmap::map(&hdt_file)? });
 
+        // Read header by walking a Cursor over the start of the mmap. We
+        // never need to seek the file again — every other section is found
+        // via the cached offsets.
+        let mut reader = std::io::Cursor::new(&hdt_mmap[..]);
         ControlInfo::read(&mut reader)?;
         let header = Header::read(&mut reader)?;
 
-        // Create file-based dictionary using cached offsets
-        let dict = FourSectDictGeneric::from_cache(
-            hdt_path,
+        // Build the dictionary from the shared HDT mmap.
+        let dict = FourSectDictGeneric::from_mmap(
+            Arc::clone(&hdt_mmap),
             cache.dict_shared_offset,
             cache.dict_subjects_offset,
             cache.dict_predicates_offset,
             cache.dict_objects_offset,
         )?;
 
-        let buf = &hdt_path.to_path_buf();
-
-        // Create file-based/mmap components using cached offsets
-        let sequence_z = FileBasedSequence::new(buf, cache.sequence_z_offset)?;
-        let bitmap_z = MmapBitmap::new(buf, cache.bitmap_z_offset)?;
-        let bitmap_y = MmapBitmap::new(buf, cache.bitmap_y_offset)?;
-
-        // Create file-based adjlist_z from cache metadata
+        // Build sequence_z, bitmap_z and bitmap_y from the same shared HDT mmap.
+        let sequence_z = MmapSequence::from_mmap(Arc::clone(&hdt_mmap), cache.sequence_z_offset)?;
+        let bitmap_z = MmapBitmap::from_mmap(Arc::clone(&hdt_mmap), cache.bitmap_z_offset)?;
+        let bitmap_y = MmapBitmap::from_mmap(Arc::clone(&hdt_mmap), cache.bitmap_y_offset)?;
         let adjlist_z = AdjListGeneric::new(sequence_z, bitmap_z);
 
-        // Get order from cache
-        let order = cache.order()?;
+        // Mmap the cache file once and share it between the op-index bitmap
+        // and sequence (which sit back-to-back at the end of the cache).
+        let cache_file = File::open(&cache_path)?;
+        let cache_mmap: Arc<memmap2::Mmap> = Arc::new(unsafe { memmap2::Mmap::map(&cache_file)? });
 
-        // Use the cached op_index (stored at end of cache file)
-        // The bitmap comes first, then the sequence
-        let op_index_bitmap = MmapBitmap::new(&cache_path, op_index_bitmap_offset)?;
-
-        // Calculate where the sequence begins (right after the bitmap)
-        let bitmap_size = op_index_bitmap.serialized_size_bytes() as u64;
-        let op_index_sequence_offset = op_index_bitmap_offset + bitmap_size;
-
-        let op_index_sequence = FileBasedSequence::new(&cache_path, op_index_sequence_offset)?;
+        let op_index_bitmap = MmapBitmap::from_mmap(Arc::clone(&cache_mmap), op_index_bitmap_offset)?;
+        let op_index_sequence_offset = op_index_bitmap_offset + op_index_bitmap.serialized_size_bytes() as u64;
+        let op_index_sequence = MmapSequence::from_mmap(cache_mmap, op_index_sequence_offset)?;
         let op_index = OpIndexGeneric::new(op_index_sequence, op_index_bitmap);
 
-        // Build the TriplesBitmapGeneric with hybrid components
+        let order = cache.order()?;
         let triples = TriplesBitmapGeneric::from_components(order, bitmap_y, adjlist_z, op_index, cache.wavelet_y);
 
         let hdt = HdtHybrid { header, dict, triples };

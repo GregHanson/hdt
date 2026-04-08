@@ -1,7 +1,7 @@
 use crate::ControlInfo;
 use crate::containers::{
-    AdjList, AdjListGeneric, Bitmap, BitmapAccess, FileBasedBitmap, FileBasedSequence, InMemoryBitmap,
-    InMemorySequence, MmapBitmap, Sequence, SequenceAccess, bitmap, control_info, sequence,
+    AdjList, AdjListGeneric, Bitmap, BitmapAccess, InMemoryBitmap, InMemorySequence, MmapBitmap, MmapSequence,
+    Sequence, SequenceAccess, bitmap, control_info, sequence,
 };
 use bytesize::ByteSize;
 use log::error;
@@ -71,8 +71,8 @@ impl TryFrom<u32> for Order {
 /// See Martínez-Prieto, M., M. Arias, and J. Fernández (2012). Exchange and Consumption of Huge RDF Data. Pages 8--10.
 ///
 /// Generic over:
-/// - S: SequenceAccess for the sequence (InMemorySequence or FileBasedSequence)
-/// - B: BitmapAccess for the bitmap (InMemoryBitmap, FileBasedBitmap, or MmapBitmap)
+/// - S: SequenceAccess for the sequence (`InMemorySequence` or `MmapSequence`)
+/// - B: BitmapAccess for the bitmap (`InMemoryBitmap` or `MmapBitmap`)
 pub struct OpIndexGeneric<S: SequenceAccess, B: BitmapAccess> {
     /// Compact integer vector of object positions.
     /// "[...] integer sequence: SoP, which stores, for each object, a sorted list of references to the predicate-subject pairs (sorted by predicate) related to it."
@@ -85,11 +85,8 @@ pub struct OpIndexGeneric<S: SequenceAccess, B: BitmapAccess> {
 /// This maintains backward compatibility with existing code.
 pub type OpIndex = OpIndexGeneric<InMemorySequence, InMemoryBitmap>;
 
-/// Type alias for file-based OpIndex with streaming from disk.
-pub type OpIndexFileBased = OpIndexGeneric<FileBasedSequence, FileBasedBitmap>;
-
-/// Type alias for mmap-based OpIndex.
-pub type OpIndexMmap = OpIndexGeneric<FileBasedSequence, MmapBitmap>;
+/// Type alias for the mmap-based OpIndex used by `HdtHybrid`.
+pub type OpIndexMmap = OpIndexGeneric<MmapSequence, MmapBitmap>;
 
 impl<S: SequenceAccess, B: BitmapAccess> fmt::Debug for OpIndexGeneric<S, B> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -146,13 +143,12 @@ type WT = QWT512<usize>;
 /// Generic `BitmapTriples` variant of the triples section.
 ///
 /// Generic over:
-/// - S: SequenceAccess (InMemorySequence or FileBasedSequence)
-/// - B: BitmapAccess (InMemoryBitmap, FileBasedBitmap, or MmapBitmap)
+/// - S: SequenceAccess (`InMemorySequence` or `MmapSequence`)
+/// - B: BitmapAccess (`InMemoryBitmap` or `MmapBitmap`)
 ///
 /// ## Main Variants:
-/// 1. **All in-memory**: TriplesBitmap (traditional, fast, high memory)
-/// 2. **File-based**: TriplesBitmapFileBased (streaming, slow, minimal memory)
-/// 3. **Hybrid with mmap**: Uses MmapBitmap for efficient multi-file scenarios
+/// 1. **All in-memory**: `TriplesBitmap` (fast, high memory)
+/// 2. **All mmaped**: `TriplesBitmapMmap` (low memory, OS page cache, used by `HdtHybrid`)
 pub struct TriplesBitmapGeneric<S: SequenceAccess, B: BitmapAccess> {
     order: Order,
     /// bitmap to find positions in the wavelet matrix (generic: in-memory or file-based)
@@ -169,12 +165,8 @@ pub struct TriplesBitmapGeneric<S: SequenceAccess, B: BitmapAccess> {
 /// This maintains backward compatibility with existing code.
 pub type TriplesBitmap = TriplesBitmapGeneric<InMemorySequence, InMemoryBitmap>;
 
-/// Type alias for file-based TriplesBitmap with streaming from disk.
-/// Minimal memory footprint but slower query performance.
-pub type TriplesBitmapFileBased = TriplesBitmapGeneric<FileBasedSequence, FileBasedBitmap>;
-
-/// Type alias for mmap-based TriplesBitmap.
-pub type TriplesBitmapMmap = TriplesBitmapGeneric<FileBasedSequence, MmapBitmap>;
+/// Type alias for the mmap-based TriplesBitmap used by `HdtHybrid`.
+pub type TriplesBitmapMmap = TriplesBitmapGeneric<MmapSequence, MmapBitmap>;
 
 #[derive(Debug)]
 pub enum Level {

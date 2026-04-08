@@ -1,7 +1,6 @@
 #![allow(missing_docs)] // temporariy while we figure out what should be public in the end
 /// Dictionary section with plain front coding.
 /// See <https://www.rdfhdt.org/hdt-binary-format/#DictionarySectionPlainFrontCoding>.
-use crate::containers::sequence_access::PositionedReader;
 use crate::containers::vbyte::{decode_vbyte_delta, encode_vbyte, read_vbyte};
 use crate::containers::{Sequence, sequence};
 use crate::triples::Id;
@@ -422,166 +421,256 @@ impl DictSectPfcAccess for DictSectPFC {
     }
 }
 
-/// File-based dictionary section that reads strings on-demand from disk.
+/// Memory-mapped dictionary section with plain front coding.
 ///
-/// This implementation keeps only the sequence (for block positions) in memory,
-/// and reads packed_data from disk when needed. This dramatically reduces memory
-/// usage for large dictionaries at the cost of slower lookups.
-pub struct FileBasedDictSectPfc {
-    /// Total number of strings in this section
+/// Holds an `Arc<Mmap>` so multiple components can share a single mapping
+/// of the same file. The block-position sequence is read into memory because
+/// it is small (one entry per block, with block size 16 by default) and is
+/// hit on every binary search; the packed UTF-8 data lives in the mmap and
+/// is touched only on demand.
+///
+/// # Safety contract for callers
+///
+/// As with [`crate::containers::MmapBitmap`], the underlying file must not
+/// be modified or truncated while any `MmapDictSectPfc` references it.
+pub struct MmapDictSectPfc {
+    /// Total number of strings stored in this section.
     num_strings: usize,
-    /// Block size for plain front coding
+    /// Block size for plain front coding (typically 16).
     block_size: usize,
-    /// In-memory sequence for block positions (relatively small)
+    /// In-memory sequence holding the byte offset of each block start
+    /// within the packed data. Small even for huge dictionaries.
     sequence: Sequence,
-    /// Offset where packed data starts (after sequence)
-    packed_data_offset: u64,
-    /// Length of packed data in bytes
+    /// Shared memory map of the underlying file.
+    mmap: Arc<memmap2::Mmap>,
+    /// Absolute offset of the packed data within the mmap.
+    packed_data_offset: usize,
+    /// Length of the packed data region in bytes.
     packed_data_len: usize,
-    /// Cached file handle with position tracking for efficient reading
-    file: std::sync::Arc<std::sync::Mutex<PositionedReader>>,
+    /// Total number of bytes this dictionary section occupies on disk
+    /// (header + sequence + packed data + CRC32 trailer). Used by callers
+    /// that need to find the offset of the next section.
+    serialized_len: usize,
 }
 
-impl fmt::Debug for FileBasedDictSectPfc {
+impl fmt::Debug for MmapDictSectPfc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "total size {}, {} strings, dictionary read directly from file",
+            "total size {}, {} strings, dictionary mmaped from file",
             ByteSize(self.size_in_bytes() as u64),
             self.num_strings,
         )
     }
 }
 
-impl FileBasedDictSectPfc {
-    /// Create a new file-based dictionary section.
-    ///
-    /// # Arguments
-    /// * `file_path` - Path to the HDT file
-    /// * `section_offset` - Offset to the start of this dictionary section (including type/metadata)
-    ///
-    /// # Returns
-    /// A file-based dictionary section that reads strings on-demand
-    pub fn new(file_path: &std::path::PathBuf, section_offset: u64) -> Result<Self> {
-        use std::fs::File;
-        use std::io::{BufReader, Read, Seek, SeekFrom};
+impl MmapDictSectPfc {
+    /// Convenience: open the file at `file_path`, mmap it, and parse the
+    /// dictionary section header at `section_offset`.
+    pub fn new(file_path: impl AsRef<std::path::Path>, section_offset: u64) -> Result<Self> {
+        let file = std::fs::File::open(file_path.as_ref())?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        Self::from_mmap(Arc::new(mmap), section_offset)
+    }
 
-        let file = File::open(file_path)?;
-        let mut reader = BufReader::new(file);
-        reader.seek(SeekFrom::Start(section_offset))?;
+    /// Parse a dictionary section header that begins at `section_offset`
+    /// within the given shared mmap. Validates CRC8 over the header,
+    /// reads the in-memory sequence (which validates its own CRC8/CRC32),
+    /// and bounds-checks the packed data range against the mmap length.
+    /// CRC32 over the packed data is *not* validated here so that we do
+    /// not force every page into memory; use [`Self::verify_crc32`] when
+    /// proactive corruption checking is desired.
+    pub fn from_mmap(mmap: Arc<memmap2::Mmap>, section_offset: u64) -> Result<Self> {
+        use std::io::{BufRead, Cursor, Read};
 
-        // Read metadata (similar to read_skip_validation but don't load packed_data)
+        let mmap_len = mmap.len();
+        if (section_offset as usize) > mmap_len {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("dict section offset {section_offset} past end of mmap (len {mmap_len})"),
+            )));
+        }
+
+        // Parse the header from a Cursor over the mmap slice. The Cursor's
+        // `position()` tells us how many bytes we consumed for the header
+        // and the in-memory sequence.
+        let mut cursor = Cursor::new(&mmap[section_offset as usize..]);
+
         let mut preamble = [0_u8];
-        reader.read_exact(&mut preamble)?;
+        cursor.read_exact(&mut preamble)?;
         if preamble[0] != 2 {
             return Err(Error::DictSectNotPfc(preamble[0]));
         }
 
-        // Read section metadata with CRC8 validation
         let crc8 = crc::Crc::<u8>::new(&crc::CRC_8_SMBUS);
         let mut digest8 = crc8.digest();
         digest8.update(&[0x02]);
 
-        let (num_strings, bytes_read) = read_vbyte(&mut reader)?;
+        let (num_strings, bytes_read) = read_vbyte(&mut cursor)?;
         digest8.update(&bytes_read);
-        let (packed_length, bytes_read) = read_vbyte(&mut reader)?;
+        let (packed_length, bytes_read) = read_vbyte(&mut cursor)?;
         digest8.update(&bytes_read);
-        let (block_size, bytes_read) = read_vbyte(&mut reader)?;
+        let (block_size, bytes_read) = read_vbyte(&mut cursor)?;
         digest8.update(&bytes_read);
 
-        let mut crc_code8 = [0_u8];
-        reader.read_exact(&mut crc_code8)?;
-        let crc_code8 = crc_code8[0];
-
-        let crc_calculated8 = digest8.finalize();
-        if crc_calculated8 != crc_code8 {
-            return Err(Error::InvalidCrc8Checksum(crc_calculated8, crc_code8));
+        let mut stored_crc8 = [0_u8];
+        cursor.read_exact(&mut stored_crc8)?;
+        let computed_crc8 = digest8.finalize();
+        if computed_crc8 != stored_crc8[0] {
+            return Err(Error::InvalidCrc8Checksum(computed_crc8, stored_crc8[0]));
         }
 
-        // Read sequence (needs to be in memory for efficient block lookups)
-        let sequence =
-            Sequence::read(&mut reader).map_err(|e| std::io::Error::other(format!("Sequence read error: {e}")))?;
+        // Read the in-memory block-position sequence. Sequence::read takes
+        // a BufRead, and Cursor over a slice fits the bill. It validates
+        // its own CRC8 and CRC32, so failures here surface real corruption.
+        let sequence = Sequence::read(&mut (&mut cursor as &mut dyn BufRead))?;
 
-        // Calculate packed data offset
-        let current_pos = reader.stream_position()?;
-        let packed_data_offset = current_pos;
+        // Locate the packed data region within the mmap.
+        let packed_data_start = section_offset as usize + cursor.position() as usize;
+        let packed_data_end = packed_data_start
+            .checked_add(packed_length)
+            .ok_or_else(|| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "packed data offset overflow")))?;
+        // Ensure the CRC32 trailer is also in bounds for serialized_len math.
+        let trailer_end = packed_data_end + 4;
+        if trailer_end > mmap_len {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("dict section data ({packed_length} bytes + 4 byte trailer) past end of mmap"),
+            )));
+        }
 
-        // Open a new file handle for the cached reader
-        let data_file = File::open(file_path)?;
-        let data_reader = BufReader::new(data_file);
-        let positioned_reader = PositionedReader::new(data_reader);
-        let file = std::sync::Arc::new(std::sync::Mutex::new(positioned_reader));
+        let serialized_len = trailer_end - section_offset as usize;
 
-        Ok(FileBasedDictSectPfc {
+        Ok(MmapDictSectPfc {
             num_strings,
             block_size,
             sequence,
-            packed_data_offset,
+            mmap,
+            packed_data_offset: packed_data_start,
             packed_data_len: packed_length,
-            file,
+            serialized_len,
         })
     }
 
-    /// Read a range of bytes from the packed data
-    fn read_packed_range(&self, start: usize, len: usize) -> std::io::Result<Vec<u8>> {
-        let mut reader = self.file.lock().unwrap();
-        let offset = self.packed_data_offset + start as u64;
-        reader.seek_to(offset)?;
-        let mut buf = vec![0u8; len];
-        reader.read_exact(&mut buf)?;
-        Ok(buf)
+    /// Total number of bytes this section occupies on disk, including the
+    /// header, the sequence, the packed data, and the CRC32 trailer.
+    pub fn serialized_size_bytes(&self) -> usize {
+        self.serialized_len
     }
 
-    /// Read bytes from a position until a null terminator
-    fn read_until_null(&self, start: usize) -> std::io::Result<Vec<u8>> {
-        let mut reader = self.file.lock().unwrap();
-        let offset = self.packed_data_offset + start as u64;
-        reader.seek_to(offset)?;
-
-        let mut result = Vec::new();
-        let mut buf = [0u8; 1];
-        loop {
-            reader.read_exact(&mut buf)?;
-            if buf[0] == 0 {
-                break;
-            }
-            result.push(buf[0]);
-        }
-        Ok(result)
+    /// Borrow the packed data slice from the mmap.
+    fn packed_data(&self) -> &[u8] {
+        &self.mmap[self.packed_data_offset..self.packed_data_offset + self.packed_data_len]
     }
 
-    /// Get the length of a null-terminated string starting at position
+    /// Length of the null-terminated string starting at `position` within
+    /// the packed data. Stops at the first null byte or end of buffer.
     fn strlen(&self, position: usize) -> usize {
-        // Read one byte at a time until null
-        let mut len = 0;
-        let mut reader = self.file.lock().unwrap();
-        let offset = self.packed_data_offset + position as u64;
-        if reader.seek_to(offset).is_err() {
+        let data = self.packed_data();
+        let length = data.len();
+        let mut p = position;
+        while p < length && data[p] != 0 {
+            p += 1;
+        }
+        p - position
+    }
+
+    /// Borrow the string stored at the start of block `index` (the first
+    /// entry of the block, which is stored verbatim — no front-coding).
+    fn index_str(&self, index: usize) -> &str {
+        let data = self.packed_data();
+        let position = self.sequence.get(index);
+        let length = self.strlen(position);
+        // The dictionary writer guarantees valid UTF-8 here. If the file is
+        // corrupted, str::from_utf8 surfaces it; we panic here to match the
+        // in-memory implementation's behavior.
+        str::from_utf8(&data[position..position + length]).expect("invalid UTF-8 in dictionary block header")
+    }
+
+    fn longest_common_prefix(a: &[u8], b: &[u8]) -> usize {
+        let len = min(a.len(), b.len());
+        let mut delta = 0;
+        while delta < len && a[delta] == b[delta] {
+            delta += 1;
+        }
+        delta
+    }
+
+    /// Search within block `block` for `element`. Returns the 1-based index
+    /// of the matching entry within the block, or 0 if not found.
+    fn locate_in_block(&self, block: usize, element: &str) -> usize {
+        if block >= self.sequence.entries {
             return 0;
         }
+        let element = element.as_bytes();
+        let data = self.packed_data();
 
-        let mut buf = [0u8; 1];
-        while reader.read_exact(&mut buf).is_ok() && buf[0] != 0 {
-            len += 1;
+        let mut pos = self.sequence.get(block);
+        let mut id_in_block = 0;
+        let mut cshared = 0;
+
+        // First string in the block is stored verbatim.
+        let slen = self.strlen(pos);
+        let mut temp_string: Vec<u8> = data[pos..pos + slen].to_vec();
+        pos += slen + 1;
+        id_in_block += 1;
+
+        while (id_in_block < self.block_size) && (pos < self.packed_data_len) {
+            let (delta, vbyte_bytes) = decode_vbyte_delta(data, pos);
+            pos += vbyte_bytes;
+
+            let slen = self.strlen(pos);
+            temp_string.truncate(delta);
+            temp_string.extend_from_slice(&data[pos..pos + slen]);
+            if delta >= cshared {
+                cshared += Self::longest_common_prefix(&temp_string[cshared..], &element[cshared..]);
+                if (cshared == element.len()) && (temp_string.len() == element.len()) {
+                    break;
+                }
+            } else {
+                // Current string sorts after the target — not present.
+                id_in_block = 0;
+                break;
+            }
+            pos += slen + 1;
+            id_in_block += 1;
         }
-        len
+
+        if pos >= self.packed_data_len || id_in_block == self.block_size {
+            id_in_block = 0;
+        }
+        id_in_block
     }
 
-    /// Get the string at a block index (for binary search)
-    fn index_str(&self, index: usize) -> Option<String> {
-        let position: usize = self.sequence.get(index);
-        let data = self.read_until_null(position).ok()?;
-        String::from_utf8(data).ok()
+    /// Verify the CRC32 trailer over the packed dictionary data. Forces the
+    /// entire packed-data region into memory; not called from the constructor.
+    pub fn verify_crc32(&self) -> Result<()> {
+        let data = self.packed_data();
+        let trailer_offset = self.packed_data_offset + self.packed_data_len;
+        let trailer: [u8; 4] = self.mmap[trailer_offset..trailer_offset + 4]
+            .try_into()
+            .map_err(|_| Error::Io(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "missing CRC32 trailer")))?;
+        let stored = u32::from_le_bytes(trailer);
+
+        let crc32 = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI);
+        let mut digest = crc32.digest();
+        digest.update(data);
+        let computed = digest.finalize();
+        if computed != stored {
+            return Err(Error::InvalidCrc32Checksum(computed, stored));
+        }
+        Ok(())
     }
 }
 
-impl DictSectPfcAccess for FileBasedDictSectPfc {
+impl DictSectPfcAccess for MmapDictSectPfc {
     fn num_strings(&self) -> usize {
         self.num_strings
     }
 
     fn size_in_bytes(&self) -> usize {
-        // Only in-memory size: sequence + metadata
+        // Block-position sequence is the only heap allocation; the packed
+        // data is mmaped and counted by the OS page cache instead.
         self.sequence.size_in_bytes() + std::mem::size_of::<Self>()
     }
 
@@ -590,7 +679,7 @@ impl DictSectPfcAccess for FileBasedDictSectPfc {
             return 0;
         }
 
-        // Binary search on block headers
+        // Binary search on block headers — same algorithm as DictSectPFC.
         let mut low: usize = 0;
         let mut high = self.sequence.entries.saturating_sub(2);
         let max = high;
@@ -603,10 +692,8 @@ impl DictSectPfcAccess for FileBasedDictSectPfc {
                 mid = max;
                 break;
             } else {
-                match self.index_str(mid) {
-                    Some(text) => element.cmp(&text),
-                    None => break,
-                }
+                let text = self.index_str(mid);
+                element.cmp(text)
             };
             match cmp {
                 Ordering::Less => {
@@ -622,8 +709,6 @@ impl DictSectPfcAccess for FileBasedDictSectPfc {
         if high < mid {
             mid = high;
         }
-
-        // Search within block (simplified - reads full block)
         let idblock = self.locate_in_block(mid, element);
         if idblock == 0 {
             return 0;
@@ -635,27 +720,20 @@ impl DictSectPfcAccess for FileBasedDictSectPfc {
         if id as usize > self.num_strings {
             return Err(ExtractError::IdOutOfBounds { id, len: self.num_strings });
         }
+        let data = self.packed_data();
         let block_index = id.saturating_sub(1) as usize / self.block_size;
         let string_index = id.saturating_sub(1) as usize % self.block_size;
         let mut position = self.sequence.get(block_index);
+        let mut slen = self.strlen(position);
+        let mut string: Vec<u8> = data[position..position + slen].to_vec();
 
-        // Read first string in block
-        let first_str = self.read_until_null(position).map_err(|_| ExtractError::IdOutOfBounds { id, len: self.num_strings })?;
-        let mut string = first_str;
-        position += string.len() + 1;
-
-        // Follow delta encoding to target string
         for _ in 0..string_index {
-            // Read vbyte delta
-            let delta_data = self.read_packed_range(position, 5).unwrap_or_default();
-            let (delta, vbyte_bytes) = decode_vbyte_delta(&delta_data, 0);
+            position += slen + 1;
+            let (delta, vbyte_bytes) = decode_vbyte_delta(data, position);
             position += vbyte_bytes;
-
-            // Read suffix
-            let suffix = self.read_until_null(position).map_err(|_| ExtractError::IdOutOfBounds { id, len: self.num_strings })?;
+            slen = self.strlen(position);
             string.truncate(delta);
-            string.extend_from_slice(&suffix);
-            position += suffix.len() + 1;
+            string.extend_from_slice(&data[position..position + slen]);
         }
 
         match str::from_utf8(&string) {
@@ -666,69 +744,6 @@ impl DictSectPfcAccess for FileBasedDictSectPfc {
                 recovered: String::from_utf8_lossy(&string).into_owned(),
             }),
         }
-    }
-}
-
-impl FileBasedDictSectPfc {
-    /// Search within a block for an element
-    fn locate_in_block(&self, block: usize, element: &str) -> usize {
-        if block >= self.sequence.entries {
-            return 0;
-        }
-        let element = element.as_bytes();
-        let mut pos = self.sequence.get(block);
-        let mut id_in_block = 0;
-        let mut cshared = 0;
-
-        // Read the first string in the block
-        let first_str = match self.read_until_null(pos) {
-            Ok(s) => s,
-            Err(_) => return 0,
-        };
-        let mut temp_string = first_str;
-        pos += temp_string.len() + 1;
-        id_in_block += 1;
-
-        while (id_in_block < self.block_size) && (pos < self.packed_data_len) {
-            // Decode prefix
-            let delta_data = self.read_packed_range(pos, 5).unwrap_or_default();
-            let (delta, vbyte_bytes) = decode_vbyte_delta(&delta_data, 0);
-            pos += vbyte_bytes;
-
-            // Read suffix
-            let suffix = match self.read_until_null(pos) {
-                Ok(s) => s,
-                Err(_) => break,
-            };
-            temp_string.truncate(delta);
-            temp_string.extend_from_slice(&suffix);
-
-            if delta >= cshared {
-                cshared += Self::longest_common_prefix(&temp_string[cshared..], &element[cshared..]);
-                if (cshared == element.len()) && (temp_string.len() == element.len()) {
-                    break;
-                }
-            } else {
-                id_in_block = 0;
-                break;
-            }
-            pos += suffix.len() + 1;
-            id_in_block += 1;
-        }
-
-        if pos >= self.packed_data_len || id_in_block == self.block_size {
-            id_in_block = 0;
-        }
-        id_in_block
-    }
-
-    fn longest_common_prefix(a: &[u8], b: &[u8]) -> usize {
-        let len = min(a.len(), b.len());
-        let mut delta = 0;
-        while delta < len && a[delta] == b[delta] {
-            delta += 1;
-        }
-        delta
     }
 }
 

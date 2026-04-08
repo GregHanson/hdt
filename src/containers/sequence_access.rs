@@ -1,13 +1,16 @@
-//! Trait abstraction for sequence access - allows both in-memory and file-based implementations
+//! Trait abstraction for sequence access - allows in-memory and memory-mapped implementations
 
 use bytesize::ByteSize;
 use std::fmt::{self, Debug};
+use std::sync::Arc;
+
+pub const USIZE_BITS: usize = usize::BITS as usize;
 
 /// Trait for accessing integer sequences
 ///
 /// This abstraction allows sequences to be either:
 /// - In-memory (Sequence struct)
-/// - File-based (streaming from disk)
+/// - Memory-mapped from disk
 pub trait SequenceAccess: Debug + Send + Sync {
     /// Get the value at the given index
     fn get(&self, index: usize) -> usize;
@@ -65,185 +68,211 @@ impl SequenceAccess for InMemorySequence {
     }
 }
 
-/// File-based sequence implementation (streams from disk)
-pub struct FileBasedSequence {
-    /// File offset where sequence data starts
-    data_offset: u64,
-    /// Number of entries
+/// Memory-mapped sequence implementation.
+///
+/// Holds an `Arc<Mmap>` so multiple components can share a single mapping
+/// of the same file. Bit-packed values are extracted with branch-light
+/// slice indexing — no locks, no buffered seeks, fully thread-safe.
+///
+/// # Safety contract for callers
+///
+/// As with [`crate::containers::MmapBitmap`], the underlying file must not
+/// be modified or truncated while any `MmapSequence` references it.
+pub struct MmapSequence {
+    /// Shared memory map of the underlying file.
+    mmap: Arc<memmap2::Mmap>,
+    /// Offset to the first byte of packed sequence data within the mmap.
+    data_offset: usize,
+    /// Number of entries.
     entries: usize,
-    /// Bits per entry
-    bits_per_entry_val: usize,
-    /// Cached file handle with position tracking
-    file: std::sync::Arc<std::sync::Mutex<PositionedReader>>,
+    /// Number of bits per entry. Validated to be in `1..=64` (or 0 for empty).
+    bits_per_entry: usize,
+    /// Length of the metadata header (type + bits + vbyte(entries) + CRC8).
+    metadata_size: usize,
 }
 
-pub const USIZE_BITS: usize = usize::BITS as usize;
-
-impl fmt::Debug for FileBasedSequence {
+impl fmt::Debug for MmapSequence {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}, sequence read directly from file", ByteSize(self.size_in_bytes() as u64))
+        write!(
+            f,
+            "{}, {} entries, {} bits per entry, mmaped from file",
+            ByteSize(self.size_in_bytes() as u64),
+            self.entries,
+            self.bits_per_entry,
+        )
     }
 }
 
-/// Wrapper around BufReader that tracks the current position
-#[derive(Debug)]
-pub struct PositionedReader {
-    reader: std::io::BufReader<std::fs::File>,
-    /// Current position in the file (accounting for buffering)
-    position: u64,
+/// Errors that can occur while parsing a sequence header out of a memory map.
+#[derive(thiserror::Error, Debug)]
+pub enum MmapSequenceError {
+    #[error("sequence offset {offset} is past end of mmap (len {len})")]
+    OffsetOutOfBounds { offset: u64, len: usize },
+    #[error("unsupported sequence type {0}, expected 1 (Log64)")]
+    UnsupportedType(u8),
+    #[error("entry size of {0} bit too large (>64 bit)")]
+    EntrySizeTooLarge(usize),
+    #[error("truncated sequence header at offset {0}")]
+    Truncated(u64),
+    #[error("invalid CRC8 over sequence header: computed {computed}, stored {stored}")]
+    InvalidCrc8 { computed: u8, stored: u8 },
+    #[error("sequence data extends past end of mmap: needs {needed} bytes from offset {offset}, mmap len {len}")]
+    DataPastEnd { offset: usize, needed: usize, len: usize },
 }
 
-impl PositionedReader {
-    pub fn new(reader: std::io::BufReader<std::fs::File>) -> Self {
-        Self { reader, position: 0 }
-    }
-
-    /// Seek to an absolute position, using relative seeking when possible
-    pub fn seek_to(&mut self, target: u64) -> std::io::Result<()> {
-        use std::io::{Seek, SeekFrom};
-
-        if self.position == target {
-            // Already at the right position
-            return Ok(());
-        }
-
-        // Calculate relative offset
-        let offset = target as i64 - self.position as i64;
-
-        // Use relative seek for efficiency
-        self.reader.seek(SeekFrom::Current(offset))?;
-        self.position = target;
-        Ok(())
-    }
-
-    /// Read exact number of bytes and update position
-    pub fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
-        use std::io::Read;
-        self.reader.read_exact(buf)?;
-        self.position += buf.len() as u64;
-        Ok(())
+impl From<MmapSequenceError> for std::io::Error {
+    fn from(e: MmapSequenceError) -> Self {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
     }
 }
 
-impl FileBasedSequence {
-    /// Create a file-based sequence
-    ///
-    /// # Arguments
-    /// * `file_path` - Path to the HDT file
-    /// * `sequence_offset` - File offset to the START of the sequence section (including metadata)
-    ///
-    /// The function will read and validate the metadata, then calculate the actual data offset.
-    pub fn new(file_path: &std::path::PathBuf, sequence_offset: u64) -> std::io::Result<Self> {
+impl MmapSequence {
+    /// Convenience: open the file at `file_path`, mmap it, and parse the
+    /// sequence header at `sequence_offset`.
+    pub fn new(file_path: impl AsRef<std::path::Path>, sequence_offset: u64) -> std::io::Result<Self> {
+        let file = std::fs::File::open(file_path.as_ref())?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        Self::from_mmap(Arc::new(mmap), sequence_offset)
+    }
+
+    /// Parse a sequence header that begins at `sequence_offset` within the
+    /// given shared mmap. Validates CRC8 over the header bytes, that
+    /// `bits_per_entry <= 64`, and that the entire data range fits inside
+    /// the mmap.
+    pub fn from_mmap(mmap: Arc<memmap2::Mmap>, sequence_offset: u64) -> std::io::Result<Self> {
         use crate::containers::vbyte::read_vbyte;
-        use std::io::{Read, Seek, SeekFrom};
+        use std::io::Cursor;
 
-        let file = std::fs::File::open(file_path)?;
-        let mut reader = std::io::BufReader::new(file);
-
-        // Seek to the start of the sequence section
-        reader.seek(SeekFrom::Start(sequence_offset))?;
-
-        // Track how many bytes we read for metadata
-        let mut metadata_size = 0u64;
-
-        // Read and validate type (1 byte)
-        let mut type_buf = [0u8];
-        reader.read_exact(&mut type_buf)?;
-        metadata_size += 1;
-        if type_buf[0] != 1 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Unsupported sequence type: {}, expected 1 (Log64)", type_buf[0]),
-            ));
+        let mmap_len = mmap.len();
+        if (sequence_offset as usize) > mmap_len {
+            return Err(MmapSequenceError::OffsetOutOfBounds { offset: sequence_offset, len: mmap_len }.into());
         }
 
-        // Read bits_per_entry (1 byte)
-        let mut bits_buf = [0u8];
-        reader.read_exact(&mut bits_buf)?;
-        metadata_size += 1;
-        let bits_per_entry = bits_buf[0] as usize;
+        let mut cursor = Cursor::new(&mmap[sequence_offset as usize..]);
+        let mut history: Vec<u8> = Vec::with_capacity(8);
 
-        // Read entries (variable-length vbyte)
-        let (entries, vbyte_bytes) = read_vbyte(&mut reader)?;
-        metadata_size += vbyte_bytes.len() as u64;
+        let type_byte = read_one_byte(&mut cursor, sequence_offset)?;
+        history.push(type_byte);
+        if type_byte != 1 {
+            return Err(MmapSequenceError::UnsupportedType(type_byte).into());
+        }
 
-        // Skip CRC8 checksum (1 byte) - we don't validate it here for performance
-        let mut crc_buf = [0u8];
-        reader.read_exact(&mut crc_buf)?;
-        metadata_size += 1;
+        let bits_per_entry_byte = read_one_byte(&mut cursor, sequence_offset)?;
+        history.push(bits_per_entry_byte);
+        let bits_per_entry = bits_per_entry_byte as usize;
+        if bits_per_entry > 64 {
+            return Err(MmapSequenceError::EntrySizeTooLarge(bits_per_entry).into());
+        }
 
-        // Calculate the actual data offset (sequence_offset + metadata_size)
-        let data_offset = sequence_offset + metadata_size;
+        let (entries, vbyte_bytes) =
+            read_vbyte(&mut cursor).map_err(|_| MmapSequenceError::Truncated(sequence_offset))?;
+        history.extend_from_slice(&vbyte_bytes);
 
-        // Re-open file for the cached reader
-        let file = std::fs::File::open(file_path)?;
-        let reader = std::io::BufReader::new(file);
-        let positioned_reader = PositionedReader::new(reader);
+        let stored_crc = read_one_byte(&mut cursor, sequence_offset)?;
 
-        Ok(Self {
-            data_offset,
-            entries,
-            bits_per_entry_val: bits_per_entry,
-            file: std::sync::Arc::new(std::sync::Mutex::new(positioned_reader)),
-        })
+        let crc8 = crc::Crc::<u8>::new(&crc::CRC_8_SMBUS);
+        let mut digest = crc8.digest();
+        digest.update(&history);
+        let computed_crc = digest.finalize();
+        if computed_crc != stored_crc {
+            return Err(MmapSequenceError::InvalidCrc8 { computed: computed_crc, stored: stored_crc }.into());
+        }
+
+        let metadata_size = cursor.position() as usize;
+        let data_offset = sequence_offset as usize + metadata_size;
+        let data_size = sequence_data_size_bytes(entries, bits_per_entry);
+        if data_offset.saturating_add(data_size) > mmap_len {
+            return Err(MmapSequenceError::DataPastEnd { offset: data_offset, needed: data_size, len: mmap_len }.into());
+        }
+
+        Ok(Self { mmap, data_offset, entries, bits_per_entry, metadata_size })
     }
 
-    /// Read a single value at index
-    fn read_value(&self, index: usize) -> std::io::Result<usize> {
-        if index >= self.entries {
-            return Ok(0);
+    /// Read the bit-packed value at `index`. The constructor verified that
+    /// every in-bounds index is reachable, so this never reads past the
+    /// mmap end.
+    fn read_value(&self, index: usize) -> usize {
+        debug_assert!(index < self.entries);
+        debug_assert!(self.bits_per_entry <= 64);
+
+        if self.bits_per_entry == 0 {
+            return 0;
         }
 
-        let mut positioned_reader = self.file.lock().unwrap();
-
-        // Calculate bit position
-        let bit_offset = index * self.bits_per_entry_val;
-        let byte_offset = bit_offset / 8;
+        let bit_offset = index * self.bits_per_entry;
+        let byte_offset = self.data_offset + (bit_offset / 8);
         let bit_in_byte = bit_offset % 8;
 
-        // Seek to position using optimized relative seeking
-        let target_position = self.data_offset + byte_offset as u64;
-        positioned_reader.seek_to(target_position)?;
+        // Bits needed = bits_per_entry + bit_in_byte ≤ 64 + 7 = 71, so a u128
+        // intermediate (loaded from up to 9 bytes) covers every case cleanly.
+        let bits_needed = self.bits_per_entry + bit_in_byte;
+        let bytes_needed = bits_needed.div_ceil(8); // 1..=9
+        debug_assert!(bytes_needed <= 16);
 
-        // Read enough bytes
-        let bytes_needed = (self.bits_per_entry_val + bit_in_byte).div_ceil(8).min(16);
-        let mut buffer = vec![0u8; bytes_needed];
-        positioned_reader.read_exact(&mut buffer)?;
+        let available = self.mmap.len() - byte_offset;
+        let to_read = bytes_needed.min(available);
 
-        // Extract bits
-        let mut data = Vec::new();
-        for chunk in buffer.chunks(std::mem::size_of::<usize>().min(buffer.len())) {
-            let mut val = 0usize;
-            for (i, &byte) in chunk.iter().enumerate() {
-                val |= (byte as usize) << (i * 8);
-            }
-            data.push(val);
+        let mut acc: u128 = 0;
+        for i in 0..to_read {
+            acc |= (self.mmap[byte_offset + i] as u128) << (i * 8);
         }
 
-        let scaled_index_in_buffer = bit_in_byte;
-        let block_index = scaled_index_in_buffer / USIZE_BITS;
-        let bit_index = scaled_index_in_buffer % USIZE_BITS;
-
-        let result_shift = USIZE_BITS - self.bits_per_entry_val;
-        let result = if bit_index + self.bits_per_entry_val <= USIZE_BITS {
-            let block_shift = USIZE_BITS - bit_index - self.bits_per_entry_val;
-            (data[block_index] << block_shift) >> result_shift
+        let mask: u128 = if self.bits_per_entry == 128 {
+            u128::MAX
         } else {
-            let block_shift = (USIZE_BITS << 1) - bit_index - self.bits_per_entry_val;
-            let mut r = data[block_index] >> bit_index;
-            if block_index + 1 < data.len() {
-                r |= (data[block_index + 1] << block_shift) >> result_shift;
-            }
-            r
+            (1u128 << self.bits_per_entry) - 1
         };
+        ((acc >> bit_in_byte) & mask) as usize
+    }
 
-        Ok(result)
+    /// Calculate the total serialized size of this sequence on disk: header
+    /// (type + bits + vbyte(entries) + CRC8) + byte-aligned packed data +
+    /// CRC32 trailer. Used by callers that need to find the offset of the
+    /// next section in a cache file.
+    pub fn serialized_size_bytes(&self) -> usize {
+        let data_size = sequence_data_size_bytes(self.entries, self.bits_per_entry);
+        // metadata + data + CRC32 trailer
+        self.metadata_size + data_size + 4
+    }
+
+    /// Verify the CRC32 trailer over the packed sequence data. This forces
+    /// every page of the sequence into memory; do not call from a hot path.
+    pub fn verify_crc32(&self) -> Result<(), std::io::Error> {
+        let data_size = sequence_data_size_bytes(self.entries, self.bits_per_entry);
+        let data = &self.mmap[self.data_offset..self.data_offset + data_size];
+        let trailer_offset = self.data_offset + data_size;
+        if trailer_offset + 4 > self.mmap.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "missing CRC32 trailer for sequence",
+            ));
+        }
+        let trailer: [u8; 4] = self.mmap[trailer_offset..trailer_offset + 4].try_into().unwrap();
+        let stored = u32::from_le_bytes(trailer);
+
+        let crc32 = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI);
+        let mut digest = crc32.digest();
+        digest.update(data);
+        let computed = digest.finalize();
+        if computed != stored {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid CRC32 over sequence data: computed {computed}, stored {stored}"),
+            ));
+        }
+        Ok(())
     }
 }
 
-impl SequenceAccess for FileBasedSequence {
+impl SequenceAccess for MmapSequence {
     fn get(&self, index: usize) -> usize {
-        self.read_value(index).unwrap_or(0)
+        assert!(
+            index < self.entries,
+            "index {} out of bounds for sequence of len {}",
+            index,
+            self.entries
+        );
+        self.read_value(index)
     }
 
     fn len(&self) -> usize {
@@ -251,11 +280,28 @@ impl SequenceAccess for FileBasedSequence {
     }
 
     fn bits_per_entry(&self) -> usize {
-        self.bits_per_entry_val
+        self.bits_per_entry
     }
 
     fn size_in_bytes(&self) -> usize {
-        // Only counting metadata, not the file
+        // Heap footprint only: a few words plus the Arc control block.
+        // The mmap data lives in the OS page cache and is not counted.
         std::mem::size_of::<Self>()
     }
+}
+
+/// Number of bytes that `entries * bits_per_entry` bits occupy on disk
+/// (byte-aligned).
+fn sequence_data_size_bytes(entries: usize, bits_per_entry: usize) -> usize {
+    if entries == 0 || bits_per_entry == 0 {
+        return 0;
+    }
+    (entries * bits_per_entry).div_ceil(8)
+}
+
+fn read_one_byte<T: AsRef<[u8]>>(cursor: &mut std::io::Cursor<T>, base_offset: u64) -> Result<u8, MmapSequenceError> {
+    use std::io::Read;
+    let mut buf = [0u8];
+    cursor.read_exact(&mut buf).map_err(|_| MmapSequenceError::Truncated(base_offset))?;
+    Ok(buf[0])
 }
