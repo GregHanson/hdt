@@ -3,6 +3,119 @@
 use std::fmt::{self, Debug};
 use std::sync::Arc;
 
+/// Number of 64-bit words per rank-index block. 8 * 64 = 512 bits per block.
+/// Each block contributes one `u64` cumulative count to the rank index, so
+/// the index overhead is 1 u64 per 512 bits of bitmap data ≈ 1.56%.
+pub const RANK_BLOCK_WORDS: usize = 8;
+pub const RANK_BLOCK_BITS: usize = RANK_BLOCK_WORDS * 64;
+
+/// Number of cumulative-count entries needed to index a bitmap with
+/// `num_words` 64-bit words. Always `num_words.div_ceil(RANK_BLOCK_WORDS) + 1`
+/// so the last entry holds the total `num_ones`.
+pub const fn rank_index_entries(num_words: usize) -> usize {
+    num_words.div_ceil(RANK_BLOCK_WORDS) + 1
+}
+
+/// Serialized byte length of a rank index for a bitmap with `num_words`
+/// 64-bit words. Each entry is a little-endian `u64`.
+pub const fn rank_index_size_bytes(num_words: usize) -> usize {
+    rank_index_entries(num_words) * 8
+}
+
+/// Build a rank index over the given bitmap words.
+///
+/// Returns a `Vec<u64>` of length `num_blocks + 1`, where
+/// `result[i] = popcount(words[0..i*RANK_BLOCK_WORDS])`. The last entry is
+/// therefore `num_ones`. Callers write this vector to the cache file as a
+/// little-endian `u64` array; [`RankIndex`] then views it via mmap.
+pub fn build_rank_index(words: &[u64]) -> Vec<u64> {
+    let num_blocks = words.len().div_ceil(RANK_BLOCK_WORDS);
+    let mut cumulative: Vec<u64> = Vec::with_capacity(num_blocks + 1);
+    cumulative.push(0);
+    let mut count: u64 = 0;
+    let mut w = 0usize;
+    while w < words.len() {
+        let end = (w + RANK_BLOCK_WORDS).min(words.len());
+        for word in &words[w..end] {
+            count += word.count_ones() as u64;
+        }
+        cumulative.push(count);
+        w = end;
+    }
+    cumulative
+}
+
+/// View over a precomputed rank index stored in a memory map.
+///
+/// The index is a dense `[u64]` array, `num_blocks + 1` entries long, laid
+/// out contiguously at `offset` bytes inside `mmap`. Entry `i` holds the
+/// cumulative count of set bits at bit position `i * RANK_BLOCK_BITS`, and
+/// the final entry holds the total `num_ones`.
+///
+/// The mmap can be a different file than the one holding the bitmap data
+/// — for `HdtHybrid`, the bitmap data lives in the HDT file while the rank
+/// index lives in the cache file. Each `Arc<Mmap>` keeps its own file alive
+/// for the lifetime of the accessor.
+#[derive(Clone)]
+pub struct RankIndex {
+    mmap: Arc<memmap2::Mmap>,
+    offset: usize,
+    num_blocks: usize,
+}
+
+impl fmt::Debug for RankIndex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "RankIndex {{ num_blocks: {}, bytes: {} }}",
+            self.num_blocks,
+            rank_index_size_bytes(self.num_blocks * RANK_BLOCK_WORDS)
+        )
+    }
+}
+
+impl RankIndex {
+    /// Construct a rank index view. `num_bits` is the bitmap this index
+    /// describes — used to derive `num_blocks` and to bounds-check the mmap.
+    pub fn from_mmap(mmap: Arc<memmap2::Mmap>, offset: u64, num_bits: usize) -> std::io::Result<Self> {
+        if offset > usize::MAX as u64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("rank index offset {offset} exceeds platform usize::MAX"),
+            ));
+        }
+        let offset = offset as usize;
+        let num_words = num_bits.div_ceil(64);
+        let num_blocks = num_words.div_ceil(RANK_BLOCK_WORDS);
+        let byte_len = rank_index_size_bytes(num_words);
+        if offset.saturating_add(byte_len) > mmap.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "rank index data extends past end of mmap: needs {byte_len} bytes from offset {offset}, mmap len {}",
+                    mmap.len()
+                ),
+            ));
+        }
+        Ok(Self { mmap, offset, num_blocks })
+    }
+
+    /// Number of 512-bit blocks this index covers.
+    pub fn num_blocks(&self) -> usize {
+        self.num_blocks
+    }
+
+    /// Read the cumulative count stored at block boundary `block_idx`.
+    /// Valid range: `[0, num_blocks]` inclusive (the final entry is
+    /// `num_ones`). Panics (debug) on out-of-range access.
+    pub fn cumulative(&self, block_idx: usize) -> u64 {
+        debug_assert!(block_idx <= self.num_blocks);
+        let byte_offset = self.offset + block_idx * 8;
+        let bytes: [u8; 8] = self.mmap[byte_offset..byte_offset + 8].try_into().unwrap();
+        u64::from_le_bytes(bytes)
+    }
+}
+
 /// Trait for accessing bitmaps with rank and select support
 ///
 /// This abstraction allows bitmaps to be either:
@@ -125,6 +238,12 @@ pub struct MmapBitmap {
     /// `num_ones()` is O(1); the cost is a single sequential scan that the
     /// OS will read ahead efficiently.
     num_ones_cached: usize,
+    /// Optional precomputed rank index. When present, `rank()` is O(1) and
+    /// `select1()` is O(log num_blocks + 64). When absent, both fall back
+    /// to linear scans. Built once at cache-generation time and loaded via
+    /// a second mmap (typically the cache file, distinct from the HDT mmap
+    /// that holds `data_offset`).
+    rank_index: Option<RankIndex>,
 }
 
 impl fmt::Debug for MmapBitmap {
@@ -242,7 +361,32 @@ impl MmapBitmap {
         let num_ones_cached =
             count_ones_in_slice(&mmap[data_offset..data_offset + data_size], num_bits);
 
-        Ok(Self { mmap, data_offset, num_bits, num_words, metadata_size, num_ones_cached })
+        Ok(Self {
+            mmap,
+            data_offset,
+            num_bits,
+            num_words,
+            metadata_size,
+            num_ones_cached,
+            rank_index: None,
+        })
+    }
+
+    /// Like [`Self::from_mmap`] but also attaches a precomputed rank index
+    /// (typically stored in a separate cache file). The rank index turns
+    /// `rank` into an O(1) operation and `select1` into
+    /// O(log num_blocks + 64), which is what makes `HdtHybrid` viable for
+    /// queries on large bitmaps.
+    ///
+    /// The `rank_mmap` can be the same `Arc<Mmap>` as `bitmap_mmap` (if
+    /// the bitmap and its rank index share a file) or a different one.
+    pub fn from_mmap_with_rank_index(
+        bitmap_mmap: Arc<memmap2::Mmap>, bitmap_offset: u64, rank_mmap: Arc<memmap2::Mmap>, rank_offset: u64,
+    ) -> std::io::Result<Self> {
+        let mut bitmap = Self::from_mmap(bitmap_mmap, bitmap_offset)?;
+        let rank_index = RankIndex::from_mmap(rank_mmap, rank_offset, bitmap.num_bits)?;
+        bitmap.rank_index = Some(rank_index);
+        Ok(bitmap)
     }
 
     /// Read a 64-bit word from the bitmap data. Always returns a value (the
@@ -293,6 +437,112 @@ impl MmapBitmap {
         self.metadata_size + data_size + 4
     }
 
+    /// O(1) rank using the precomputed rank index.
+    ///
+    /// `pos < self.num_bits` is the caller's precondition (checked in the
+    /// trait method before delegation). The block-level cumulative count
+    /// eliminates the linear scan; we only popcount up to 7 full words plus
+    /// one partial word within the target block.
+    fn rank_with_index(&self, idx: &RankIndex, pos: usize) -> usize {
+        let word_idx = pos / 64;
+        let block_idx = word_idx / RANK_BLOCK_WORDS;
+        let word_in_block = word_idx % RANK_BLOCK_WORDS;
+        let bit_in_word = pos % 64;
+
+        let mut count = idx.cumulative(block_idx) as usize;
+        // Full words between the start of the block and the target word.
+        for w in 0..word_in_block {
+            count += self.read_word(block_idx * RANK_BLOCK_WORDS + w).count_ones() as usize;
+        }
+        // Bits inside the target word, up to (but not including) `pos`.
+        if bit_in_word > 0 {
+            let word = self.read_word(word_idx);
+            let mask = (1u64 << bit_in_word) - 1;
+            count += (word & mask).count_ones() as usize;
+        }
+        count
+    }
+
+    /// Fallback O(n) rank used when no rank index is attached.
+    fn rank_scan(&self, pos: usize) -> usize {
+        let word_index = pos / 64;
+        let bit_in_word = pos % 64;
+        let mut count = 0usize;
+
+        for idx in 0..word_index {
+            count += self.read_word(idx).count_ones() as usize;
+        }
+
+        let word = self.read_word(word_index);
+        let mask = if bit_in_word == 0 { 0 } else { (1u64 << bit_in_word) - 1 };
+        count += (word & mask).count_ones() as usize;
+
+        count
+    }
+
+    /// O(log num_blocks + 64) select1 using the precomputed rank index.
+    ///
+    /// Binary-search the block table to find the block where the k-th set
+    /// bit lives, then linear-scan the (≤ 8) words of that block.
+    /// `k < num_ones_cached` is the caller's precondition.
+    fn select1_with_index(&self, idx: &RankIndex, k: usize) -> Option<usize> {
+        let target = k as u64;
+        // Invariant: cumulative(lo) <= target, cumulative(hi) > target.
+        // We want the largest block_idx with cumulative(block_idx) <= target.
+        let mut lo = 0usize;
+        let mut hi = idx.num_blocks();
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if mid == 0 {
+                break;
+            }
+            if idx.cumulative(mid) <= target {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let block_idx = lo;
+        let block_start_count = idx.cumulative(block_idx) as usize;
+        let target_in_block = k - block_start_count;
+
+        // Linear scan within the block — at most RANK_BLOCK_WORDS words.
+        let start_word = block_idx * RANK_BLOCK_WORDS;
+        let end_word = (start_word + RANK_BLOCK_WORDS).min(self.num_words);
+        let mut ones_seen = 0usize;
+        for word_idx in start_word..end_word {
+            let word = self.read_word(word_idx);
+            let ones_in_word = word.count_ones() as usize;
+            if ones_seen + ones_in_word > target_in_block {
+                let target_in_word = target_in_block - ones_seen;
+                let bit_pos = Self::select1_in_word(word, target_in_word)?;
+                return Some(word_idx * 64 + bit_pos);
+            }
+            ones_seen += ones_in_word;
+        }
+        None
+    }
+
+    /// Fallback O(n) select1 used when no rank index is attached.
+    fn select1_scan(&self, k: usize) -> Option<usize> {
+        let mut ones_seen = 0usize;
+
+        for word_idx in 0..self.num_words {
+            let word = self.read_word(word_idx);
+            let ones_in_word = word.count_ones() as usize;
+
+            if ones_seen + ones_in_word > k {
+                let target_in_word = k - ones_seen;
+                let bit_pos = Self::select1_in_word(word, target_in_word)?;
+                return Some(word_idx * 64 + bit_pos);
+            }
+
+            ones_seen += ones_in_word;
+        }
+
+        None
+    }
+
     /// Verify the CRC32 trailer over the bitmap data. This forces all data
     /// pages into memory, so it is *not* called from the constructor. Use it
     /// in long-running services that want to detect on-disk corruption
@@ -326,42 +576,23 @@ impl MmapBitmap {
 
 impl BitmapAccess for MmapBitmap {
     fn select1(&self, k: usize) -> Option<usize> {
-        let mut ones_seen = 0usize;
-
-        for word_idx in 0..self.num_words {
-            let word = self.read_word(word_idx);
-            let ones_in_word = word.count_ones() as usize;
-
-            if ones_seen + ones_in_word > k {
-                let target_in_word = k - ones_seen;
-                let bit_pos = Self::select1_in_word(word, target_in_word)?;
-                return Some(word_idx * 64 + bit_pos);
-            }
-
-            ones_seen += ones_in_word;
+        if k >= self.num_ones_cached {
+            return None;
         }
-
-        None
+        if let Some(idx) = &self.rank_index {
+            return self.select1_with_index(idx, k);
+        }
+        self.select1_scan(k)
     }
 
     fn rank(&self, pos: usize) -> usize {
         if pos >= self.num_bits {
             return self.num_ones_cached;
         }
-
-        let word_index = pos / 64;
-        let bit_in_word = pos % 64;
-        let mut count = 0usize;
-
-        for idx in 0..word_index {
-            count += self.read_word(idx).count_ones() as usize;
+        if let Some(idx) = &self.rank_index {
+            return self.rank_with_index(idx, pos);
         }
-
-        let word = self.read_word(word_index);
-        let mask = if bit_in_word == 0 { 0 } else { (1u64 << bit_in_word) - 1 };
-        count += (word & mask).count_ones() as usize;
-
-        count
+        self.rank_scan(pos)
     }
 
     fn len(&self) -> usize {
@@ -436,4 +667,132 @@ fn read_one_byte<T: AsRef<[u8]>>(cursor: &mut std::io::Cursor<T>, base_offset: u
     let mut buf = [0u8];
     cursor.read_exact(&mut buf).map_err(|_| MmapBitmapError::Truncated(base_offset))?;
     Ok(buf[0])
+}
+
+#[cfg(test)]
+mod rank_index_tests {
+    use super::*;
+    use crate::containers::Bitmap;
+    use qwt::BitVectorMut;
+
+    /// Build a bitmap with every `stride`-th bit set, padded to a multiple
+    /// of 64 bits with zeros. Returns the `Bitmap` plus the total number
+    /// of padded bits so callers can iterate the full range.
+    fn build_test_bitmap(num_bits: usize, stride: usize) -> (Bitmap, usize) {
+        let mut bv = BitVectorMut::new();
+        for i in 0..num_bits {
+            bv.push(i % stride == 0);
+        }
+        // Pad to next multiple of 64 with zeros.
+        let padded = num_bits.div_ceil(64) * 64;
+        for _ in num_bits..padded {
+            bv.push(false);
+        }
+        (Bitmap::from(bv), padded)
+    }
+
+    /// Serialize a bitmap + its rank index into a single anonymous mmap
+    /// and return the mmap plus the offsets of each section. This mimics
+    /// the runtime layout where the bitmap lives in one region and its
+    /// rank index in another (possibly the same) mmap.
+    fn build_bitmap_mmap(bitmap: &Bitmap) -> (Arc<memmap2::Mmap>, u64, u64) {
+        // Serialize bitmap to bytes via the real writer so we exercise the
+        // exact header/CRC format that MmapBitmap::from_mmap expects.
+        let mut bitmap_bytes = Vec::new();
+        bitmap.write(&mut bitmap_bytes).unwrap();
+
+        // Build the rank index and serialize as little-endian u64 array.
+        let rank_words = build_rank_index(bitmap.dict.bit_vector().words());
+        let mut rank_bytes = Vec::with_capacity(rank_words.len() * 8);
+        for w in &rank_words {
+            rank_bytes.extend_from_slice(&w.to_le_bytes());
+        }
+
+        // Combine into one anonymous mmap, bitmap first then rank index.
+        let bitmap_offset = 0u64;
+        let rank_offset = bitmap_bytes.len() as u64;
+        let total = bitmap_bytes.len() + rank_bytes.len();
+        let mut anon = memmap2::MmapMut::map_anon(total).unwrap();
+        anon[..bitmap_bytes.len()].copy_from_slice(&bitmap_bytes);
+        anon[bitmap_bytes.len()..].copy_from_slice(&rank_bytes);
+        let mmap = Arc::new(anon.make_read_only().unwrap());
+
+        (mmap, bitmap_offset, rank_offset)
+    }
+
+    /// The constructor used by `Hdt::new_hybrid_cache`; this directly
+    /// exercises `rank_with_index` and `select1_with_index`.
+    fn bitmap_with_rank(bitmap: &Bitmap) -> MmapBitmap {
+        let (mmap, bitmap_offset, rank_offset) = build_bitmap_mmap(bitmap);
+        MmapBitmap::from_mmap_with_rank_index(
+            Arc::clone(&mmap),
+            bitmap_offset,
+            mmap,
+            rank_offset,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rank_matches_in_memory_every_position() {
+        // 5000 bits × stride 3 → ~1667 ones → spans multiple rank blocks
+        // (5000 / 512 ≈ 10 blocks), exercises both cumulative lookups and
+        // partial-block popcounts across word boundaries.
+        let (in_mem, padded_bits) = build_test_bitmap(5000, 3);
+        let mmap_bitmap = bitmap_with_rank(&in_mem);
+
+        assert_eq!(mmap_bitmap.len(), in_mem.len());
+        assert_eq!(mmap_bitmap.num_ones(), in_mem.num_ones());
+
+        // Compare rank at every position except the final boundary
+        // (in-memory Bitmap::rank panics on pos == len).
+        for pos in 0..padded_bits {
+            let expected = in_mem.rank(pos);
+            let actual = mmap_bitmap.rank(pos);
+            assert_eq!(actual, expected, "rank({pos}) mismatch");
+        }
+        // At pos == len, MmapBitmap returns num_ones_cached.
+        assert_eq!(mmap_bitmap.rank(padded_bits), in_mem.num_ones());
+    }
+
+    #[test]
+    fn select1_matches_in_memory_every_index() {
+        let (in_mem, _padded_bits) = build_test_bitmap(5000, 3);
+        let mmap_bitmap = bitmap_with_rank(&in_mem);
+
+        let num_ones = in_mem.num_ones();
+        for k in 0..num_ones {
+            let expected = in_mem.select1(k);
+            let actual = mmap_bitmap.select1(k);
+            assert_eq!(actual, expected, "select1({k}) mismatch");
+        }
+        // Past the end: both should return None.
+        assert_eq!(mmap_bitmap.select1(num_ones), None);
+        assert_eq!(mmap_bitmap.select1(num_ones + 1), None);
+    }
+
+    #[test]
+    fn rank_and_select1_across_multiple_block_boundaries() {
+        // Larger bitmap with a denser pattern to exercise binary search
+        // through several rank blocks (12000 / 512 ≈ 23 blocks).
+        let (in_mem, padded_bits) = build_test_bitmap(12000, 2);
+        let mmap_bitmap = bitmap_with_rank(&in_mem);
+
+        // Spot-check rank at every block boundary, and a handful of
+        // positions within each block.
+        for block in 0..(padded_bits / RANK_BLOCK_BITS) {
+            let boundary = block * RANK_BLOCK_BITS;
+            assert_eq!(mmap_bitmap.rank(boundary), in_mem.rank(boundary));
+            assert_eq!(mmap_bitmap.rank(boundary + 1), in_mem.rank(boundary + 1));
+            assert_eq!(mmap_bitmap.rank(boundary + 63), in_mem.rank(boundary + 63));
+            assert_eq!(mmap_bitmap.rank(boundary + 64), in_mem.rank(boundary + 64));
+            assert_eq!(mmap_bitmap.rank(boundary + 257), in_mem.rank(boundary + 257));
+        }
+
+        // Spot-check select1 at regular intervals.
+        let num_ones = in_mem.num_ones();
+        for k in (0..num_ones).step_by(37) {
+            assert_eq!(mmap_bitmap.select1(k), in_mem.select1(k), "select1({k})");
+        }
+    }
 }

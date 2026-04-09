@@ -36,6 +36,7 @@ use crate::containers::AdjList;
 use crate::containers::Bitmap;
 use crate::containers::ControlInfo;
 use crate::containers::Sequence;
+use crate::containers::bitmap_access::build_rank_index;
 use crate::header::Header;
 use crate::triples::Order;
 use crate::triples::TriplesBitmap;
@@ -49,7 +50,6 @@ use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io::Seek;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -172,10 +172,13 @@ fn unlock_cache_lock(lock_file: &File, lock_path: &Path, mode: &'static str) -> 
 /// Cached structures for HybridTripleAccess
 ///
 /// ## Storage Strategy:
-/// - **In cache (in memory)**: wavelet_y - computed/built structures loaded into memory
-/// - **In cache (on disk)**: op_index.bitmap and op_index.sequence - written at end of cache file, offsets returned by read_from_file()
-/// - **HDT file offsets**: bitmap_y, bitmap_z, sequence_z, dictionary sections - read from HDT file on-demand
-/// - **Metadata in ControlInfo**: order, numTriples, headerSize stored in properties
+/// - **In cache (in memory)**: wavelet_y — computed/built structures loaded into memory
+/// - **In cache (on disk)**: rank indices for bitmap_y, bitmap_z, and
+///   op_index.bitmap; op_index.bitmap itself; op_index.sequence. All mmaped
+///   at load time and accessed via slice indexing.
+/// - **HDT file offsets**: bitmap_y, bitmap_z, sequence_z, dictionary sections —
+///   read from HDT file on-demand via shared mmap.
+/// - **Metadata in ControlInfo**: order, numTriples, headerSize stored in properties.
 pub struct HybridCache {
     /// Control information containing metadata (order, numTriples, headerSize)
     pub control_info: ControlInfo,
@@ -199,6 +202,19 @@ pub struct HybridCache {
     pub dict_objects_offset: u64,
     /// File offset where Triples section begins in HDT file
     pub triples_offset: u64,
+    /// Offset inside the cache file where the bitmap_y rank index begins.
+    /// A dense `[u64]` array; `MmapBitmap::from_mmap_with_rank_index` wraps it.
+    pub bitmap_y_rank_index_offset: u64,
+    /// Offset inside the cache file where the bitmap_z (= adjlist_z.bitmap)
+    /// rank index begins.
+    pub bitmap_z_rank_index_offset: u64,
+    /// Offset inside the cache file where the op_index.bitmap rank index begins.
+    pub op_index_bitmap_rank_index_offset: u64,
+    /// Offset inside the cache file where the op_index bitmap section begins.
+    /// Stored explicitly because its position now depends on the combined
+    /// size of the three rank indices that precede it, which can't be
+    /// reconstructed from the fixed-size header alone.
+    pub op_index_bitmap_offset: u64,
 }
 
 impl fmt::Debug for HybridCache {
@@ -477,12 +493,65 @@ impl HybridCache {
         writer.write_all(&dict_objects_offset.to_le_bytes())?;
         writer.write_all(&triples_offset.to_le_bytes())?;
 
-        let op_index_offset = writer.stream_position()?;
+        // Build rank indices for all three bitmaps. Each call pops through
+        // the u64 words of the bitmap once, so total cost is ~3 sequential
+        // scans — far smaller than the wavelet build that already ran.
+        let bitmap_y_rank_index_words = build_rank_index(triples_bitmap.bitmap_y.inner().dict.bit_vector().words());
+        let bitmap_z_rank_index_words =
+            build_rank_index(triples_bitmap.adjlist_z.bitmap.inner().dict.bit_vector().words());
+        let op_index_bitmap_rank_index_words =
+            build_rank_index(triples_bitmap.op_index.bitmap.inner().dict.bit_vector().words());
 
-        // Write op_index.bitmap, then op_index.sequence at the END of the file
-        // (offset returned by read_from_file(), both can be accessed on-demand)
+        // Compute layout: after the 9 HDT offsets we write 4 more u64s
+        // (three rank-index offsets plus the op_index_bitmap offset), then
+        // the three rank-index byte arrays, then the op_index bitmap +
+        // sequence. Everything downstream of this point is positionally
+        // derived, not streamed, because readers need the rank index
+        // offsets up-front.
+        let header_end = writer.stream_position()?;
+        let rank_header_bytes: u64 = 4 * 8;
+        let bitmap_y_rank_index_offset = header_end + rank_header_bytes;
+        let bitmap_y_rank_index_bytes = (bitmap_y_rank_index_words.len() * 8) as u64;
+        let bitmap_z_rank_index_offset = bitmap_y_rank_index_offset + bitmap_y_rank_index_bytes;
+        let bitmap_z_rank_index_bytes = (bitmap_z_rank_index_words.len() * 8) as u64;
+        let op_index_bitmap_rank_index_offset = bitmap_z_rank_index_offset + bitmap_z_rank_index_bytes;
+        let op_index_bitmap_rank_index_bytes = (op_index_bitmap_rank_index_words.len() * 8) as u64;
+        let op_index_bitmap_offset = op_index_bitmap_rank_index_offset + op_index_bitmap_rank_index_bytes;
+
+        // Write the 4 cache-file offsets. Their positions inside the cache
+        // file are now fixed and recoverable by any reader.
+        writer.write_all(&bitmap_y_rank_index_offset.to_le_bytes())?;
+        writer.write_all(&bitmap_z_rank_index_offset.to_le_bytes())?;
+        writer.write_all(&op_index_bitmap_rank_index_offset.to_le_bytes())?;
+        writer.write_all(&op_index_bitmap_offset.to_le_bytes())?;
+
+        // Sanity-check that we're about to write the rank indices at the
+        // offset we promised readers they'd live at.
+        debug_assert_eq!(writer.stream_position()?, bitmap_y_rank_index_offset);
+
+        for word in &bitmap_y_rank_index_words {
+            writer.write_all(&word.to_le_bytes())?;
+        }
+        debug_assert_eq!(writer.stream_position()?, bitmap_z_rank_index_offset);
+
+        for word in &bitmap_z_rank_index_words {
+            writer.write_all(&word.to_le_bytes())?;
+        }
+        debug_assert_eq!(writer.stream_position()?, op_index_bitmap_rank_index_offset);
+
+        for word in &op_index_bitmap_rank_index_words {
+            writer.write_all(&word.to_le_bytes())?;
+        }
+        debug_assert_eq!(writer.stream_position()?, op_index_bitmap_offset);
+
+        // Write op_index.bitmap, then op_index.sequence.
         triples_bitmap.op_index.bitmap.inner().write(&mut writer)?;
         triples_bitmap.op_index.sequence.inner().write(&mut writer)?;
+
+        // The second tuple element returned from `write_cache_from_hdt_file`
+        // is the op_index_bitmap offset, so the caller can construct the
+        // MmapBitmap view over the op-index without re-reading the cache.
+        let op_index_offset = op_index_bitmap_offset;
 
         writer.flush()?;
         // Make sure every byte hits the disk before we swing the rename.
@@ -518,6 +587,10 @@ impl HybridCache {
             dict_predicates_offset,
             dict_objects_offset,
             triples_offset,
+            bitmap_y_rank_index_offset,
+            bitmap_z_rank_index_offset,
+            op_index_bitmap_rank_index_offset,
+            op_index_bitmap_offset,
         };
 
         debug!("Cache generated and saved to: {}", cache_path.display());
@@ -593,8 +666,18 @@ impl HybridCache {
         reader.read_exact(&mut triples_offset_bytes)?;
         let triples_offset = u64::from_le_bytes(triples_offset_bytes);
 
-        // The OpIndex data (bitmap then sequence) starts right after all the offsets
-        let op_index_offset = reader.stream_position()?;
+        // Read the 4 cache-file offsets: three rank index offsets and the
+        // op_index_bitmap offset. These must match the positions computed
+        // by write_cache_from_hdt_file.
+        let mut buf = [0u8; 8];
+        reader.read_exact(&mut buf)?;
+        let bitmap_y_rank_index_offset = u64::from_le_bytes(buf);
+        reader.read_exact(&mut buf)?;
+        let bitmap_z_rank_index_offset = u64::from_le_bytes(buf);
+        reader.read_exact(&mut buf)?;
+        let op_index_bitmap_rank_index_offset = u64::from_le_bytes(buf);
+        reader.read_exact(&mut buf)?;
+        let op_index_bitmap_offset = u64::from_le_bytes(buf);
 
         let cache = Self {
             control_info,
@@ -608,9 +691,13 @@ impl HybridCache {
             dict_predicates_offset,
             dict_objects_offset,
             triples_offset,
+            bitmap_y_rank_index_offset,
+            bitmap_z_rank_index_offset,
+            op_index_bitmap_rank_index_offset,
+            op_index_bitmap_offset,
         };
 
-        Ok((cache, op_index_offset))
+        Ok((cache, op_index_bitmap_offset))
     }
 }
 

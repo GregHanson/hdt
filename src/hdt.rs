@@ -391,8 +391,9 @@ impl Hdt {
     /// ```
     #[cfg(feature = "cache")]
     pub fn new_hybrid_cache(hdt_path: &Path) -> Result<HdtHybrid> {
-        // Load the HybridCache (or create it). `op_index_bitmap_offset` is
-        // the offset within the cache file where the op-index bitmap begins.
+        // Load the HybridCache (or create it). The returned offset is
+        // `cache.op_index_bitmap_offset` — still returned for back-compat
+        // even though it's also present on the cache struct now.
         let (cache, op_index_bitmap_offset) = HybridCache::from_hdt_path(hdt_path)?;
         let cache_path = HybridCache::get_cache_path(hdt_path);
 
@@ -401,9 +402,15 @@ impl Hdt {
         let hdt_file = File::open(hdt_path)?;
         let hdt_mmap: Arc<memmap2::Mmap> = Arc::new(unsafe { memmap2::Mmap::map(&hdt_file)? });
 
-        // Read header by walking a Cursor over the start of the mmap. We
-        // never need to seek the file again — every other section is found
-        // via the cached offsets.
+        // Mmap the cache file once. Every accessor that views the cache
+        // file shares this single Arc<Mmap>: the three rank indices, the
+        // op-index bitmap, and the op-index sequence.
+        let cache_file = File::open(&cache_path)?;
+        let cache_mmap: Arc<memmap2::Mmap> = Arc::new(unsafe { memmap2::Mmap::map(&cache_file)? });
+
+        // Read header by walking a Cursor over the start of the HDT mmap.
+        // We never need to seek the file again — every other section is
+        // found via the cached offsets.
         let mut reader = std::io::Cursor::new(&hdt_mmap[..]);
         ControlInfo::read(&mut reader)?;
         let header = Header::read(&mut reader)?;
@@ -417,18 +424,33 @@ impl Hdt {
             cache.dict_objects_offset,
         )?;
 
-        // Build sequence_z, bitmap_z and bitmap_y from the same shared HDT mmap.
+        // Sequences don't need rank indices (rank/select are bitmap ops).
         let sequence_z = MmapSequence::from_mmap(Arc::clone(&hdt_mmap), cache.sequence_z_offset)?;
-        let bitmap_z = MmapBitmap::from_mmap(Arc::clone(&hdt_mmap), cache.bitmap_z_offset)?;
-        let bitmap_y = MmapBitmap::from_mmap(Arc::clone(&hdt_mmap), cache.bitmap_y_offset)?;
+
+        // Bitmaps DO need rank indices. Each bitmap's data lives in the
+        // HDT mmap; its rank index lives in the cache mmap.
+        let bitmap_z = MmapBitmap::from_mmap_with_rank_index(
+            Arc::clone(&hdt_mmap),
+            cache.bitmap_z_offset,
+            Arc::clone(&cache_mmap),
+            cache.bitmap_z_rank_index_offset,
+        )?;
+        let bitmap_y = MmapBitmap::from_mmap_with_rank_index(
+            Arc::clone(&hdt_mmap),
+            cache.bitmap_y_offset,
+            Arc::clone(&cache_mmap),
+            cache.bitmap_y_rank_index_offset,
+        )?;
         let adjlist_z = AdjListGeneric::new(sequence_z, bitmap_z);
 
-        // Mmap the cache file once and share it between the op-index bitmap
-        // and sequence (which sit back-to-back at the end of the cache).
-        let cache_file = File::open(&cache_path)?;
-        let cache_mmap: Arc<memmap2::Mmap> = Arc::new(unsafe { memmap2::Mmap::map(&cache_file)? });
-
-        let op_index_bitmap = MmapBitmap::from_mmap(Arc::clone(&cache_mmap), op_index_bitmap_offset)?;
+        // The op-index bitmap lives in the cache file; its rank index also
+        // lives in the cache file. Both Arcs point at the same mmap.
+        let op_index_bitmap = MmapBitmap::from_mmap_with_rank_index(
+            Arc::clone(&cache_mmap),
+            op_index_bitmap_offset,
+            Arc::clone(&cache_mmap),
+            cache.op_index_bitmap_rank_index_offset,
+        )?;
         let op_index_sequence_offset = op_index_bitmap_offset + op_index_bitmap.serialized_size_bytes() as u64;
         let op_index_sequence = MmapSequence::from_mmap(cache_mmap, op_index_sequence_offset)?;
         let op_index = OpIndexGeneric::new(op_index_sequence, op_index_bitmap);
