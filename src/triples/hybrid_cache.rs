@@ -56,32 +56,92 @@ use std::path::{Path, PathBuf};
 pub const CACHE_EXT: &str = "index.v5-rust-cache";
 const CACHE_FORMAT: &str = "<http://purl.org/HDT/hdt#cacheV5>";
 
-fn boxed_io_error(message: impl Into<String>) -> Box<dyn std::error::Error> {
-    std::io::Error::other(message.into()).into()
+/// Typed error for everything that can go wrong when loading, validating,
+/// or generating a `HybridCache`. Replaces the previous `Box<dyn Error>`
+/// surface so callers (notably `Hdt::new_hybrid_cache`) get structured
+/// errors with intact source chains.
+#[derive(thiserror::Error, Debug)]
+pub enum HybridCacheError {
+    #[error("IO error")]
+    Io(#[from] std::io::Error),
+    #[error("failed to read HDT control info")]
+    ControlInfo(#[from] crate::containers::control_info::Error),
+    #[error("failed to read HDT header")]
+    Header(#[from] crate::header::Error),
+    #[error("failed to read HDT bitmap")]
+    Bitmap(#[from] crate::containers::bitmap::Error),
+    #[error("failed to read HDT sequence")]
+    Sequence(#[from] crate::containers::sequence::Error),
+    #[error("failed to read HDT dictionary section")]
+    DictSect(#[from] crate::dict_sect_pfc::Error),
+    #[error("failed to construct HDT triples section")]
+    Triples(#[from] crate::triples::Error),
+    #[error("bincode decode error")]
+    BincodeDecode(#[from] bincode::error::DecodeError),
+    #[error("bincode encode error")]
+    BincodeEncode(#[from] bincode::error::EncodeError),
+    #[error("invalid cache control type: expected Index, found {found:?}")]
+    InvalidControlType { found: crate::containers::ControlType },
+    #[error("unsupported cache format: expected {expected}, found {found}")]
+    UnsupportedFormat { expected: String, found: String },
+    #[error("missing required cache property: {0}")]
+    MissingProperty(&'static str),
+    #[error("invalid value for cache property {key}: {value}")]
+    InvalidProperty { key: &'static str, value: String },
+    #[error("HDT file has no triples; hybrid cache cannot be created")]
+    EmptyHdt,
+    #[error("DictSectPFC read worker thread panicked")]
+    DictSectThreadPanic,
+    #[error("failed to canonicalize HDT path {path}")]
+    Canonicalize {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to {op} cache lock file {path}")]
+    Lock {
+        op: &'static str,
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to atomically rename cache temp {tmp} to {final_path}")]
+    Rename {
+        tmp: String,
+        final_path: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
+
+pub type HybridCacheResult<T> = core::result::Result<T, HybridCacheError>;
 
 /// Canonicalize the HDT path so that two callers that reach the same file
 /// via different relative paths still hash to the same lock file.
-fn canonical_hdt_path(path: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    path.canonicalize()
-        .map_err(|e| boxed_io_error(format!("failed to canonicalize HDT path {}: {e}", path.display())))
+fn canonical_hdt_path(path: &Path) -> HybridCacheResult<PathBuf> {
+    path.canonicalize().map_err(|source| HybridCacheError::Canonicalize {
+        path: path.display().to_string(),
+        source,
+    })
 }
 
 /// Build the path of the lock file used to serialize cache generation for
 /// the given canonical HDT path. Lives in the system temp directory under
 /// `hdt-hybrid-cache-locks/`, keyed by the FNV-style hash of the path.
-fn cache_lock_file_path(canonical_hdt_path: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn cache_lock_file_path(canonical_hdt_path: &Path) -> HybridCacheResult<PathBuf> {
     let mut hasher = DefaultHasher::new();
     canonical_hdt_path.as_os_str().hash(&mut hasher);
     let lock_name = format!("hdt-hybrid-cache-{:016x}.lock", hasher.finish());
     let lock_root = std::env::temp_dir().join("hdt-hybrid-cache-locks");
-    std::fs::create_dir_all(&lock_root).map_err(|e| {
-        boxed_io_error(format!("failed to create cache lock directory {}: {e}", lock_root.display()))
+    std::fs::create_dir_all(&lock_root).map_err(|source| HybridCacheError::Lock {
+        op: "create directory for",
+        path: lock_root.display().to_string(),
+        source,
     })?;
     Ok(lock_root.join(lock_name))
 }
 
-fn open_cache_lock_file(canonical_hdt_path: &Path) -> Result<(File, PathBuf), Box<dyn std::error::Error>> {
+fn open_cache_lock_file(canonical_hdt_path: &Path) -> HybridCacheResult<(File, PathBuf)> {
     let lock_path = cache_lock_file_path(canonical_hdt_path)?;
     let lock_file = OpenOptions::new()
         .read(true)
@@ -89,19 +149,23 @@ fn open_cache_lock_file(canonical_hdt_path: &Path) -> Result<(File, PathBuf), Bo
         .create(true)
         .truncate(false)
         .open(&lock_path)
-        .map_err(|e| boxed_io_error(format!("failed to open cache lock file {}: {e}", lock_path.display())))?;
+        .map_err(|source| HybridCacheError::Lock {
+            op: "open",
+            path: lock_path.display().to_string(),
+            source,
+        })?;
     Ok((lock_file, lock_path))
 }
 
-fn unlock_cache_lock(
-    lock_file: &File, lock_path: &Path, hdt_path: &Path, mode: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    FileExt::unlock(lock_file).map_err(|e| {
-        boxed_io_error(format!(
-            "failed to release {mode} cache lock {} for {}: {e}",
-            lock_path.display(),
-            hdt_path.display()
-        ))
+fn unlock_cache_lock(lock_file: &File, lock_path: &Path, mode: &'static str) -> HybridCacheResult<()> {
+    FileExt::unlock(lock_file).map_err(|source| HybridCacheError::Lock {
+        op: match mode {
+            "shared" => "release shared",
+            "exclusive" => "release exclusive",
+            _ => "release",
+        },
+        path: lock_path.display().to_string(),
+        source,
     })
 }
 
@@ -150,24 +214,40 @@ impl fmt::Debug for HybridCache {
 
 impl HybridCache {
     /// Get the triple ordering from cache metadata
-    pub fn order(&self) -> Result<Order, Box<dyn std::error::Error>> {
-        let order_str = self.control_info.get("order").ok_or("order property not found in cache")?;
-        let order_value = order_str.parse::<u8>()?;
-        Order::try_from(order_value as u32).map_err(|e| format!("Invalid order value: {e}").into())
+    pub fn order(&self) -> HybridCacheResult<Order> {
+        let value = self
+            .control_info
+            .get("order")
+            .ok_or(HybridCacheError::MissingProperty("order"))?;
+        let parsed = value
+            .parse::<u8>()
+            .map_err(|_| HybridCacheError::InvalidProperty { key: "order", value: value.clone() })?;
+        Order::try_from(parsed as u32).map_err(|_| HybridCacheError::InvalidProperty {
+            key: "order",
+            value,
+        })
     }
 
     /// Get the number of triples from cache metadata
-    pub fn num_triples(&self) -> Result<usize, Box<dyn std::error::Error>> {
-        let num_triples_str =
-            self.control_info.get("numTriples").ok_or("numTriples property not found in cache")?;
-        Ok(num_triples_str.parse::<usize>()?)
+    pub fn num_triples(&self) -> HybridCacheResult<usize> {
+        let value = self
+            .control_info
+            .get("numTriples")
+            .ok_or(HybridCacheError::MissingProperty("numTriples"))?;
+        value
+            .parse::<usize>()
+            .map_err(|_| HybridCacheError::InvalidProperty { key: "numTriples", value })
     }
 
     /// Get the header size from cache metadata
-    pub fn header_size(&self) -> Result<u64, Box<dyn std::error::Error>> {
-        let header_size_str =
-            self.control_info.get("headerSize").ok_or("headerSize property not found in cache")?;
-        Ok(header_size_str.parse::<u64>()?)
+    pub fn header_size(&self) -> HybridCacheResult<u64> {
+        let value = self
+            .control_info
+            .get("headerSize")
+            .ok_or(HybridCacheError::MissingProperty("headerSize"))?;
+        value
+            .parse::<u64>()
+            .map_err(|_| HybridCacheError::InvalidProperty { key: "headerSize", value })
     }
 }
 
@@ -198,7 +278,7 @@ impl HybridCache {
     /// Returns a tuple `(HybridCache, u64)` where:
     /// - `HybridCache`: The loaded/created cache
     /// - `u64`: File offset in the cache file where the OpIndex bitmap begins
-    pub fn from_hdt_path(hdt_path: impl AsRef<Path>) -> Result<(Self, u64), Box<dyn std::error::Error>> {
+    pub fn from_hdt_path(hdt_path: impl AsRef<Path>) -> HybridCacheResult<(Self, u64)> {
         let hdt_path = hdt_path.as_ref();
         let canonical = canonical_hdt_path(hdt_path)?;
         let (lock_file, lock_path) = open_cache_lock_file(&canonical)?;
@@ -207,12 +287,10 @@ impl HybridCache {
 
         // Reader path: shared lock allows many concurrent loaders to share an
         // already-built cache without blocking each other.
-        FileExt::lock_shared(&lock_file).map_err(|e| {
-            boxed_io_error(format!(
-                "failed to acquire shared cache lock {} for {}: {e}",
-                lock_path.display(),
-                hdt_path.display()
-            ))
+        FileExt::lock_shared(&lock_file).map_err(|source| HybridCacheError::Lock {
+            op: "acquire shared",
+            path: lock_path.display().to_string(),
+            source,
         })?;
 
         if cache_path.exists() {
@@ -221,7 +299,7 @@ impl HybridCache {
                 Ok((cache, op_index_bitmap_offset)) => {
                     debug!("Loaded cache successfully");
                     debug!("{cache:#?}");
-                    unlock_cache_lock(&lock_file, &lock_path, hdt_path, "shared")?;
+                    unlock_cache_lock(&lock_file, &lock_path, "shared")?;
                     return Ok((cache, op_index_bitmap_offset));
                 }
                 Err(e) => {
@@ -233,16 +311,14 @@ impl HybridCache {
             debug!("Cache not found, generating from HDT file...");
         }
 
-        unlock_cache_lock(&lock_file, &lock_path, hdt_path, "shared")?;
+        unlock_cache_lock(&lock_file, &lock_path, "shared")?;
 
         // Writer path: serialize cache regeneration. We must release the
         // shared lock first because flock() upgrade is not portable.
-        FileExt::lock_exclusive(&lock_file).map_err(|e| {
-            boxed_io_error(format!(
-                "failed to acquire exclusive cache lock {} for {}: {e}",
-                lock_path.display(),
-                hdt_path.display()
-            ))
+        FileExt::lock_exclusive(&lock_file).map_err(|source| HybridCacheError::Lock {
+            op: "acquire exclusive",
+            path: lock_path.display().to_string(),
+            source,
         })?;
 
         // Re-check after acquiring the exclusive lock — another process may
@@ -250,14 +326,14 @@ impl HybridCache {
         if cache_path.exists() {
             debug!("Re-checking cache after acquiring exclusive lock");
             if let Ok((cache, op_index_bitmap_offset)) = Self::read_from_file(&cache_path) {
-                unlock_cache_lock(&lock_file, &lock_path, hdt_path, "exclusive")?;
+                unlock_cache_lock(&lock_file, &lock_path, "exclusive")?;
                 return Ok((cache, op_index_bitmap_offset));
             }
             warn!("Cache remained unreadable under exclusive lock; regenerating...");
         }
 
         let generated = Self::write_cache_from_hdt_file(hdt_path);
-        unlock_cache_lock(&lock_file, &lock_path, hdt_path, "exclusive")?;
+        unlock_cache_lock(&lock_file, &lock_path, "exclusive")?;
         generated
     }
 
@@ -276,7 +352,7 @@ impl HybridCache {
         cache_path
     }
 
-    pub fn write_cache_from_hdt_file(hdt_path: &Path) -> Result<(Self, u64), Box<dyn std::error::Error>> {
+    pub fn write_cache_from_hdt_file(hdt_path: &Path) -> HybridCacheResult<(Self, u64)> {
         use crate::containers::ControlType;
         use std::collections::HashMap;
         use std::io::Seek;
@@ -295,19 +371,29 @@ impl HybridCache {
         // Read dictionary control info
         let _ = ControlInfo::read(&mut reader)?;
 
-        // Track offsets for each dictionary section BEFORE reading them
-        // We just need to read through them to get offsets, validation happens separately
+        // Track offsets for each dictionary section BEFORE reading them.
+        // The .join().unwrap() on the parsing thread is documented at the
+        // unwrap site: it can only panic if the worker thread panicked,
+        // which is itself a bug we want to surface.
         let dict_shared_offset = reader.stream_position()?;
-        crate::dict_sect_pfc::DictSectPFC::read(&mut reader)?.join().unwrap()?;
+        crate::dict_sect_pfc::DictSectPFC::read(&mut reader)?
+            .join()
+            .map_err(|_| HybridCacheError::DictSectThreadPanic)??;
 
         let dict_subjects_offset = reader.stream_position()?;
-        crate::dict_sect_pfc::DictSectPFC::read(&mut reader)?.join().unwrap()?;
+        crate::dict_sect_pfc::DictSectPFC::read(&mut reader)?
+            .join()
+            .map_err(|_| HybridCacheError::DictSectThreadPanic)??;
 
         let dict_predicates_offset = reader.stream_position()?;
-        crate::dict_sect_pfc::DictSectPFC::read(&mut reader)?.join().unwrap()?;
+        crate::dict_sect_pfc::DictSectPFC::read(&mut reader)?
+            .join()
+            .map_err(|_| HybridCacheError::DictSectThreadPanic)??;
 
         let dict_objects_offset = reader.stream_position()?;
-        crate::dict_sect_pfc::DictSectPFC::read(&mut reader)?.join().unwrap()?;
+        crate::dict_sect_pfc::DictSectPFC::read(&mut reader)?
+            .join()
+            .map_err(|_| HybridCacheError::DictSectThreadPanic)??;
 
         // Track triples section offset
         let triples_offset = reader.stream_position()?;
@@ -330,17 +416,19 @@ impl HybridCache {
         let sequence_z_offset = reader.stream_position()?;
         let sequence_z = Sequence::read(&mut reader)?;
 
-        let order: Order;
-        if let Some(n) = triples_ci.get("order").and_then(|v| v.parse::<u32>().ok()) {
-            order = Order::try_from(n)?;
-        } else {
-            return Err("unknown triples Order".into());
-        }
+        let order_value = triples_ci
+            .get("order")
+            .ok_or(HybridCacheError::MissingProperty("order"))?;
+        let order_num = order_value
+            .parse::<u32>()
+            .map_err(|_| HybridCacheError::InvalidProperty { key: "order", value: order_value.clone() })?;
+        let order = Order::try_from(order_num)
+            .map_err(|_| HybridCacheError::InvalidProperty { key: "order", value: order_value })?;
         let adjlist_z = AdjList::new(sequence_z, bitmap_z);
 
-        // QWT library panics on empty data, so skip cache for empty HDT files
+        // QWT library panics on empty data, so skip cache for empty HDT files.
         if adjlist_z.is_empty() {
-            return Err("HDT file has no triples, skipping cache creation".into());
+            return Err(HybridCacheError::EmptyHdt);
         }
 
         let triples_bitmap = TriplesBitmap::new(order, &sequence_y, bitmap_y, adjlist_z);
@@ -400,21 +488,21 @@ impl HybridCache {
         // Make sure every byte hits the disk before we swing the rename.
         // Without sync_all() a crash between rename and journal commit could
         // leave the new inode visible but empty.
-        let file = writer.into_inner().map_err(|e| boxed_io_error(format!("{e}")))?;
+        let file = writer.into_inner().map_err(|e| HybridCacheError::Io(e.into_error()))?;
         file.sync_all()?;
         drop(file);
 
         // Atomic publish: rename the temp file onto the final cache path.
         // On Unix this is a single inode swap; on Windows, std uses MoveFileEx
         // with MOVEFILE_REPLACE_EXISTING semantics so it overwrites in place.
-        std::fs::rename(&tmp_cache_path, &cache_path).map_err(|e| {
+        std::fs::rename(&tmp_cache_path, &cache_path).map_err(|source| {
             // Best-effort cleanup of the orphaned temp file.
             let _ = std::fs::remove_file(&tmp_cache_path);
-            boxed_io_error(format!(
-                "failed to rename cache temp {} to {}: {e}",
-                tmp_cache_path.display(),
-                cache_path.display()
-            ))
+            HybridCacheError::Rename {
+                tmp: tmp_cache_path.display().to_string(),
+                final_path: cache_path.display().to_string(),
+                source,
+            }
         })?;
 
         // Create and return the cache structure
@@ -444,7 +532,7 @@ impl HybridCache {
     /// - `HybridCache`: The loaded cache with in-memory structures (wavelet_y only)
     /// - `u64`: File offset in the cache file where the OpIndex data begins (bitmap then sequence).
     ///   Callers can use this offset to construct both bitmap and sequence accessors.
-    pub fn read_from_file<P: AsRef<Path>>(path: P) -> Result<(Self, u64), Box<dyn std::error::Error>> {
+    pub fn read_from_file<P: AsRef<Path>>(path: P) -> HybridCacheResult<(Self, u64)> {
         use crate::containers::ControlType;
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
@@ -454,20 +542,15 @@ impl HybridCache {
 
         // Verify it's an Index type
         if control_info.control_type != ControlType::Index {
-            return Err(format!(
-                "Invalid cache file: expected Index control type, found {:?}",
-                control_info.control_type
-            )
-            .into());
+            return Err(HybridCacheError::InvalidControlType { found: control_info.control_type });
         }
 
         // Verify format
         if control_info.format != CACHE_FORMAT {
-            return Err(format!(
-                "Unsupported cache format: expected {}, found {}",
-                CACHE_FORMAT, control_info.format
-            )
-            .into());
+            return Err(HybridCacheError::UnsupportedFormat {
+                expected: CACHE_FORMAT.to_owned(),
+                found: control_info.format,
+            });
         }
 
         // Read wavelet_y using bincode
@@ -606,9 +689,14 @@ mod tests {
             match handle.join() {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
-                    return Err(boxed_io_error(format!("hybrid cache worker failed while loading cache: {e}")));
+                    return Err(std::io::Error::other(format!(
+                        "hybrid cache worker failed while loading cache: {e}"
+                    ))
+                    .into());
                 }
-                Err(_) => return Err(boxed_io_error("hybrid cache worker thread panicked")),
+                Err(_) => {
+                    return Err(std::io::Error::other("hybrid cache worker thread panicked").into());
+                }
             }
         }
 

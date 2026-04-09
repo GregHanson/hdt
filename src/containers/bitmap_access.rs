@@ -26,7 +26,14 @@ pub trait BitmapAccess: Debug + Send + Sync {
     /// Number of one bits in the bitmap
     fn num_ones(&self) -> usize;
 
-    /// Access a specific bit (returns true if 1, false if 0)
+    /// Access a specific bit (returns true if 1, false if 0).
+    ///
+    /// # Panics
+    /// Implementations must panic if `pos >= self.len()`. This method is
+    /// called from query iterators that compute their positions by
+    /// construction; an out-of-bounds access is always a programming error
+    /// in the caller and should fail loudly rather than masquerade as a
+    /// false bit.
     fn access(&self, pos: usize) -> bool;
 
     /// Size in bytes (memory footprint)
@@ -366,9 +373,12 @@ impl BitmapAccess for MmapBitmap {
     }
 
     fn access(&self, pos: usize) -> bool {
-        if pos >= self.num_bits {
-            return false;
-        }
+        assert!(
+            pos < self.num_bits,
+            "MmapBitmap::access out of bounds: pos {} >= len {}",
+            pos,
+            self.num_bits
+        );
         let byte_offset = self.data_offset + pos / 8;
         let bit_in_byte = pos % 8;
         (self.mmap[byte_offset] >> bit_in_byte) & 1 == 1

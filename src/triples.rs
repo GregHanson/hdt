@@ -22,9 +22,9 @@ mod object_iter;
 pub use object_iter::ObjectIter;
 
 #[cfg(feature = "cache")]
-mod hybrid_cache;
+pub mod hybrid_cache;
 #[cfg(feature = "cache")]
-pub use hybrid_cache::{HybridCache, CACHE_EXT};
+pub use hybrid_cache::{CACHE_EXT, HybridCache, HybridCacheError, HybridCacheResult};
 
 #[cfg(feature = "cache")]
 use serde::{self, Deserialize, Serialize};
@@ -102,8 +102,22 @@ impl<S: SequenceAccess, B: BitmapAccess> fmt::Debug for OpIndexGeneric<S, B> {
 }
 
 impl<S: SequenceAccess, B: BitmapAccess> OpIndexGeneric<S, B> {
-    /// Create a new OpIndex with the given sequence and bitmap
+    /// Create a new OpIndex with the given sequence and bitmap.
+    ///
+    /// # Panics
+    /// Panics if the bitmap can't back the sequence. Same band as
+    /// [`crate::containers::AdjListGeneric::new`]: bitmap must be at least
+    /// `sequence.len()` bits long and at most 63 bits longer.
     pub fn new(sequence: S, bitmap: B) -> Self {
+        let s_len = sequence.len();
+        // See AdjListGeneric::new for the empty-bitmap special case.
+        if s_len > 0 {
+            let b_len = bitmap.len();
+            assert!(
+                b_len >= s_len && b_len - s_len < 64,
+                "OpIndexGeneric: bitmap.len() ({b_len}) cannot back sequence.len() ({s_len})"
+            );
+        }
         Self { sequence, bitmap }
     }
 
@@ -210,6 +224,12 @@ pub enum Error {
     BitmapError(#[from] bitmap::Error),
     #[error("Sequence error")]
     SequenceError(#[from] sequence::Error),
+    /// One of the cross-component invariants of `TriplesBitmapGeneric`
+    /// failed. The most likely cause is a stale or corrupted hybrid cache:
+    /// the cached `wavelet_y`/`bitmap_y`/`adjlist_z`/`op_index` were built
+    /// from a different HDT file than the one currently being mapped.
+    #[error("triples bitmap components are inconsistent: {0}")]
+    InconsistentComponents(String),
 }
 
 impl<S: SequenceAccess, B: BitmapAccess> fmt::Debug for TriplesBitmapGeneric<S, B> {
@@ -223,16 +243,51 @@ impl<S: SequenceAccess, B: BitmapAccess> fmt::Debug for TriplesBitmapGeneric<S, 
 
 // Generic implementation for all TriplesBitmapGeneric variants
 impl<S: SequenceAccess, B: BitmapAccess> TriplesBitmapGeneric<S, B> {
-    /// Create a new TriplesBitmapGeneric with the given components.
-    /// This constructor is used for creating hybrid/streaming implementations.
+    /// Create a new TriplesBitmapGeneric from independently-loaded
+    /// components. Used by the hybrid/streaming load path where the four
+    /// components come from separately-mapped sections of an HDT file plus
+    /// a cached wavelet tree.
+    ///
+    /// Validates the cross-component invariants:
+    /// - `bitmap_y.len()` is in `[wavelet_y.len(), wavelet_y.len() + 64)`.
+    ///   Both index the predicate sequence; the wavelet stores the predicate
+    ///   at each position and the bitmap marks subject boundaries within the
+    ///   same range. The bitmap is padded up to a multiple of 64 bits, so we
+    ///   accept up to 63 bits of slack.
+    /// - `op_index.len() == adjlist_z.len()` — the inverse object index has
+    ///   one entry per triple, same as the Z-level adjacency list. Both are
+    ///   raw sequence lengths, no padding.
+    ///
+    /// (`adjlist_z` and `op_index` already enforce their own intra-component
+    /// invariants via [`AdjListGeneric::new`] / [`OpIndexGeneric::new`].)
+    ///
+    /// # Errors
+    /// Returns [`Error::InconsistentComponents`] if any invariant fails.
+    /// The most likely cause in production is a stale cache whose offsets
+    /// were generated from a different version of the HDT file.
     pub fn from_components(
-        order: Order,
-        bitmap_y: B,
-        adjlist_z: AdjListGeneric<S, B>,
-        op_index: OpIndexGeneric<S, B>,
-        wavelet_y: WT,
-    ) -> Self {
-        Self { order, bitmap_y, adjlist_z, op_index, wavelet_y }
+        order: Order, bitmap_y: B, adjlist_z: AdjListGeneric<S, B>, op_index: OpIndexGeneric<S, B>, wavelet_y: WT,
+    ) -> Result<Self> {
+        // Same empty-bitmap caveat as AdjListGeneric::new: skip the bitmap_y
+        // length check entirely if the wavelet is empty, to avoid the qwt
+        // empty-RSNarrow subtract-overflow.
+        let w_len = wavelet_y.len();
+        if w_len > 0 {
+            let by_len = bitmap_y.len();
+            if by_len < w_len || by_len - w_len >= 64 {
+                return Err(Error::InconsistentComponents(format!(
+                    "bitmap_y.len() ({by_len}) cannot back wavelet_y.len() ({w_len}) — cache likely stale"
+                )));
+            }
+        }
+        if op_index.len() != adjlist_z.len() {
+            return Err(Error::InconsistentComponents(format!(
+                "op_index.len() ({}) != adjlist_z.len() ({}) — cache likely stale",
+                op_index.len(),
+                adjlist_z.len()
+            )));
+        }
+        Ok(Self { order, bitmap_y, adjlist_z, op_index, wavelet_y })
     }
 
     /// Size in bytes on the heap.

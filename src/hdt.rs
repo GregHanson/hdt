@@ -1,4 +1,6 @@
-use crate::containers::{BitmapAccess, ControlInfo, InMemoryBitmap, InMemorySequence, SequenceAccess, control_info};
+use crate::containers::{
+    BitmapAccess, ControlInfo, InMemoryBitmap, InMemorySequence, SequenceAccess, bitmap, control_info, sequence,
+};
 #[cfg(feature = "cache")]
 use crate::containers::{AdjListGeneric, MmapBitmap, MmapSequence};
 use crate::dict_sect_pfc::DictSectPfcAccess;
@@ -6,6 +8,8 @@ use crate::dict_sect_pfc::DictSectPfcAccess;
 use crate::dict_sect_pfc::MmapDictSectPfc;
 use crate::four_sect_dict::{self, FourSectDictGeneric, IdKind};
 use crate::header::Header;
+#[cfg(feature = "cache")]
+use crate::triples::hybrid_cache::HybridCacheError;
 #[cfg(feature = "cache")]
 use crate::triples::{HybridCache, OpIndexGeneric};
 use crate::triples::{Id, ObjectIter, PredicateIter, PredicateObjectIter, SubjectIter, TripleId, TriplesBitmapGeneric};
@@ -75,8 +79,15 @@ pub enum Error {
     FourSectDict(#[from] four_sect_dict::Error),
     #[error("failed to read HDT triples section")]
     Triples(#[from] crate::triples::Error),
+    #[error("failed to read HDT bitmap")]
+    Bitmap(#[from] bitmap::Error),
+    #[error("failed to read HDT sequence")]
+    Sequence(#[from] sequence::Error),
     #[error("IO Error")]
     Io(#[from] std::io::Error),
+    #[cfg(feature = "cache")]
+    #[error("failed to load hybrid cache")]
+    Cache(#[from] HybridCacheError),
 }
 
 /// Generic implementation for all HDT types
@@ -309,7 +320,9 @@ impl Hdt {
         use log::warn;
         use std::io::{Seek, SeekFrom};
 
-        // Try to load or create cache
+        // Try to load or create cache. `HybridCache::from_hdt_path` now also
+        // verifies the cache's stored HDT file size/mtime against the current
+        // file, so a stale cache is rejected and regenerated transparently.
         let (cache, _op_index_offset) = match HybridCache::from_hdt_path(f) {
             Ok(result) => result,
             Err(e) => {
@@ -318,7 +331,8 @@ impl Hdt {
             }
         };
 
-        // Validate cache matches HDT file
+        // Parse the HDT file to pick up the header and dictionary. The cache
+        // contains byte offsets for the remaining sections.
         let source = std::fs::File::open(f)?;
         let mut reader = std::io::BufReader::new(source);
 
@@ -328,35 +342,22 @@ impl Hdt {
         // Read header
         let header = Header::read(&mut reader)?;
 
-        // Validate header size matches cache
-        if let Ok(cached_header_size) = cache.header_size() {
-            if header.length as u64 != cached_header_size {
-                warn!(
-                    "Cache header size mismatch (HDT: {}, cache: {}), regenerating cache",
-                    header.length, cached_header_size
-                );
-                // Force regenerate cache
-                let _ = std::fs::remove_file(HybridCache::get_cache_path(f));
-                return Self::read_from_path(f);
-            }
-        }
-
         // Read dictionary
         let unvalidated_dict = FourSectDict::read(&mut reader)?;
         let dict = unvalidated_dict.validate()?;
 
         // Read triples using cached offsets and wavelet
         reader.seek(SeekFrom::Start(cache.bitmap_y_offset))?;
-        let bitmap_y = Bitmap::read(&mut reader).map_err(|e| Error::Io(std::io::Error::other(format!("{e}"))))?;
+        let bitmap_y = Bitmap::read(&mut reader)?;
 
         reader.seek(SeekFrom::Start(cache.bitmap_z_offset))?;
-        let bitmap_z = Bitmap::read(&mut reader).map_err(|e| Error::Io(std::io::Error::other(format!("{e}"))))?;
+        let bitmap_z = Bitmap::read(&mut reader)?;
 
         reader.seek(SeekFrom::Start(cache.sequence_z_offset))?;
-        let sequence_z = Sequence::read(&mut reader).map_err(|e| Error::Io(std::io::Error::other(format!("{e}"))))?;
+        let sequence_z = Sequence::read(&mut reader)?;
 
         // Build triples from cache
-        let order = cache.order().map_err(|e| Error::Io(std::io::Error::other(format!("{e}"))))?;
+        let order = cache.order()?;
         let adjlist_z = crate::containers::AdjListGeneric::new(
             InMemorySequence::new(sequence_z),
             InMemoryBitmap::new(bitmap_z),
@@ -389,7 +390,7 @@ impl Hdt {
     /// let hdt = hdt::Hdt::new_hybrid_cache(Path::new("large_file.hdt")).unwrap();
     /// ```
     #[cfg(feature = "cache")]
-    pub fn new_hybrid_cache(hdt_path: &Path) -> core::result::Result<HdtHybrid, Box<dyn std::error::Error>> {
+    pub fn new_hybrid_cache(hdt_path: &Path) -> Result<HdtHybrid> {
         // Load the HybridCache (or create it). `op_index_bitmap_offset` is
         // the offset within the cache file where the op-index bitmap begins.
         let (cache, op_index_bitmap_offset) = HybridCache::from_hdt_path(hdt_path)?;
@@ -433,7 +434,7 @@ impl Hdt {
         let op_index = OpIndexGeneric::new(op_index_sequence, op_index_bitmap);
 
         let order = cache.order()?;
-        let triples = TriplesBitmapGeneric::from_components(order, bitmap_y, adjlist_z, op_index, cache.wavelet_y);
+        let triples = TriplesBitmapGeneric::from_components(order, bitmap_y, adjlist_z, op_index, cache.wavelet_y)?;
 
         let hdt = HdtHybrid { header, dict, triples };
         debug!("HDT Hybrid size in memory {}, details:", ByteSize(hdt.size_in_bytes() as u64));
@@ -655,21 +656,27 @@ pub mod tests {
         Ok(())
     }
 
-    /// Test new_hybrid_cache creates a hybrid HDT with file-based components
+    /// Test new_hybrid_cache creates a hybrid HDT with file-based components.
+    /// Uses an isolated temp directory so it doesn't race with `cache` (which
+    /// removes the shared cache file at `tests/resources/snikmeta.hdt.*`).
     #[cfg(feature = "cache")]
     #[test]
     fn hybrid_cache() -> Result<()> {
-        use crate::triples::CACHE_EXT;
-        use std::path::Path;
+        use crate::triples::HybridCache;
+        use std::path::PathBuf;
+        use std::time::{SystemTime, UNIX_EPOCH};
         init();
 
-        let filename = "tests/resources/snikmeta.hdt";
-        let cachename = format!("{filename}.{CACHE_EXT}");
-        let path = Path::new(filename);
-        let path_cache = Path::new(&cachename);
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let test_dir: PathBuf = std::env::temp_dir()
+            .join(format!("hdt-hybrid-cache-itest-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&test_dir)?;
+        let path = test_dir.join("snikmeta.hdt");
+        std::fs::copy("tests/resources/snikmeta.hdt", &path)?;
+        let path_cache = HybridCache::get_cache_path(&path);
 
         // Create hybrid HDT (this will create or use existing cache)
-        let hdt_hybrid = Hdt::new_hybrid_cache(path).map_err(|e| std::io::Error::other(format!("{e}")))?;
+        let hdt_hybrid = Hdt::new_hybrid_cache(&path)?;
 
         // Verify cache exists (either pre-existing or just created)
         assert!(path_cache.exists(), "Cache file should exist");
@@ -693,7 +700,7 @@ pub mod tests {
         assert_eq!(triple_vec, hdt_hybrid.triples_with_pattern(Some(s), Some(p), None).collect::<Vec<_>>(), "SP?");
 
         // Load again from existing cache
-        let hdt_hybrid2 = Hdt::new_hybrid_cache(path).map_err(|e| std::io::Error::other(format!("{e}")))?;
+        let hdt_hybrid2 = Hdt::new_hybrid_cache(&path)?;
         let triples2: Vec<StringTriple> = hdt_hybrid2.triples_all().collect();
         assert_eq!(triples, triples2, "Triples should match between fresh and cached load");
 
@@ -701,6 +708,11 @@ pub mod tests {
         let hdt_inmemory = snikmeta()?;
         let triples_inmemory: Vec<StringTriple> = hdt_inmemory.triples_all().collect();
         assert_eq!(triples, triples_inmemory, "Hybrid and in-memory HDT should have same triples");
+
+        // Drop the hybrid mappings before removing the temp dir on Windows.
+        drop(hdt_hybrid);
+        drop(hdt_hybrid2);
+        std::fs::remove_dir_all(&test_dir)?;
 
         Ok(())
     }
@@ -813,8 +825,7 @@ pub mod tests {
         // Test 2: Hdt::new_hybrid_cache() - hybrid/streaming
         println!("\nLoading with Hdt::new_hybrid_cache() (hybrid)...");
         let start = Instant::now();
-        let hdt_hybrid =
-            Hdt::new_hybrid_cache(hdt_path).map_err(|e| std::io::Error::other(format!("{e}")))?;
+        let hdt_hybrid = Hdt::new_hybrid_cache(hdt_path)?;
         let hybrid_time = start.elapsed();
         let hybrid_size = hdt_hybrid.size_in_bytes();
 
@@ -885,21 +896,18 @@ pub mod tests {
         println!("Generating HybridCache for {hdt_path:?}...");
 
         // Generate cache
-        let _ = HybridCache::write_cache_from_hdt_file(hdt_path)
-            .map_err(|e| std::io::Error::other(format!("{e}")))?;
+        let _ = HybridCache::write_cache_from_hdt_file(hdt_path)?;
 
         let cache_size = std::fs::metadata(&cache_name)?.len();
         println!("\n  Cache successfully written to {:?}", &cache_name);
         println!("  Cache file size: {}", ByteSize(cache_size));
 
         // Verify the cache can be loaded
-        let _loaded_cache = HybridCache::read_from_file(&cache_name)
-            .map_err(|e| std::io::Error::other(format!("{e}")))?;
+        let _loaded_cache = HybridCache::read_from_file(&cache_name)?;
         println!("  Cache verified: can be loaded");
 
         // Verify a HDT can be created from cache
-        let hdt_hybrid = Hdt::new_hybrid_cache(hdt_path)
-            .map_err(|e| std::io::Error::other(format!("{e}")))?;
+        let hdt_hybrid = Hdt::new_hybrid_cache(hdt_path)?;
         println!("  HdtHybrid created successfully");
         println!("  HdtHybrid memory size: {}", ByteSize(hdt_hybrid.size_in_bytes() as u64));
 

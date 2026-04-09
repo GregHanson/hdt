@@ -20,8 +20,29 @@ pub struct AdjListGeneric<S: SequenceAccess, B: BitmapAccess> {
 }
 
 impl<S: SequenceAccess, B: BitmapAccess> AdjListGeneric<S, B> {
-    /// Create adjacency list with given sequence and bitmap
+    /// Create adjacency list with given sequence and bitmap.
+    ///
+    /// # Panics
+    /// Panics if the bitmap can't address every sequence position. The
+    /// bitmap must be at least as long as the sequence and at most 63 bits
+    /// longer (the in-memory `Bitmap` rounds up to a multiple of 64 bits;
+    /// `MmapBitmap` stores the exact count). A mismatch outside that band
+    /// indicates a corrupt cache or a caller bug — either would silently
+    /// produce wrong query results, so failing loudly at construction is
+    /// the right move.
     pub fn new(sequence: S, bitmap: B) -> Self {
+        let s_len = sequence.len();
+        // Skip the bitmap.len() invariant for empty inputs: the in-memory
+        // QWT-backed Bitmap panics with subtract-overflow inside qwt's
+        // RSNarrow when it's empty (qwt 0.3.4 bug). Empty sequences are
+        // never the corruption mode we're trying to catch anyway.
+        if s_len > 0 {
+            let b_len = bitmap.len();
+            assert!(
+                b_len >= s_len && b_len - s_len < 64,
+                "AdjListGeneric: bitmap.len() ({b_len}) cannot back sequence.len() ({s_len})"
+            );
+        }
         Self { sequence, bitmap }
     }
 
