@@ -384,7 +384,12 @@ fn build_op_index_from_entries(mut entries: Vec<(u32, u32, u32)>) -> (Vec<u32>, 
     // collected in pos_z order have monotonically non-decreasing pos_y
     // (because bitmap.rank is monotone), which matches the insertion-order
     // preservation of the old stable sort_by_cached_key.
-    entries.sort_unstable_by_key(|&(obj, pred, pos_y)| (obj, pred, pos_y));
+    //
+    // par_sort splits into chunks, sorts each in parallel, then merges.
+    // For 500M entries this is the single largest time sink in cache
+    // generation (~60-120s single-threaded, ~15-30s with rayon).
+    use rayon::slice::ParallelSliceMut;
+    entries.par_sort_unstable_by_key(|&(obj, pred, pos_y)| (obj, pred, pos_y));
 
     let n = entries.len();
     let mut bitmap = BitVectorMut::new();
@@ -408,18 +413,22 @@ impl TriplesBitmap {
 
         let entries = adjlist_z.sequence.entries;
         // Collect (object, predicate, pos_y) tuples for the op-index build.
-        // One wavelet lookup per entry (same total as the old sort_by_cached_key).
-        let mut pairs: Vec<(u32, u32, u32)> = Vec::with_capacity(entries);
-        for pos_z in 0..entries {
-            let object = adjlist_z.sequence.get(pos_z);
-            if object == 0 {
-                error!("ERROR: There is a zero value in the Z level.");
-                continue;
-            }
-            let pos_y = adjlist_z.bitmap.rank(pos_z) as u32;
-            let predicate = wavelet_y.get(pos_y as usize).unwrap() as u32;
-            pairs.push((object as u32, predicate, pos_y));
-        }
+        // Each iteration does one sequence.get + one bitmap.rank + one wavelet.get;
+        // all are read-only so we parallelize with rayon for ~6-8× speedup.
+        use rayon::prelude::*;
+        let pairs: Vec<(u32, u32, u32)> = (0..entries)
+            .into_par_iter()
+            .filter_map(|pos_z| {
+                let object = adjlist_z.sequence.get(pos_z);
+                if object == 0 {
+                    error!("ERROR: There is a zero value in the Z level.");
+                    return None;
+                }
+                let pos_y = adjlist_z.bitmap.rank(pos_z) as u32;
+                let predicate = wavelet_y.get(pos_y as usize).unwrap() as u32;
+                Some((object as u32, predicate, pos_y))
+            })
+            .collect();
 
         // Sort + stream → op-index components. `pairs` is consumed and freed.
         let (cv, bitmap_index_bitvector) = build_op_index_from_entries(pairs);
@@ -453,18 +462,21 @@ impl TriplesBitmap {
         adjlist_z: AdjListGeneric<InMemorySequence, InMemoryBitmap>,
         wavelet_y: WT,
     ) -> Self {
+        use rayon::prelude::*;
         let entries = adjlist_z.sequence.len();
-        let mut pairs: Vec<(u32, u32, u32)> = Vec::with_capacity(entries);
-        for pos_z in 0..entries {
-            let object = adjlist_z.sequence.get(pos_z);
-            if object == 0 {
-                error!("ERROR: There is a zero value in the Z level.");
-                continue;
-            }
-            let pos_y = adjlist_z.bitmap.rank(pos_z) as u32;
-            let predicate = wavelet_y.get(pos_y as usize).unwrap() as u32;
-            pairs.push((object as u32, predicate, pos_y));
-        }
+        let pairs: Vec<(u32, u32, u32)> = (0..entries)
+            .into_par_iter()
+            .filter_map(|pos_z| {
+                let object = adjlist_z.sequence.get(pos_z);
+                if object == 0 {
+                    error!("ERROR: There is a zero value in the Z level.");
+                    return None;
+                }
+                let pos_y = adjlist_z.bitmap.rank(pos_z) as u32;
+                let predicate = wavelet_y.get(pos_y as usize).unwrap() as u32;
+                Some((object as u32, predicate, pos_y))
+            })
+            .collect();
 
         let (cv, bitmap_index_bitvector) = build_op_index_from_entries(pairs);
 

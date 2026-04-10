@@ -169,6 +169,57 @@ fn unlock_cache_lock(lock_file: &File, lock_path: &Path, mode: &'static str) -> 
     })
 }
 
+/// Advance the reader past a DictSectPFC section without allocating its
+/// packed data or computing its CRC32. Only the header bytes (preamble +
+/// 3 vbytes + CRC8) and the embedded Sequence header are parsed; the bulk
+/// data (packed strings + CRC32) is seeked past.
+///
+/// This is used during cache generation: the cache writer needs the stream
+/// position of each section but never inspects the dictionary data itself.
+/// Skipping avoids allocating ~1.5 GB for the largest section and saves
+/// the CRC32 computation over that data.
+fn skip_dict_section<R: std::io::BufRead + std::io::Seek>(reader: &mut R) -> HybridCacheResult<()> {
+    use crate::containers::vbyte::read_vbyte;
+    use std::io::SeekFrom;
+
+    // [preamble: u8] [num_strings: vbyte] [packed_length: vbyte] [block_size: vbyte] [CRC8: u8]
+    let mut buf = [0u8];
+    reader.read_exact(&mut buf)?; // preamble
+    let _ = read_vbyte(reader)?; // num_strings
+    let (packed_length, _) = read_vbyte(reader)?; // packed_length — needed for seek
+    let _ = read_vbyte(reader)?; // block_size
+    reader.read_exact(&mut buf)?; // CRC8
+
+    // [Sequence section: header + data + CRC32]
+    skip_sequence(reader)?;
+
+    // [packed_data: packed_length bytes] [CRC32: 4 bytes]
+    reader.seek(SeekFrom::Current(packed_length as i64 + 4))?;
+    Ok(())
+}
+
+/// Advance the reader past a Sequence section without reading its data.
+/// Parses the header to determine the data length, then seeks past data +
+/// CRC32.
+fn skip_sequence<R: std::io::BufRead + std::io::Seek>(reader: &mut R) -> HybridCacheResult<()> {
+    use crate::containers::vbyte::read_vbyte;
+    use std::io::SeekFrom;
+
+    // [type: u8] [bits_per_entry: u8] [entries: vbyte] [CRC8: u8]
+    let mut buf = [0u8];
+    reader.read_exact(&mut buf)?; // type
+    reader.read_exact(&mut buf)?; // bits_per_entry
+    let bits_per_entry = buf[0] as u64;
+    let (entries, _) = read_vbyte(reader)?; // entries
+    reader.read_exact(&mut buf)?; // CRC8
+
+    // Data is byte-aligned: ceil(entries * bits_per_entry / 8) bytes,
+    // followed by a 4-byte CRC32 trailer.
+    let data_bytes = (entries as u64 * bits_per_entry).div_ceil(8);
+    reader.seek(SeekFrom::Current(data_bytes as i64 + 4))?;
+    Ok(())
+}
+
 /// Cached structures for HybridTripleAccess
 ///
 /// ## Storage Strategy:
@@ -387,29 +438,21 @@ impl HybridCache {
         // Read dictionary control info
         let _ = ControlInfo::read(&mut reader)?;
 
-        // Track offsets for each dictionary section BEFORE reading them.
-        // The .join().unwrap() on the parsing thread is documented at the
-        // unwrap site: it can only panic if the worker thread panicked,
-        // which is itself a bug we want to surface.
+        // Track offsets for each dictionary section. We only need the
+        // stream positions — the section data is not used during cache
+        // generation. Skipping avoids allocating ~1.5 GB for the largest
+        // section and saves the CRC32 computation over that data.
         let dict_shared_offset = reader.stream_position()?;
-        crate::dict_sect_pfc::DictSectPFC::read(&mut reader)?
-            .join()
-            .map_err(|_| HybridCacheError::DictSectThreadPanic)??;
+        skip_dict_section(&mut reader)?;
 
         let dict_subjects_offset = reader.stream_position()?;
-        crate::dict_sect_pfc::DictSectPFC::read(&mut reader)?
-            .join()
-            .map_err(|_| HybridCacheError::DictSectThreadPanic)??;
+        skip_dict_section(&mut reader)?;
 
         let dict_predicates_offset = reader.stream_position()?;
-        crate::dict_sect_pfc::DictSectPFC::read(&mut reader)?
-            .join()
-            .map_err(|_| HybridCacheError::DictSectThreadPanic)??;
+        skip_dict_section(&mut reader)?;
 
         let dict_objects_offset = reader.stream_position()?;
-        crate::dict_sect_pfc::DictSectPFC::read(&mut reader)?
-            .join()
-            .map_err(|_| HybridCacheError::DictSectThreadPanic)??;
+        skip_dict_section(&mut reader)?;
 
         // Track triples section offset
         let triples_offset = reader.stream_position()?;
