@@ -26,9 +26,6 @@ pub mod hybrid_cache;
 #[cfg(feature = "cache")]
 pub use hybrid_cache::{CACHE_EXT, HybridCache, HybridCacheError, HybridCacheResult};
 
-#[cfg(feature = "cache")]
-use serde::{self, Deserialize, Serialize};
-
 pub type Result<T> = core::result::Result<T, Error>;
 
 /// Order of the triple sections.
@@ -536,23 +533,6 @@ impl TriplesBitmap {
         }
     }
 
-    /// load the cached HDT index file, only supports TriplesBitmap
-    #[cfg(feature = "cache")]
-    pub fn load_cache<R: BufRead>(reader: &mut R, info: &ControlInfo) -> Result<Self> {
-        match &info.format[..] {
-            "<http://purl.org/HDT/hdt#triplesBitmap>" => TriplesBitmap::load(reader),
-            "<http://purl.org/HDT/hdt#triplesList>" => Err(Error::TriplesList),
-            f => Err(Error::UnknownTriplesFormat(f.to_owned())),
-        }
-    }
-
-    /// load the entire cached TriplesBitmap object
-    #[cfg(feature = "cache")]
-    pub fn load<R: BufRead>(reader: &mut R) -> Result<Self> {
-        let triples: TriplesBitmapSerde = bincode::serde::decode_from_std_read(reader, bincode::config::standard())?;
-        Ok(triples.into())
-    }
-
     fn read<R: BufRead>(reader: &mut R, triples_ci: &ControlInfo) -> Result<Self> {
         let order: Order;
         if let Some(n) = triples_ci.get("order").and_then(|v| v.parse::<u32>().ok()) {
@@ -610,62 +590,6 @@ pub type Id = usize;
 /// When used as a triple, 0 values are invalid.
 /// When used as a pattern, 0 values in a position match all values.
 pub type TripleId = [Id; 3];
-
-/// Serde-compatible version of TriplesBitmap for cache serialization
-#[cfg(feature = "cache")]
-#[derive(Serialize, Deserialize)]
-struct TriplesBitmapSerde {
-    order: Order,
-    bitmap_y: Bitmap,
-    adjlist_z_sequence: Sequence,
-    adjlist_z_bitmap: Bitmap,
-    op_index_sequence: Sequence,
-    op_index_bitmap: Bitmap,
-    #[serde(with = "wavelet_serde")]
-    wavelet_y: WT,
-}
-
-#[cfg(feature = "cache")]
-impl From<TriplesBitmapSerde> for TriplesBitmap {
-    fn from(serde: TriplesBitmapSerde) -> Self {
-        Self {
-            order: serde.order,
-            bitmap_y: InMemoryBitmap::new(serde.bitmap_y),
-            adjlist_z: AdjListGeneric::new(
-                InMemorySequence::new(serde.adjlist_z_sequence),
-                InMemoryBitmap::new(serde.adjlist_z_bitmap),
-            ),
-            op_index: OpIndexGeneric::new(
-                InMemorySequence::new(serde.op_index_sequence),
-                InMemoryBitmap::new(serde.op_index_bitmap),
-            ),
-            wavelet_y: serde.wavelet_y,
-        }
-    }
-}
-
-#[cfg(feature = "cache")]
-mod wavelet_serde {
-    use super::WT;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S>(wavelet: &WT, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        // Collect wavelet values and serialize
-        let values: Vec<usize> = wavelet.iter().collect();
-        values.serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<WT, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let values: Vec<usize> = Vec::deserialize(deserializer)?;
-        Ok(WT::from_iter(values))
-    }
-}
 
 #[cfg(test)]
 mod tests {
