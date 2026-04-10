@@ -378,7 +378,7 @@ impl<S: SequenceAccess, B: BitmapAccess> TriplesBitmapGeneric<S, B> {
 /// objects consumed ~8 GB of heap in 200M separate allocations. This flat
 /// approach uses one contiguous allocation of N × 12 bytes (~6 GB for
 /// 500M triples), sorts in-place, and streams in order.
-fn build_op_index_from_entries(mut entries: Vec<(u32, u32, u32)>) -> (Vec<usize>, BitVectorMut) {
+fn build_op_index_from_entries(mut entries: Vec<(u32, u32, u32)>) -> (Vec<u32>, BitVectorMut) {
     // Sort key must include pos_y as a tiebreaker so the ordering is fully
     // determined: entries with the same (object, predicate) that were
     // collected in pos_z order have monotonically non-decreasing pos_y
@@ -388,14 +388,14 @@ fn build_op_index_from_entries(mut entries: Vec<(u32, u32, u32)>) -> (Vec<usize>
 
     let n = entries.len();
     let mut bitmap = BitVectorMut::new();
-    let mut cv = Vec::<usize>::with_capacity(n);
+    let mut cv = Vec::<u32>::with_capacity(n);
     let mut prev_object = 0u32;
     for &(object, _, pos_y) in &entries {
         bitmap.push(object != prev_object);
         prev_object = object;
-        cv.push(pos_y as usize);
+        cv.push(pos_y);
     }
-    // `entries` dropped here — frees the sorted array before Sequence::new.
+    // `entries` dropped here — frees the sorted array before Sequence::new_from_u32.
     (cv, bitmap)
 }
 
@@ -426,7 +426,7 @@ impl TriplesBitmap {
 
         let bv = BitVector::from(bitmap_index_bitvector);
         let bitmap_index = Bitmap { dict: RSNarrow::from(bv) };
-        let op_index_sequence = InMemorySequence::new(Sequence::new(&cv));
+        let op_index_sequence = InMemorySequence::new(Sequence::new_from_u32(&cv));
         let op_index = OpIndexGeneric::new(op_index_sequence, InMemoryBitmap::new(bitmap_index));
 
         // Wrap adjlist_z components in generic wrappers
@@ -470,7 +470,7 @@ impl TriplesBitmap {
 
         let bv = BitVector::from(bitmap_index_bitvector);
         let bitmap_index = Bitmap { dict: RSNarrow::from(bv) };
-        let op_index_sequence = InMemorySequence::new(Sequence::new(&cv));
+        let op_index_sequence = InMemorySequence::new(Sequence::new_from_u32(&cv));
         let op_index = OpIndexGeneric::new(op_index_sequence, InMemoryBitmap::new(bitmap_index));
 
         Self {

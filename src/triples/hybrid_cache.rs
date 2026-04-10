@@ -448,6 +448,7 @@ impl HybridCache {
         }
 
         let triples_bitmap = TriplesBitmap::new(order, &sequence_y, bitmap_y, adjlist_z);
+        drop(sequence_y); // ~156 MB freed; not referenced again after wavelet build
 
         // Prepare a temporary cache file in the same directory, then atomically
         // rename it onto the final cache path once writing is complete. This
