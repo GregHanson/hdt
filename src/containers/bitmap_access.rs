@@ -443,6 +443,13 @@ impl MmapBitmap {
     /// trait method before delegation). The block-level cumulative count
     /// eliminates the linear scan; we only popcount up to 7 full words plus
     /// one partial word within the target block.
+    ///
+    /// The full-word popcounts are batched into a single contiguous slice
+    /// read — one bounds check for up to 56 bytes instead of 7 separate
+    /// `read_word()` calls. `chunks_exact(8)` lets the compiler
+    /// SIMD-vectorize the popcount loop. The target word (which might be
+    /// the byte-aligned last word of the bitmap) still uses `read_word()`
+    /// for its partial-word edge-case handling.
     fn rank_with_index(&self, idx: &RankIndex, pos: usize) -> usize {
         let word_idx = pos / 64;
         let block_idx = word_idx / RANK_BLOCK_WORDS;
@@ -450,11 +457,21 @@ impl MmapBitmap {
         let bit_in_word = pos % 64;
 
         let mut count = idx.cumulative(block_idx) as usize;
-        // Full words between the start of the block and the target word.
-        for w in 0..word_in_block {
-            count += self.read_word(block_idx * RANK_BLOCK_WORDS + w).count_ones() as usize;
+
+        // Batch-load full words in one slice. All words before word_idx are
+        // guaranteed to be full 8-byte words (only the absolute last word of
+        // the bitmap can be byte-aligned, and it's handled via read_word below).
+        if word_in_block > 0 {
+            let block_start = self.data_offset + block_idx * RANK_BLOCK_WORDS * 8;
+            let bytes = word_in_block * 8;
+            let slice = &self.mmap[block_start..block_start + bytes];
+            for chunk in slice.chunks_exact(8) {
+                let word = u64::from_le_bytes(chunk.try_into().unwrap());
+                count += word.count_ones() as usize;
+            }
         }
-        // Bits inside the target word, up to (but not including) `pos`.
+
+        // Partial target word (might be the last word of the bitmap).
         if bit_in_word > 0 {
             let word = self.read_word(word_idx);
             let mask = (1u64 << bit_in_word) - 1;

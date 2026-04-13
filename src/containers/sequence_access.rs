@@ -208,6 +208,14 @@ impl MmapSequence {
     /// Read the bit-packed value at `index`. The constructor verified that
     /// every in-bounds index is reachable, so this never reads past the
     /// mmap end.
+    ///
+    /// The hot path (bits_per_entry + bit_in_byte ≤ 64, i.e. the value fits
+    /// in a single u64 load) avoids per-byte iteration entirely: one slice
+    /// copy → one `u64::from_le_bytes` → shift + mask. This is the common
+    /// case for HDT sequences where bits_per_entry ≤ 56.
+    ///
+    /// The cold path (57-64 bits_per_entry with a non-zero bit_in_byte,
+    /// requiring up to 9 bytes) falls back to a 16-byte stack copy.
     fn read_value(&self, index: usize) -> usize {
         debug_assert!(index < self.entries);
         debug_assert!(self.bits_per_entry <= 64);
@@ -219,27 +227,25 @@ impl MmapSequence {
         let bit_offset = index * self.bits_per_entry;
         let byte_offset = self.data_offset + (bit_offset / 8);
         let bit_in_byte = bit_offset % 8;
-
-        // Bits needed = bits_per_entry + bit_in_byte ≤ 64 + 7 = 71, so a u128
-        // intermediate (loaded from up to 9 bytes) covers every case cleanly.
         let bits_needed = self.bits_per_entry + bit_in_byte;
         let bytes_needed = bits_needed.div_ceil(8); // 1..=9
-        debug_assert!(bytes_needed <= 16);
 
-        let available = self.mmap.len() - byte_offset;
-        let to_read = bytes_needed.min(available);
+        let slice = &self.mmap[byte_offset..byte_offset + bytes_needed];
 
-        let mut acc: u128 = 0;
-        for i in 0..to_read {
-            acc |= (self.mmap[byte_offset + i] as u128) << (i * 8);
-        }
-
-        let mask: u128 = if self.bits_per_entry == 128 {
-            u128::MAX
+        let raw: u128 = if bytes_needed <= 8 {
+            // Hot path: single u64 load covers the value.
+            let mut buf = [0u8; 8];
+            buf[..bytes_needed].copy_from_slice(slice);
+            u64::from_le_bytes(buf) as u128
         } else {
-            (1u128 << self.bits_per_entry) - 1
+            // Cold path: 9 bytes needed (bits_per_entry 57-64 with misaligned start).
+            let mut buf = [0u8; 16];
+            buf[..bytes_needed].copy_from_slice(slice);
+            u128::from_le_bytes(buf)
         };
-        ((acc >> bit_in_byte) & mask) as usize
+
+        let mask = (1u128 << self.bits_per_entry) - 1;
+        ((raw >> bit_in_byte) & mask) as usize
     }
 
     /// Calculate the total serialized size of this sequence on disk: header
