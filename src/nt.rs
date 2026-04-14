@@ -1,10 +1,10 @@
 // //! *This module is available only if HDT is built with the experimental `"nt"` feature.*
 use crate::header::Header;
-use crate::triples::{TripleId, TriplesBitmap};
-use crate::{DictSectPFC, FourSectDict, Hdt, IdKind};
+use crate::triples::{Id, TripleId, TriplesBitmap};
+use crate::{DictSectPFC, FourSectDict, Hdt};
 use bitset_core::BitSet;
 use bytesize::ByteSize;
-use lasso::{Key, Spur, ThreadedRodeo};
+use lasso::{Key, RodeoResolver, Spur, ThreadedRodeo};
 use log::{debug, error};
 use oxttl::NTriplesParser;
 use rayon::prelude::*;
@@ -30,7 +30,8 @@ impl Hdt {
 
         let (dict, mut encoded_triples) = read_dict_triples(f, BLOCK_SIZE)?;
         let num_triples = encoded_triples.len();
-        encoded_triples.sort_unstable();
+        // Sort by final HDT ID (SPO order) before feeding into TriplesBitmap.
+        encoded_triples.par_sort_unstable();
         let triples = TriplesBitmap::from_triples(&encoded_triples);
 
         let header = Header { format: "ntriples".to_owned(), length: 0, body: BTreeSet::new() };
@@ -113,56 +114,79 @@ impl Hdt {
     }
 }
 
-struct IndexPool {
-    triples: Vec<[usize; 3]>,
+/// Output of [`parse_nt_terms`]. All term strings live inside `lasso`; the
+/// triples hold lasso `Spur` keys (4 bytes each) instead of full strings, and
+/// the three bitsets track which `Spur` indices appear as subject / predicate
+/// / object.
+struct ParsedTerms {
+    triples: Vec<[Spur; 3]>,
+    lasso: ThreadedRodeo<Spur>,
     subjects: Indices,
-    objects: Indices,
     predicates: Indices,
-    strings: Vec<String>,
+    objects: Indices,
 }
+
+/// ID map: indexed by `Spur::into_usize()`, holds the final HDT id for a term
+/// in a given role (subject/predicate/object), or 0 if it has no id in that
+/// role. u32 fits: HDT ids are at most `num_strings` ≤ u32::MAX.
+type IdMap = Vec<u32>;
 
 /// read N-Triples and convert them to a dictionary and triple IDs
 fn read_dict_triples(path: &Path, block_size: usize) -> Result<(FourSectDict, Vec<TripleId>)> {
-    // 1. Parse N-Triples and collect terms using string interning
-    let mut pool = parse_nt_terms(path)?;
+    // 1. Parse N-Triples, interning each unique term exactly once in `lasso`.
+    let ParsedTerms { triples, lasso, subjects, predicates, objects } = parse_nt_terms(path)?;
 
-    // Sort and deduplicate triples in parallel with dictionary building
-    let mut triples = std::mem::take(&mut pool.triples); // not needed anymore
+    // 2. In parallel with dictionary build: sort + dedup triples (by Spur value
+    //    — this removes exact duplicate triples; the final SPO-ID sort happens
+    //    later, once we've assigned HDT ids).
     let sorter = thread::Builder::new().name("sorter".to_owned()).spawn(move || {
-        triples.sort_unstable();
-        triples.dedup();
-        triples
+        let mut t = triples;
+        t.par_sort_unstable();
+        t.dedup();
+        t
     })?;
 
-    // 2. Build dictionary from term indices
-    let dict = build_dict_from_terms(&pool, block_size);
+    // 3. Assign HDT ids in sorted-string order and build the compressed dict.
+    //    Returns three `Spur -> u32 id` lookup tables — direct array indexing
+    //    during encoding, no more binary-search-through-PFC.
+    let (dict, subj_map, pred_map, obj_map) = {
+        // Keep resolver alive for the build, then drop at end of this block so
+        // the interned strings are freed before the encoding peak.
+        let resolver = lasso.into_resolver();
+        build_dict_and_id_maps(&resolver, &subjects, &predicates, &objects, block_size)
+    };
+    // Bitsets served their purpose; drop before the encoding peak.
+    drop(subjects);
+    drop(predicates);
+    drop(objects);
 
-    // 3. Encode triples to IDs using dictionary
-    let sorted_triple_indices = sorter.join().unwrap();
-    let refs: &[[usize; 3]] = &sorted_triple_indices;
-    let encoded_triples: Vec<TripleId> = refs
-        .par_iter()
-        .map(|[s_idx, p_idx, o_idx]| {
-            let s = &pool.strings[*s_idx as usize];
-            let p = &pool.strings[*p_idx as usize];
-            let o = &pool.strings[*o_idx as usize];
-            let triple = [
-                dict.string_to_id(s, IdKind::Subject),
-                dict.string_to_id(p, IdKind::Predicate),
-                dict.string_to_id(o, IdKind::Object),
-            ];
-            if triple[0] == 0 || triple[1] == 0 || triple[2] == 0 {
-                error!("{triple:?} contains 0, part of ({s}, {p}, {o}) not found in the dictionary");
+    // 4. Drain the sorted Spur triples directly into HDT-id triples via the
+    //    ID maps. `into_par_iter` consumes the Vec so the Spur triples are
+    //    freed before `read_dict_triples` returns — only `Vec<TripleId>`
+    //    survives into `TriplesBitmap::from_triples`.
+    let sorted_spur_triples = sorter.join().expect("NT sorter thread panicked");
+    let encoded_triples: Vec<TripleId> = sorted_spur_triples
+        .into_par_iter()
+        .map(|[s_spur, p_spur, o_spur]| {
+            let s = subj_map[s_spur.into_usize()] as Id;
+            let p = pred_map[p_spur.into_usize()] as Id;
+            let o = obj_map[o_spur.into_usize()] as Id;
+            if s == 0 || p == 0 || o == 0 {
+                error!("encoded triple [{s}, {p}, {o}] contains 0; term missing from dictionary");
             }
-            triple
+            [s, p, o]
         })
         .collect();
+
+    drop(subj_map);
+    drop(pred_map);
+    drop(obj_map);
 
     Ok((dict, encoded_triples))
 }
 
-/// Parse N-Triples in parallel and collect terms into sets
-fn parse_nt_terms(path: &Path) -> Result<IndexPool> {
+/// Parse N-Triples and collect terms into the interning pool + role bitsets.
+fn parse_nt_terms(path: &Path) -> Result<ParsedTerms> {
     let lasso: Arc<ThreadedRodeo<Spur>> = Arc::new(ThreadedRodeo::new());
     // workaround for bug with lasso v0.7.3 when concurrency is too high, see https://github.com/Kixiron/lasso/issues/48
     // experiments have always failed with 24, often with 23 and sometimes with 22 threads, choose 16 to be on the safe side
@@ -170,10 +194,9 @@ fn parse_nt_terms(path: &Path) -> Result<IndexPool> {
     let num_parsers = std::cmp::min(16, thread::available_parallelism().map_or(2, std::num::NonZero::get));
     // Store triple indices instead of strings
     let readers = NTriplesParser::new().split_file_for_parallel_parsing(path, num_parsers)?;
-    let triples: Vec<[usize; 3]> = readers
+    let triples: Vec<[Spur; 3]> = readers
         .into_par_iter()
         .flat_map_iter(|reader| {
-            //for q in reader {
             reader.map(|q| {
                 let clean = |s: &mut String| {
                     let mut chars = s.chars();
@@ -190,80 +213,175 @@ fn parse_nt_terms(path: &Path) -> Result<IndexPool> {
                 let mut obj_str = q.object.to_string();
                 clean(&mut obj_str);
 
-                let s_idx = lasso.get_or_intern(subj_str).into_usize();
-                let p_idx = lasso.get_or_intern(pred_str).into_usize();
-                let o_idx = lasso.get_or_intern(obj_str).into_usize();
+                let s = lasso.get_or_intern(subj_str);
+                let p = lasso.get_or_intern(pred_str);
+                let o = lasso.get_or_intern(obj_str);
 
-                [s_idx, p_idx, o_idx]
+                [s, p, o]
             })
         })
         .collect();
-    // TODO: error handling
-    //.map_err(|e| Error::Other(format!("Error reading N-Triples: {e:?}")))?;
-    let lasso = Arc::try_unwrap(lasso).unwrap(); // no parallel usage anymore
-    // Track which indices are subjects/objects/predicates
+
+    let lasso = Arc::try_unwrap(lasso).expect("lasso Arc still has outstanding references");
+
+    // Role bitsets indexed by Spur::into_usize() (0-based, dense).
     let block = [0u64; 4];
     let blocks = lasso.len().div_ceil(256);
-    let mut subjects = vec![block; blocks];
-    let mut objects = vec![block; blocks];
-    let mut predicates = vec![block; blocks];
+    let mut subjects: Indices = vec![block; blocks];
+    let mut objects: Indices = vec![block; blocks];
+    let mut predicates: Indices = vec![block; blocks];
 
     for [s, p, o] in &triples {
-        subjects.bit_set(*s);
-        predicates.bit_set(*p);
-        objects.bit_set(*o);
+        subjects.bit_set(s.into_usize());
+        predicates.bit_set(p.into_usize());
+        objects.bit_set(o.into_usize());
     }
 
-    let strings: Vec<String> = lasso.into_resolver().strings().map(String::from).collect();
-    Ok(IndexPool { triples, subjects, objects, predicates, strings })
+    Ok(ParsedTerms { triples, lasso, subjects, predicates, objects })
 }
 
-/// Build dictionary from collected terms using string pool indices
-fn build_dict_from_terms(pool: &IndexPool, block_size: usize) -> FourSectDict {
-    use log::warn;
-    use std::collections::BTreeSet;
-
-    if pool.predicates.is_empty() {
-        warn!("no triples found in provided RDF");
-    }
-    // can this be optimized? the bitvec lib does not seem to have an iterator for 1-bits
-    let externalize = |idx: &Indices| {
-        let mut v = BTreeSet::<&str>::new();
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..idx.bit_len() {
-            if idx.bit_test(i) {
-                v.insert(&pool.strings[i]);
+/// Enumerate the set-bit positions (Spur indices) of a bitset. Uses
+/// `trailing_zeros` per word — far cheaper than iterating every bit and
+/// calling `bit_test` (the old `externalize` pattern).
+fn collect_set_spurs(bitset: &Indices) -> Vec<Spur> {
+    // Estimate capacity from popcount to avoid Vec grow allocations.
+    let popcount: usize = bitset.iter().flat_map(|block| block.iter()).map(|w| w.count_ones() as usize).sum();
+    let mut out = Vec::with_capacity(popcount);
+    for (block_idx, block) in bitset.iter().enumerate() {
+        for (word_idx, &word) in block.iter().enumerate() {
+            let base_bit = block_idx * 256 + word_idx * 64;
+            let mut w = word;
+            while w != 0 {
+                let bit_offset = w.trailing_zeros() as usize;
+                out.push(Spur::try_from_usize(base_bit + bit_offset).expect("Spur index overflow (>u32::MAX)"));
+                w &= w - 1;
             }
         }
-        v
-    };
-    macro_rules! nspawn {
-        ($s:expr, $n:expr, $f:expr) => {
-            thread::Builder::new().name($n.to_owned()).spawn_scoped($s, $f).unwrap()
-        };
     }
-    let [shared, subjects, predicates, objects]: [DictSectPFC; 4] = thread::scope(|s| {
-        [
-            nspawn!(s, "shared", || {
-                let mut shared_indices: Indices = pool.subjects.clone();
-                shared_indices.bit_and(&pool.objects); // intersection
-                DictSectPFC::compress(&externalize(&shared_indices), block_size)
-            }),
-            nspawn!(s, "unique subjects", || {
-                let mut unique_subject_indices: Indices = pool.subjects.clone();
-                unique_subject_indices.bit_andnot(&pool.objects);
-                DictSectPFC::compress(&externalize(&unique_subject_indices), block_size)
-            }),
-            nspawn!(s, "predicates", || DictSectPFC::compress(&externalize(&pool.predicates), block_size)),
-            nspawn!(s, "unique objects", || {
-                let mut unique_object_indices = pool.objects.clone();
-                unique_object_indices.bit_andnot(&pool.subjects);
-                DictSectPFC::compress(&externalize(&unique_object_indices), block_size)
-            }),
-        ]
-        .map(|t| t.join().unwrap())
+    out
+}
+
+/// Build the four compressed dictionary sections and the three per-role
+/// `Spur -> HDT id` lookup tables.
+///
+/// Sections follow the standard HDT MAPPING2 layout:
+/// - shared: terms that appear as both subject and object (ids 1..=N_shared for both roles)
+/// - unique subjects: subject-only terms (subject ids N_shared+1..=N_shared+N_subj)
+/// - unique objects: object-only terms (object ids N_shared+1..=N_shared+N_obj)
+/// - predicates: all predicate terms (ids 1..=N_pred)
+fn build_dict_and_id_maps(
+    resolver: &RodeoResolver<Spur>, subjects_bs: &Indices, predicates_bs: &Indices, objects_bs: &Indices,
+    block_size: usize,
+) -> (FourSectDict, IdMap, IdMap, IdMap) {
+    use log::warn;
+
+    if predicates_bs.is_empty() {
+        warn!("no triples found in provided RDF");
+    }
+
+    // Compute section membership via bitset ops.
+    let mut shared_bs = subjects_bs.clone();
+    shared_bs.bit_and(objects_bs);
+    let mut unique_subj_bs = subjects_bs.clone();
+    unique_subj_bs.bit_andnot(objects_bs);
+    let mut unique_obj_bs = objects_bs.clone();
+    unique_obj_bs.bit_andnot(subjects_bs);
+
+    // Collect the Spurs in each section.
+    let mut shared_spurs = collect_set_spurs(&shared_bs);
+    let mut unique_subj_spurs = collect_set_spurs(&unique_subj_bs);
+    let mut pred_spurs = collect_set_spurs(predicates_bs);
+    let mut unique_obj_spurs = collect_set_spurs(&unique_obj_bs);
+    drop(shared_bs);
+    drop(unique_subj_bs);
+    drop(unique_obj_bs);
+
+    // Sort each section by the resolved string. Each `par_sort_unstable_by`
+    // uses the rayon thread pool, so running the four sorts back-to-back lets
+    // each one use every core; spawning them all in parallel would just fight
+    // over the same workers.
+    let cmp = |a: &Spur, b: &Spur| resolver.resolve(a).cmp(resolver.resolve(b));
+    shared_spurs.par_sort_unstable_by(cmp);
+    unique_subj_spurs.par_sort_unstable_by(cmp);
+    pred_spurs.par_sort_unstable_by(cmp);
+    unique_obj_spurs.par_sort_unstable_by(cmp);
+
+    // Allocate ID maps sized by the lasso interner's term count (also the bit
+    // length of the role bitsets).
+    let map_len = resolver.len();
+    let mut subj_map: IdMap = vec![0u32; map_len];
+    let mut pred_map: IdMap = vec![0u32; map_len];
+    let mut obj_map: IdMap = vec![0u32; map_len];
+
+    let n_shared = shared_spurs.len();
+    let shared_id_ceiling = u32::try_from(n_shared).expect("too many shared terms (>u32::MAX)");
+    for (i, spur) in shared_spurs.iter().enumerate() {
+        let id = (i as u32) + 1; // ids are 1-indexed
+        let slot = spur.into_usize();
+        subj_map[slot] = id;
+        obj_map[slot] = id;
+    }
+    for (i, spur) in unique_subj_spurs.iter().enumerate() {
+        subj_map[spur.into_usize()] = shared_id_ceiling + (i as u32) + 1;
+    }
+    for (i, spur) in unique_obj_spurs.iter().enumerate() {
+        obj_map[spur.into_usize()] = shared_id_ceiling + (i as u32) + 1;
+    }
+    for (i, spur) in pred_spurs.iter().enumerate() {
+        pred_map[spur.into_usize()] = (i as u32) + 1;
+    }
+
+    // Compress the four sections concurrently. Each thread pulls its strings
+    // straight from the resolver (no intermediate `Vec<&str>` or `BTreeSet`).
+    let shared_ref = &shared_spurs;
+    let unique_subj_ref = &unique_subj_spurs;
+    let pred_ref = &pred_spurs;
+    let unique_obj_ref = &unique_obj_spurs;
+    let (shared, subjects, predicates, objects) = thread::scope(|s| {
+        let h_shared = thread::Builder::new()
+            .name("shared".into())
+            .spawn_scoped(s, || {
+                DictSectPFC::compress_iter(
+                    shared_ref.iter().map(|k| resolver.resolve(k)),
+                    shared_ref.len(),
+                    block_size,
+                )
+            })
+            .unwrap();
+        let h_subj = thread::Builder::new()
+            .name("unique subjects".into())
+            .spawn_scoped(s, || {
+                DictSectPFC::compress_iter(
+                    unique_subj_ref.iter().map(|k| resolver.resolve(k)),
+                    unique_subj_ref.len(),
+                    block_size,
+                )
+            })
+            .unwrap();
+        let h_pred = thread::Builder::new()
+            .name("predicates".into())
+            .spawn_scoped(s, || {
+                DictSectPFC::compress_iter(
+                    pred_ref.iter().map(|k| resolver.resolve(k)),
+                    pred_ref.len(),
+                    block_size,
+                )
+            })
+            .unwrap();
+        let h_obj = thread::Builder::new()
+            .name("unique objects".into())
+            .spawn_scoped(s, || {
+                DictSectPFC::compress_iter(
+                    unique_obj_ref.iter().map(|k| resolver.resolve(k)),
+                    unique_obj_ref.len(),
+                    block_size,
+                )
+            })
+            .unwrap();
+        (h_shared.join().unwrap(), h_subj.join().unwrap(), h_pred.join().unwrap(), h_obj.join().unwrap())
     });
-    FourSectDict { shared, subjects, predicates, objects }
+
+    (FourSectDict { shared, subjects, predicates, objects }, subj_map, pred_map, obj_map)
 }
 
 #[cfg(test)]
