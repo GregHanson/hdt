@@ -189,7 +189,8 @@ fn read_dict_triples(path: &Path, block_size: usize) -> Result<(FourSectDict, Ve
 fn parse_nt_terms(path: &Path) -> Result<ParsedTerms> {
     let lasso: Arc<ThreadedRodeo<Spur>> = Arc::new(ThreadedRodeo::new());
     // use two threads when available parallelism cannot be determined as going to a single thread is around 38% slower
-    let num_parsers = thread::available_parallelism().map_or(2, std::num::NonZero::get);
+    // 16 chosen as a sane upper limit
+    let num_parsers = std::cmp::min(16, thread::available_parallelism().map_or(2, std::num::NonZero::get));
     // Store triple indices instead of strings
     let readers = NTriplesParser::new().split_file_for_parallel_parsing(path, num_parsers)?;
     let triples: Vec<[Spur; 3]> = readers
