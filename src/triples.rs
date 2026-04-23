@@ -202,6 +202,7 @@ fn build_op_index_from_entries(mut entries: Vec<(u32, u32, u32)>) -> (Vec<u32>, 
 impl TriplesBitmap {
     /// builds the necessary indexes and constructs TriplesBitmap
     pub fn new(order: Order, sequence_y: &Sequence, bitmap_y: Bitmap, adjlist_z: AdjList) -> Self {
+        use rayon::prelude::*;
         //let wavelet_thread = std::thread::spawn(move || WT::from_iter(&sequence_y));
         let wavelet_y = WT::from_iter(sequence_y);
 
@@ -209,7 +210,6 @@ impl TriplesBitmap {
         // Collect (object, predicate, pos_y) tuples for the op-index build.
         // Each iteration does one sequence.get + one bitmap.rank + one wavelet.get;
         // all are read-only so we parallelize with rayon for ~6-8× speedup.
-        use rayon::prelude::*;
         let pairs: Vec<(u32, u32, u32)> = (0..entries)
             .into_par_iter()
             .filter_map(|pos_z| {
