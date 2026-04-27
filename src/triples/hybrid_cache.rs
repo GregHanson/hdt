@@ -499,18 +499,10 @@ impl HybridCache {
         // file: a fresh inode appears under the final name, leaving any stale
         // mapping pointing at the old inode until it is dropped.
         let cache_path = Self::get_cache_path(hdt_path);
-        let file_name = cache_path.file_name().and_then(|n| n.to_str()).unwrap_or("hdt-cache");
-        let tmp_cache_path = cache_path.with_file_name(format!(
-            "{file_name}.tmp-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("unnamed")
-        ));
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_cache_path)?;
-        let mut writer = BufWriter::new(file);
+        let cache_dir = cache_path.parent().unwrap_or_else(|| Path::new("."));
+        let mut tmp_cache = tempfile::NamedTempFile::new_in(cache_dir)?;
+        let tmp_cache_path = tmp_cache.path().to_path_buf();
+        let mut writer = BufWriter::new(tmp_cache.as_file_mut());
 
         // Create ControlInfo with metadata in properties
         let mut properties = HashMap::new();
@@ -601,20 +593,15 @@ impl HybridCache {
         // Make sure every byte hits the disk before we swing the rename.
         // Without sync_all() a crash between rename and journal commit could
         // leave the new inode visible but empty.
-        let file = writer.into_inner().map_err(|e| HybridCacheError::Io(e.into_error()))?;
-        file.sync_all()?;
-        drop(file);
+        drop(writer);
+        tmp_cache.as_file().sync_all()?;
 
-        // Atomic publish: rename the temp file onto the final cache path.
-        // On Unix this is a single inode swap; on Windows, std uses MoveFileEx
-        // with MOVEFILE_REPLACE_EXISTING semantics so it overwrites in place.
-        std::fs::rename(&tmp_cache_path, &cache_path).map_err(|source| {
-            // Best-effort cleanup of the orphaned temp file.
-            let _ = std::fs::remove_file(&tmp_cache_path);
+        // Atomic publish: persist the temp file onto the final cache path.
+        tmp_cache.persist(&cache_path).map_err(|error| {
             HybridCacheError::Rename {
                 tmp: tmp_cache_path.display().to_string(),
                 final_path: cache_path.display().to_string(),
-                source,
+                source: error.error,
             }
         })?;
 
@@ -832,6 +819,28 @@ mod tests {
         }
 
         assert!(cache_path.exists(), "cache should exist after concurrent loads");
+        std::fs::remove_dir_all(test_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_from_hdt_path_thread_name_with_path_unsafe_chars() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::init();
+        let (test_dir, hdt_path, cache_path) = setup_isolated_hdt("thread-name")?;
+        let _ = std::fs::remove_file(&cache_path);
+
+        let handle = thread::Builder::new()
+            .name("hdt::cache::worker".to_string())
+            .spawn({
+                let path = hdt_path.clone();
+                move || HybridCache::from_hdt_path(&path).map(|_| ())
+            })?;
+
+        handle
+            .join()
+            .map_err(|_| std::io::Error::other("hybrid cache worker thread panicked"))??;
+
+        assert!(cache_path.exists(), "cache should exist after named-thread load");
         std::fs::remove_dir_all(test_dir)?;
         Ok(())
     }
