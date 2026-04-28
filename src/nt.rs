@@ -197,7 +197,7 @@ fn parse_nt_terms(path: &Path) -> Result<ParsedTerms> {
     let triples: Vec<[Spur; 3]> = readers
         .into_par_iter()
         .flat_map_iter(|reader| {
-            reader.map(|q| {
+            reader.map(|q| -> Result<[Spur; 3]> {
                 let clean = |s: &mut String| {
                     let mut chars = s.chars();
                     if chars.next() == Some('<') && chars.nth_back(0) == Some('>') {
@@ -205,7 +205,9 @@ fn parse_nt_terms(path: &Path) -> Result<ParsedTerms> {
                         s.pop();
                     }
                 };
-                let q = q.unwrap(); // TODO: error handling
+                let q = q.map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                })?;
                 let mut subj_str = q.subject.to_string();
                 clean(&mut subj_str);
                 let mut pred_str = q.predicate.to_string();
@@ -217,10 +219,10 @@ fn parse_nt_terms(path: &Path) -> Result<ParsedTerms> {
                 let p = lasso.get_or_intern(pred_str);
                 let o = lasso.get_or_intern(obj_str);
 
-                [s, p, o]
+                Ok([s, p, o])
             })
         })
-        .collect();
+        .collect::<Result<Vec<[Spur; 3]>>>()?;
 
     let lasso = Arc::try_unwrap(lasso).expect("lasso Arc still has outstanding references");
 
