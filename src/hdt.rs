@@ -18,12 +18,15 @@ use crate::triples::{
 use crate::{DictSectPFC, FourSectDict, header};
 use bytesize::ByteSize;
 use log::{debug, error};
+use qwt::SelectUnsigned;
 #[cfg(feature = "cache")]
 use std::fs::File;
 use std::iter;
 #[cfg(feature = "cache")]
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub type Result<T> = core::result::Result<T, Error>;
 #[cfg(feature = "nt")]
@@ -49,6 +52,13 @@ pub struct HdtGeneric<D: DictSectPfcAccess, S: SequenceAccess, B: BitmapAccess> 
     pub dict: FourSectDictGeneric<D>,
     /// representation of triples
     pub triples: TriplesBitmapGeneric<S, B>,
+    /// Per-predicate triple counts, filled in on first use by
+    /// [`predicate_cardinality`](HdtGeneric::predicate_cardinality).
+    ///
+    /// A loaded graph is immutable, so a predicate's count never changes and is worth keeping
+    /// once measured. Indexed by predicate ID, one slot per predicate in the dictionary -- a few
+    /// kilobytes even for a graph with thousands of predicates.
+    predicate_counts: OnceLock<Box<[AtomicUsize]>>,
 }
 
 /// Type alias for the standard in-memory HDT (backward compatible)
@@ -63,6 +73,46 @@ pub type Hdt = HdtGeneric<DictSectPFC, InMemorySequence, InMemoryBitmap>;
 pub type HdtHybrid = HdtGeneric<MmapDictSectPfc, MmapSequence, MmapBitmap>;
 
 type StringTriple = [Arc<str>; 3];
+
+/// How many of a predicate's adjacency runs [`HdtGeneric::cardinality`] measures before
+/// extrapolating. Each sample is a wavelet select plus two bitmap selects, so this trades a few
+/// microseconds for an estimate that ranks predicates correctly.
+const PREDICATE_SAMPLE: usize = 32;
+
+/// How many triples match a triple pattern, as reported by [`HdtGeneric::cardinality`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cardinality {
+    /// The number of matching triples, or an approximation of it when `exact` is false.
+    pub value: usize,
+    /// Whether `value` is the true number of matching triples rather than an approximation.
+    ///
+    /// A planner that has to choose between two patterns can use an approximation; one that wants
+    /// to answer `SELECT (COUNT(*) ...)` from the index alone cannot, and should check this first.
+    pub exact: bool,
+}
+
+impl Cardinality {
+    const fn exact(value: usize) -> Self {
+        Self { value, exact: true }
+    }
+
+    const fn estimate(value: usize) -> Self {
+        Self { value, exact: false }
+    }
+
+    /// Pack into one nonzero `usize` so a cache slot can use 0 for "not measured yet".
+    const fn encode(self) -> usize {
+        ((self.value << 1) | (self.exact as usize)) + 1
+    }
+
+    const fn decode(encoded: usize) -> Option<Self> {
+        if encoded == 0 {
+            return None;
+        }
+        let encoded = encoded - 1;
+        Some(Self { value: encoded >> 1, exact: encoded & 1 == 1 })
+    }
+}
 
 /// The error type for the `translate_id` method.
 #[derive(thiserror::Error, Debug)]
@@ -188,7 +238,7 @@ impl<D: DictSectPfcAccess, S: SequenceAccess, B: BitmapAccess> HdtGeneric<D, S, 
     /// }
     /// ```
     pub fn triples_with_pattern<'a>(
-        &'a self, sp: Option<&'a str>, pp: Option<&'a str>, op: Option<&'a str>,
+        &'a self, sp: Option<&str>, pp: Option<&str>, op: Option<&str>,
     ) -> Box<dyn Iterator<Item = StringTriple> + 'a> {
         // Resolve the constant terms to dictionary IDs first. Building the Arc<str> for each bound
         // term is deferred until after this check so that a pattern naming a term absent from the
@@ -201,6 +251,52 @@ impl<D: DictSectPfcAccess, S: SequenceAccess, B: BitmapAccess> HdtGeneric<D, S, 
         }
         let pattern: [Option<(Arc<str>, usize)>; 3] =
             [(0, sp), (1, pp), (2, op)].map(|(i, x)| x.map(|x| (Arc::from(x), ids[i].unwrap())));
+        self.triples_with_resolved_pattern(pattern)
+    }
+
+    /// Like [`triples_with_pattern`](Self::triples_with_pattern) but taking terms that are already
+    /// `Arc<str>`, which are reused rather than re-allocated.
+    ///
+    /// The `&str` form has to copy every bound term into a fresh `Arc` before it can hand it back
+    /// out with each matching triple. That copy is invisible on a single scan but not on a nested
+    /// loop join, where a SPARQL engine calls this once per binding of the outer pattern with terms
+    /// it is already holding as `Arc<str>` -- there the copy is one allocation per bound term per
+    /// probe. Passing the `Arc`s in turns that into a refcount increment.
+    /// # Example
+    /// ```
+    /// use std::sync::Arc;
+    /// fn query(dbpedia: hdt::Hdt, subject: Arc<str>) {
+    ///   for triple in dbpedia.triples_with_arc_pattern(Some(subject), None, None) {
+    ///     println!("{triple:?}");
+    ///   }
+    /// }
+    /// ```
+    pub fn triples_with_arc_pattern<'a>(
+        &'a self, sp: Option<Arc<str>>, pp: Option<Arc<str>>, op: Option<Arc<str>>,
+    ) -> Box<dyn Iterator<Item = StringTriple> + 'a> {
+        let resolve = |term: Option<Arc<str>>, kind: IdKind| {
+            term.map(|t| {
+                let id = self.dict.string_to_id(t.as_ref(), kind);
+                (t, id)
+            })
+        };
+        let pattern: [Option<(Arc<str>, usize)>; 3] =
+            [resolve(sp, IdKind::Subject), resolve(pp, IdKind::Predicate), resolve(op, IdKind::Object)];
+        // at least one term does not exist in the graph
+        if pattern.iter().flatten().any(|&(_, id)| id == 0) {
+            return Box::new(iter::empty());
+        }
+        self.triples_with_resolved_pattern(pattern)
+    }
+
+    /// Shared body of the two `triples_with_*_pattern` entry points.
+    ///
+    /// Each bound position arrives as its `Arc<str>` paired with the dictionary ID it resolved to;
+    /// callers have already rejected patterns naming a term the graph does not contain, so every ID
+    /// here is nonzero.
+    fn triples_with_resolved_pattern<'a>(
+        &'a self, pattern: [Option<(Arc<str>, usize)>; 3],
+    ) -> Box<dyn Iterator<Item = StringTriple> + 'a> {
         // TODO: improve error handling
         let mut cache = TripleCache::new(self);
         match pattern {
@@ -239,10 +335,131 @@ impl<D: DictSectPfcAccess, S: SequenceAccess, B: BitmapAccess> HdtGeneric<D, S, 
         }
     }
 
+    /// How many triples match a pattern, and whether that number is exact.
+    ///
+    /// Answering a triple pattern is a range walk over structures whose extent the index already
+    /// knows, so for most patterns the count falls out without reading a single triple. A SPARQL
+    /// optimiser needs exactly this: given a basic graph pattern, run the most selective pattern
+    /// first. Without it a planner has to guess from the pattern's shape alone, which cannot tell
+    /// a predicate occurring three times from one occurring three million times.
+    ///
+    /// | Pattern | Cost | Exact |
+    /// |---|---|---|
+    /// | `SPO`, `SP?`, `S??`, `???` | O(1) | yes |
+    /// | `??O` | O(1) | yes |
+    /// | `?PO` | O(log n) | yes |
+    /// | `S?O` | O(1) | no, an upper bound |
+    /// | `?P?` | O(1) amortised | only for predicates with few enough adjacency runs to sample in full |
+    ///
+    /// A pattern naming a term the graph does not contain is exactly zero.
+    /// # Example
+    /// ```
+    /// fn plan(dbpedia: hdt::Hdt) {
+    ///   let c = dbpedia.cardinality(None, Some("http://dbpedia.org/ontology/birthPlace"), None);
+    ///   println!("about {} triples, exact: {}", c.value, c.exact);
+    /// }
+    /// ```
+    pub fn cardinality(&self, sp: Option<&str>, pp: Option<&str>, op: Option<&str>) -> Cardinality {
+        let pattern: [Option<usize>; 3] =
+            [(0, sp), (1, pp), (2, op)].map(|(i, x)| x.map(|x| self.dict.string_to_id(x, IdKind::KINDS[i])));
+        // A bound term that is not in the dictionary matches nothing, and that is not a guess.
+        if pattern.contains(&Some(0)) {
+            return Cardinality::exact(0);
+        }
+        self.cardinality_with_id_pattern(pattern.map(|x| x.unwrap_or(0)))
+    }
+
+    /// How many triples carry a given predicate.
+    ///
+    /// This is the one pattern shape HDT cannot answer in constant time. The wavelet index gives
+    /// the number of distinct subject-predicate pairs for a predicate immediately, but each pair
+    /// stands for a whole adjacency run, and run lengths vary enormously between predicates: a
+    /// `caption` is one per subject, an `actor` a dozen. Scaling the pair count by a graph-wide
+    /// average therefore does not merely blur the answer, it *reorders* predicates -- which is
+    /// worse than useless to a planner whose only job is to rank them.
+    ///
+    /// So the run lengths are sampled instead: up to [`PREDICATE_SAMPLE`] pairs spread evenly
+    /// across the predicate's occurrences, averaged, and multiplied back out. Spreading rather
+    /// than taking a prefix matters because occurrences are in subject order, and subject order
+    /// correlates with almost everything in a real graph. When a predicate has no more pairs than
+    /// the sample size, every run is visited and the answer is exact.
+    fn predicate_cardinality(&self, p: Id) -> Cardinality {
+        let cache = self
+            .predicate_counts
+            .get_or_init(|| (0..=self.dict.predicates.num_strings()).map(|_| AtomicUsize::new(0)).collect());
+        if let Some(slot) = cache.get(p)
+            && let Some(cached) = Cardinality::decode(slot.load(Ordering::Relaxed))
+        {
+            return cached;
+        }
+        let measured = self.measure_predicate_cardinality(p);
+        if let Some(slot) = cache.get(p) {
+            slot.store(measured.encode(), Ordering::Relaxed);
+        }
+        measured
+    }
+
+    /// The uncached half of [`predicate_cardinality`](Self::predicate_cardinality).
+    fn measure_predicate_cardinality(&self, p: Id) -> Cardinality {
+        let ts = &self.triples;
+        let pairs = PredicateIter::new(ts, p).size_hint().0;
+        if pairs == 0 {
+            return Cardinality::exact(0);
+        }
+        let step = pairs.div_ceil(PREDICATE_SAMPLE);
+        let mut sampled = 0_usize;
+        let mut objects = 0_usize;
+        let mut i = 0;
+        while i < pairs {
+            let Some(pos_y) = ts.wavelet_y.select(p, i) else { break };
+            let start = ts.adjlist_z.find(pos_y as Id);
+            let end = ts.adjlist_z.last(pos_y as Id);
+            objects += end + 1 - start;
+            sampled += 1;
+            i += step;
+        }
+        if sampled == 0 {
+            return Cardinality::estimate(pairs);
+        }
+        if sampled == pairs {
+            // Every run was visited, so the sum is the count rather than a sample of it.
+            return Cardinality::exact(objects);
+        }
+        Cardinality::estimate(pairs.saturating_mul(objects) / sampled)
+    }
+
+    /// [`cardinality`](Self::cardinality) over dictionary IDs, where 0 stands for a variable.
+    ///
+    /// Callers that already resolved their terms -- a SPARQL engine holding IDs from a previous
+    /// pattern, say -- skip the dictionary lookups this way.
+    pub fn cardinality_with_id_pattern(&self, pattern: TripleId) -> Cardinality {
+        let ts = &self.triples;
+        let [s, p, o] = pattern;
+        match (s, p, o) {
+            // The subject iterator covers SPO, SP?, S??, S?O and ???, and its size hint is exact
+            // for all of those but S?O.
+            (1.., _, _) | (0, 0, 0) => {
+                let (lower, upper) = SubjectIter::with_pattern(ts, [s, p, o]).size_hint();
+                match upper {
+                    Some(upper) if upper == lower => Cardinality::exact(lower),
+                    // S?O: at most one triple per predicate of the subject, and at most one per
+                    // occurrence of the object. Both bounds are O(1), so take the tighter.
+                    Some(upper) => {
+                        Cardinality::estimate(upper.min(self.cardinality_with_id_pattern([0, 0, o]).value))
+                    }
+                    None => Cardinality::estimate(lower),
+                }
+            }
+            (0, 1.., 1..) => Cardinality::exact(PredicateObjectIter::new(ts, p, o).len()),
+            (0, 0, 1..) => Cardinality::exact(ObjectIter::new(ts, o).len()),
+            (0, 1.., 0) => self.predicate_cardinality(p),
+        }
+    }
+
     /// Get all internal triple IDs that fit the given triple patterns, where `None` stands for a variable.
     /// Used for specific optimizations, call triples_with_pattern instead to get actual string results.
     pub fn triple_ids_with_pattern<'a>(
-        &'a self, sp: Option<&'a str>, pp: Option<&'a str>, op: Option<&'a str>,
+        &'a self, sp: Option<&str>, pp: Option<&str>, op: Option<&str>,
     ) -> Box<dyn Iterator<Item = TripleId> + 'a> {
         let pattern: [Option<usize>; 3] =
             [(0, sp), (1, pp), (2, op)].map(|(i, x)| x.map(|x| self.dict.string_to_id(x, IdKind::KINDS[i])));
@@ -295,7 +512,7 @@ impl Hdt {
         let unvalidated_dict = FourSectDict::read(&mut reader)?;
         let triples = TriplesBitmap::read_sect(&mut reader)?;
         let dict = unvalidated_dict.validate()?;
-        let hdt = Hdt { header, dict, triples };
+        let hdt = Hdt { header, dict, triples, predicate_counts: OnceLock::new() };
         debug!("HDT size in memory {}, details:", ByteSize(hdt.size_in_bytes() as u64));
         debug!("{hdt:#?}");
         Ok(hdt)
@@ -372,7 +589,7 @@ impl Hdt {
 
         let triples = TriplesBitmap::from_cache(order, bitmap_y, adjlist_z, cache.wavelet_y);
 
-        let hdt = Hdt { header, dict, triples };
+        let hdt = Hdt { header, dict, triples, predicate_counts: OnceLock::new() };
         debug!("HDT size in memory {}, details:", ByteSize(hdt.size_in_bytes() as u64));
         debug!("{hdt:#?}");
         Ok(hdt)
@@ -466,7 +683,7 @@ impl Hdt {
         let triples =
             TriplesBitmapGeneric::from_components(order, bitmap_y, adjlist_z, op_index, cache.wavelet_y)?;
 
-        let hdt = HdtHybrid { header, dict, triples };
+        let hdt = HdtHybrid { header, dict, triples, predicate_counts: OnceLock::new() };
         debug!("HDT Hybrid size in memory {}, details:", ByteSize(hdt.size_in_bytes() as u64));
         debug!("{hdt:#?}");
         Ok(hdt)
@@ -549,6 +766,66 @@ pub mod tests {
         hdt.write(&mut buf)?;
         let hdt2 = Hdt::read(std::io::Cursor::new(buf))?;
         snikmeta_check(&hdt2)?;
+        Ok(())
+    }
+
+    /// Every pattern shape, checked against the number of triples actually produced.
+    ///
+    /// Exact shapes must match on the nose; the two approximate shapes only have to bracket the
+    /// truth in the direction they claim, since an estimate that is merely close is still a usable
+    /// planning input but one that is wrong in the wrong direction is not.
+    #[test]
+    fn cardinality_matches_iteration() -> Result<()> {
+        init();
+        let hdt = snikmeta()?;
+        let s = "http://www.snik.eu/ontology/meta/хобби-N-0";
+        let p = "http://www.w3.org/2000/01/rdf-schema#label";
+        let o = "\"ХОББИ\"@ru";
+
+        let exact_patterns = [
+            (Some(s), Some(p), Some(o)),
+            (Some(s), Some(p), None),
+            (Some(s), None, None),
+            (None, Some(p), Some(o)),
+            (None, None, Some(o)),
+            (None, None, None),
+        ];
+        for (sp, pp, op) in exact_patterns {
+            let counted = hdt.triples_with_pattern(sp, pp, op).count();
+            let c = hdt.cardinality(sp, pp, op);
+            assert!(c.exact, "pattern {sp:?} {pp:?} {op:?} should report an exact cardinality");
+            assert_eq!(c.value, counted, "pattern {sp:?} {pp:?} {op:?}");
+        }
+
+        // S?O is an upper bound.
+        let counted = hdt.triples_with_pattern(Some(s), None, Some(o)).count();
+        let c = hdt.cardinality(Some(s), None, Some(o));
+        assert!(!c.exact);
+        assert!(c.value >= counted, "S?O estimate {} is below the true count {counted}", c.value);
+
+        // ?P? is exact when every adjacency run fits in the sample and extrapolated otherwise. An
+        // extrapolation still has to be within an order of magnitude to be worth calling an
+        // estimate, since its whole job is to rank predicates against each other.
+        let counted = hdt.triples_with_pattern(None, Some(p), None).count();
+        let c = hdt.cardinality(None, Some(p), None);
+        if c.exact {
+            assert_eq!(c.value, counted, "?P? claimed an exact count that is wrong");
+        } else {
+            assert!(
+                c.value * 10 >= counted && counted * 10 >= c.value,
+                "?P? estimate {} is more than 10x off the true count {counted}",
+                c.value
+            );
+        }
+
+        // A term the graph does not contain is exactly nothing, in every position.
+        let missing = "http://example.org/not-in-this-graph";
+        for (sp, pp, op) in [(Some(missing), None, None), (None, Some(missing), None), (None, None, Some(missing))]
+        {
+            let c = hdt.cardinality(sp, pp, op);
+            assert!(c.exact);
+            assert_eq!(c.value, 0, "pattern {sp:?} {pp:?} {op:?}");
+        }
         Ok(())
     }
 

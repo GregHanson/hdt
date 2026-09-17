@@ -49,4 +49,14 @@ impl<S: SequenceAccess, B: BitmapAccess> Iterator for PredicateIter<'_, S, B> {
         }
         Some(self.triples.coord_to_triple(self.s, self.p, o).unwrap())
     }
+
+    /// Lower bound only.
+    ///
+    /// `occs` counts how many times the predicate occurs in the wavelet index, which is the number
+    /// of distinct subject-predicate pairs, not the number of triples: each pair contributes at
+    /// least one triple and often several. Turning that into an exact count means walking every
+    /// pair, which is the work the iterator exists to do.
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.occs.saturating_sub(self.i), None)
+    }
 }

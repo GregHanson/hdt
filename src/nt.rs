@@ -61,7 +61,7 @@ impl Hdt {
         let triples = TriplesBitmap::from_triples(encoded_triples);
 
         let header = Header { format: "ntriples".to_owned(), length: 0, body: BTreeSet::new() };
-        let mut hdt = Hdt { header, dict, triples };
+        let mut hdt = Hdt { header, dict, triples, predicate_counts: std::sync::OnceLock::new() };
         hdt.fill_header(base, BLOCK_SIZE, num_triples, original_size);
         // This crate's `Header::write` does not auto-recompute the serialized
         // header length, so set it explicitly here or the HDT fails to

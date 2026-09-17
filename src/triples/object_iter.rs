@@ -38,4 +38,13 @@ impl<S: SequenceAccess, B: BitmapAccess> Iterator for ObjectIter<'_, S, B> {
         self.pos_index += 1;
         Some([x, y, self.o])
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        // The object index stores one entry per triple with this object, so the remaining span of
+        // the index is the remaining triple count.
+        let remaining = (self.max_index + 1).saturating_sub(self.pos_index);
+        (remaining, Some(remaining))
+    }
 }
+
+impl<S: SequenceAccess, B: BitmapAccess> ExactSizeIterator for ObjectIter<'_, S, B> {}

@@ -61,8 +61,9 @@ impl<'a, S: SequenceAccess, B: BitmapAccess> PredicateObjectIter<'a, S, B> {
                 break;
             }
         }
-        // not found
-        PredicateObjectIter { triples, pos_index: 999, max_index: 0 }
+        // Not found. Any pos_index > max_index reads as an exhausted range; 1 > 0 says so without
+        // the reader having to work out what a magic number means.
+        PredicateObjectIter { triples, pos_index: 1, max_index: 0 }
     }
 }
 
@@ -77,4 +78,13 @@ impl<S: SequenceAccess, B: BitmapAccess> Iterator for PredicateObjectIter<'_, S,
         self.pos_index += 1;
         Some(s)
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        // The constructor binary-searched out the exact index span for this predicate-object pair,
+        // and yields one subject per position in it.
+        let remaining = (self.max_index + 1).saturating_sub(self.pos_index);
+        (remaining, Some(remaining))
+    }
 }
+
+impl<S: SequenceAccess, B: BitmapAccess> ExactSizeIterator for PredicateObjectIter<'_, S, B> {}

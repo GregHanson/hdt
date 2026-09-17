@@ -116,7 +116,7 @@ pub mod wasm;
 
 #[cfg(feature = "cache")]
 pub use crate::hdt::HdtHybrid;
-pub use crate::hdt::{Hdt, HdtGeneric};
+pub use crate::hdt::{Cardinality, Hdt, HdtGeneric};
 #[cfg(feature = "cache")]
 pub mod hdt_any;
 #[cfg(feature = "cache")]

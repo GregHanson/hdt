@@ -25,7 +25,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::four_sect_dict::{ExtractError, IdKind};
-use crate::hdt::{Error, Hdt, HdtHybrid};
+use crate::hdt::{Cardinality, Error, Hdt, HdtHybrid};
 use crate::header::Header;
 use crate::triples::hybrid_cache::HybridCacheError;
 use crate::triples::{Id, TripleId};
@@ -150,7 +150,7 @@ impl HdtAny {
     }
 
     pub fn triples_with_pattern<'a>(
-        &'a self, sp: Option<&'a str>, pp: Option<&'a str>, op: Option<&'a str>,
+        &'a self, sp: Option<&str>, pp: Option<&str>, op: Option<&str>,
     ) -> Box<dyn Iterator<Item = StringTriple> + 'a> {
         match self {
             Self::Hybrid(h) => h.triples_with_pattern(sp, pp, op),
@@ -158,8 +158,34 @@ impl HdtAny {
         }
     }
 
+    /// Forwards to [`HdtGeneric::cardinality`].
+    pub fn cardinality(&self, sp: Option<&str>, pp: Option<&str>, op: Option<&str>) -> Cardinality {
+        match self {
+            Self::Hybrid(h) => h.cardinality(sp, pp, op),
+            Self::InMemory(h) => h.cardinality(sp, pp, op),
+        }
+    }
+
+    /// Forwards to [`HdtGeneric::cardinality_with_id_pattern`].
+    pub fn cardinality_with_id_pattern(&self, pattern: TripleId) -> Cardinality {
+        match self {
+            Self::Hybrid(h) => h.cardinality_with_id_pattern(pattern),
+            Self::InMemory(h) => h.cardinality_with_id_pattern(pattern),
+        }
+    }
+
+    /// Forwards to [`HdtGeneric::triples_with_arc_pattern`].
+    pub fn triples_with_arc_pattern<'a>(
+        &'a self, sp: Option<Arc<str>>, pp: Option<Arc<str>>, op: Option<Arc<str>>,
+    ) -> Box<dyn Iterator<Item = StringTriple> + 'a> {
+        match self {
+            Self::Hybrid(h) => h.triples_with_arc_pattern(sp, pp, op),
+            Self::InMemory(h) => h.triples_with_arc_pattern(sp, pp, op),
+        }
+    }
+
     pub fn triple_ids_with_pattern<'a>(
-        &'a self, sp: Option<&'a str>, pp: Option<&'a str>, op: Option<&'a str>,
+        &'a self, sp: Option<&str>, pp: Option<&str>, op: Option<&str>,
     ) -> Box<dyn Iterator<Item = TripleId> + 'a> {
         match self {
             Self::Hybrid(h) => h.triple_ids_with_pattern(sp, pp, op),

@@ -146,4 +146,19 @@ impl<S: SequenceAccess, B: BitmapAccess> Iterator for SubjectIter<'_, S, B> {
         self.pos_z += 1;
         Some(triple_id)
     }
+
+    /// Exact for every pattern this iterator answers except S?O.
+    ///
+    /// The constructor already computed the z-range the pattern covers, and for SPO, SP?, S?? and
+    /// ??? there is exactly one triple per z position, so the remaining count is just how much of
+    /// that range is left. S?O is the exception: it walks one y position per predicate of the
+    /// subject and keeps only those whose adjacency list contains the object, so all that is known
+    /// up front is that it cannot yield more triples than the subject has predicates.
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.search_z > 0 {
+            return (0, Some(self.max_y.saturating_sub(self.pos_y)));
+        }
+        let remaining = self.max_z.saturating_sub(self.pos_z);
+        (remaining, Some(remaining))
+    }
 }
