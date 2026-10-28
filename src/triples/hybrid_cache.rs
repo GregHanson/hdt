@@ -396,7 +396,7 @@ impl HybridCache {
 
     pub fn write_cache_from_hdt_file(hdt_path: &Path) -> HybridCacheResult<(Self, u64)> {
         use crate::containers::ControlType;
-        use std::collections::HashMap;
+        use std::collections::BTreeMap;
         use std::io::Seek;
 
         let mut reader = std::io::BufReader::new(std::fs::File::open(hdt_path)?);
@@ -478,7 +478,7 @@ impl HybridCache {
         let mut writer = BufWriter::new(tmp_cache.as_file_mut());
 
         // Create ControlInfo with metadata in properties
-        let mut properties = HashMap::new();
+        let mut properties = BTreeMap::new();
         properties.insert("order".to_owned(), (triples_bitmap.order.clone() as u8).to_string());
         properties.insert("numTriples".to_owned(), triples_bitmap.adjlist_z.len().to_string());
         properties.insert("headerSize".to_owned(), header_size.to_string());

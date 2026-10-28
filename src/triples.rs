@@ -486,17 +486,20 @@ impl TriplesBitmap {
     pub fn from_triples(triples: Vec<TripleId>) -> Self {
         let mut y_bitmap = BitVectorMut::new();
         let mut z_bitmap = BitVectorMut::new();
-        let mut array_y = Vec::new();
-        let mut array_z = Vec::new();
+        // Size both arrays exactly instead of letting `push` grow them: RawVec doubles to the next power of two,
+        // so array_z would reserve 16.8M slots (134 MB) for 10.3M triples where 82 MB is needed, and every doubling briefly holds the old and new buffer at once.
+        // array_z takes one entry per triple; array_y one per distinct (subject, predicate) pair, counted below by a comparison-only pass over the already-sorted triples.
+        let num_y = usize::from(!triples.is_empty())
+            + triples.windows(2).filter(|w| w[0][0] != w[1][0] || w[0][1] != w[1][1]).count();
+        let mut array_y = Vec::with_capacity(num_y);
+        let mut array_z = Vec::with_capacity(triples.len());
 
         let mut last_x = 0;
         let mut last_y = 0;
         let mut last_z = 0;
 
-        for (i, triple) in triples.iter().enumerate() {
-            let [x, y, z] = *triple;
-
-            assert!(!(x == 0 || y == 0 || z == 0), "triple IDs should never be zero");
+        for (i, &[x, y, z]) in triples.iter().enumerate() {
+            assert!(x != 0 && y != 0 && z != 0, "triple IDs should never be zero");
 
             if i == 0 {
                 array_y.push(y);
@@ -506,19 +509,16 @@ impl TriplesBitmap {
                 array_y.push(y);
                 z_bitmap.push(true);
             } else if y != last_y {
-                assert!(y >= last_y, "the predicates must be in increasing order.");
+                assert!(y > last_y, "the predicates must be in increasing order.");
                 y_bitmap.push(false);
                 array_y.push(y);
                 z_bitmap.push(true);
             } else {
-                assert!(z >= last_z, "the objects must be in increasing order");
+                assert!(z > last_z, "the objects must be in increasing order");
                 z_bitmap.push(false);
             }
             array_z.push(z);
-
-            last_x = x;
-            last_y = y;
-            last_z = z;
+            [last_x, last_y, last_z] = [x, y, z];
         }
         // The encoded triples have been fully read into the y/z arrays and
         // bitmaps; free them (~24 B × num_triples) before the op-index build

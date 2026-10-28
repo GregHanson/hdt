@@ -456,9 +456,8 @@ impl MmapBitmap {
             let block_start = self.data_offset + block_idx * RANK_BLOCK_WORDS * 8;
             let bytes = word_in_block * 8;
             let slice = &self.mmap[block_start..block_start + bytes];
-            for chunk in slice.chunks_exact(8) {
-                let word = u64::from_le_bytes(chunk.try_into().unwrap());
-                count += word.count_ones() as usize;
+            for chunk in slice.as_chunks::<8>().0 {
+                count += u64::from_le_bytes(*chunk).count_ones() as usize;
             }
         }
 

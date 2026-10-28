@@ -9,7 +9,7 @@ keywords = ["rdf", "hdt", "compression", "file-format"]
 categories = ["compression", "filesystem", "parsing", "web-programming"]
 readme = "README.md"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.89"
 exclude = ["tests/resources/rdf-tests"]
 
 [package.metadata."docs.rs"]
@@ -23,7 +23,6 @@ oxrdf = "0.3"
 sophia = { version = "0.10", optional = true }
 thiserror = "2"
 log = "0.4"
-env_logger = { version = "0.11", default-features = false, features = ["auto-color"] }
 mownstr = { version = "0.3", optional = true }
 bincode = { version = "2", optional = true, default-features = false, features = ["std", "serde"] }
 rayon = { version = "1.11.0", default-features = false }
@@ -82,7 +81,7 @@ opt-level = 1
 pretty_assertions = "1"
 env_logger = { version = "0.11", default-features = false, features = ["auto-color"] }
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support", "html_reports"] }
-gungraun = "0.19"
+gungraun = "0.20"
 color-eyre = "0.6"
 fs-err = "3.1.0"
 sparesults = "0.3"
