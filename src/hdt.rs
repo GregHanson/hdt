@@ -36,6 +36,8 @@ mod concurrent_interner;
 #[path = "nt.rs"]
 /// Converting N-Triples to HDT, available only if HDT is built with the experimental `"nt"` feature.
 mod nt;
+#[cfg(feature = "nt")]
+pub use nt::HdtBuilder;
 
 /// Generic representation of an RDF graph loaded from an HDT file.
 /// Allows queries by triple patterns.

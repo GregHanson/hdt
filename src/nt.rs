@@ -7,23 +7,28 @@ use crate::{DictSectPFC, FourSectDict, Hdt};
 use bitset_core::BitSet;
 use bytesize::ByteSize;
 use log::{debug, error};
-use oxrdf::{Term, vocab::xsd};
+use oxrdf::{TermRef, Triple, TripleRef, vocab::xsd};
 use oxttl::NTriplesParser;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
-use std::io::{Error, ErrorKind::InvalidData};
+use std::fmt::{Display, Write as _};
+use std::io::{Error, ErrorKind::InvalidData, Read};
 use std::path::Path;
-use std::sync::Arc;
 use std::thread;
 
 pub type Result<T> = std::io::Result<T>;
 type Simd = [u64; 4];
 type Indices = Vec<Simd>;
 
+/// Bytes read per block by [`HdtBuilder::load_nt_reader`]: enough that every
+/// parser thread gets a few MiB of each block.
+const NT_READER_BLOCK: usize = 64 << 20;
+
 impl Hdt {
     /// Converts RDF N-Triples to HDT with a FourSectionDictionary with DictionarySectionPlainFrontCoding and SPO order.
     /// Literal escapes are decoded, so the dictionary holds term values, not N-Triples syntax.
     /// All triples including nul chars (U+0000), whether written `\u0000`, `\U00000000` or as a raw byte, are dropped as the dictionary cannot store them.
+    /// To build one HDT from several inputs, use [`HdtBuilder`].
     /// *This function is available only if HDT is built with the experimental `"nt"` feature.*
     /// # Example
     /// ```
@@ -31,10 +36,10 @@ impl Hdt {
     /// ```
     pub fn read_nt(f: impl AsRef<Path>) -> Result<Self> {
         let f = f.as_ref();
-        let base = Id::Named(format!("file://{}", f.canonicalize()?.display()));
-        let original_size = std::fs::File::open(f)?.metadata()?.len();
-        let pool = parse_nt_terms(f)?;
-        Self::from_parsed_terms(pool, &base, Some(original_size))
+        let base = format!("file://{}", f.canonicalize()?.display());
+        let mut builder = HdtBuilder::new();
+        builder.load_nt_file(f)?;
+        builder.finish(&base)
     }
 
     /// Builds an HDT with a FourSectionDictionary with DictionarySectionPlainFrontCoding and SPO order
@@ -52,7 +57,9 @@ impl Hdt {
     /// assert_eq!(hdt.triples_with_pattern(None, None, Some("http://ex.org/o")).count(), 1);
     /// ```
     pub fn from_triples<S: AsRef<str>>(triples: impl IntoIterator<Item = [S; 3]>, base_iri: &str) -> Result<Self> {
-        Self::from_parsed_terms(intern_terms(triples), &Id::Named(base_iri.to_owned()), None)
+        let mut builder = HdtBuilder::new();
+        builder.load_str_triples(triples)?;
+        builder.finish(base_iri)
     }
 
     fn from_parsed_terms(pool: ParsedTerms, base: &Id, original_size: Option<u64>) -> Result<Self> {
@@ -140,7 +147,207 @@ impl Hdt {
     }
 }
 
-/// Output of [`parse_nt_terms`] (file path) and [`intern_terms`] (in-memory).
+/// Builds an HDT from RDF loaded in any number of calls (N-Triples files, N-Triples
+/// streams, parsed triples, or a mix), then assembles it once in [`finish`](Self::finish).
+///
+/// Terms are stored as [`Hdt::read_nt`] stores them: literal escapes decoded, and
+/// triples containing NUL characters dropped. Each load interns its terms and keeps
+/// its triples as three `u32` term indices, so memory grows with the loaded data
+/// just as with `read_nt`; duplicate triples are removed in `finish`. A load either
+/// keeps all of its triples or, on error, none of them, and the builder stays usable.
+/// *This type is available only if HDT is built with the experimental `"nt"` feature.*
+/// # Example
+/// ```
+/// use hdt::oxrdf::{NamedNode, Triple};
+///
+/// let mut builder = hdt::HdtBuilder::new();
+/// builder.load_nt_file("tests/resources/empty.nt")?;
+/// let ex = |name: &str| NamedNode::new_unchecked(format!("http://example.org/{name}"));
+/// builder.load_triples(&[Triple::new(ex("s"), ex("p"), ex("o"))])?;
+/// let hdt = builder.finish("http://example.org/dataset")?;
+/// assert_eq!(hdt.triples_all().count(), 1);
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub struct HdtBuilder {
+    interner: Interner,
+    /// Term indices into `interner`, in load order, duplicates included.
+    triples: Vec<[u32; 3]>,
+    /// Input bytes for the header's original size; `None` until something counts.
+    original_size: Option<u64>,
+}
+
+impl Default for HdtBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HdtBuilder {
+    pub fn new() -> Self {
+        Self { interner: Interner::new(), triples: Vec::new(), original_size: None }
+    }
+
+    /// Load an N-Triples file, parsed in parallel. Its size counts toward the
+    /// header's original size.
+    pub fn load_nt_file(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        let (triples, size) = self.parse_nt_file(path).map_err(|e| with_path(&e, path))?;
+        self.commit(triples, size);
+        Ok(())
+    }
+
+    fn parse_nt_file(&self, path: &Path) -> Result<(Vec<[u32; 3]>, u64)> {
+        let size = std::fs::metadata(path)?.len();
+        let readers = NTriplesParser::new().split_file_for_parallel_parsing(path, num_parsers())?;
+        let interner = &self.interner;
+        let triples = readers
+            .into_par_iter()
+            .flat_map_iter(|reader| {
+                let mut bufs = TermBufs::default();
+                reader.filter_map(move |triple| match triple {
+                    Ok(triple) => intern_triple(interner, triple.as_ref(), &mut bufs).map(Ok),
+                    Err(e) => Some(Err(parse_error(e))),
+                })
+            })
+            .collect::<Result<Vec<[u32; 3]>>>()?;
+        Ok((triples, size))
+    }
+
+    /// Load N-Triples from a stream such as a decompressor or a pipe. The stream is
+    /// read in blocks of whole lines and each block is parsed in parallel, so the
+    /// buffered input stays bounded however long the stream is. The bytes read
+    /// count toward the header's original size.
+    pub fn load_nt_reader(&mut self, reader: impl Read) -> Result<()> {
+        self.load_nt_blocks(reader, NT_READER_BLOCK)
+    }
+
+    fn load_nt_blocks(&mut self, mut reader: impl Read, block_size: usize) -> Result<()> {
+        let parsers = num_parsers();
+        let interner = &self.interner;
+        let mut triples: Vec<[u32; 3]> = Vec::new();
+        let mut buf: Vec<u8> = Vec::with_capacity(block_size);
+        let mut bytes = 0;
+        loop {
+            // Read a whole block on top of the carried-over partial line, so a
+            // line longer than a block still makes progress.
+            let read = reader.by_ref().take(block_size as u64).read_to_end(&mut buf)?;
+            bytes += read as u64;
+            let eof = read < block_size;
+            // Parse whole lines only and carry the partial last line into the
+            // next block. N-Triples statements never span lines.
+            let cut = if eof { buf.len() } else { buf.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1) };
+            if cut > 0 {
+                let mut block = NTriplesParser::new()
+                    .split_slice_for_parallel_parsing(&buf[..cut], parsers)
+                    .into_par_iter()
+                    .flat_map_iter(|parser| {
+                        let mut bufs = TermBufs::default();
+                        parser.filter_map(move |triple| match triple {
+                            Ok(triple) => intern_triple(interner, triple.as_ref(), &mut bufs).map(Ok),
+                            Err(e) => Some(Err(parse_error(e))),
+                        })
+                    })
+                    .collect::<Result<Vec<[u32; 3]>>>()?;
+                triples.append(&mut block);
+                buf.drain(..cut);
+            }
+            if eof {
+                break;
+            }
+        }
+        self.commit(triples, bytes);
+        Ok(())
+    }
+
+    /// Load already-parsed triples, e.g. from a Turtle or RDF/XML parser, interning
+    /// them in parallel. Use [`add_original_size`](Self::add_original_size) to
+    /// record the size of their source.
+    pub fn load_triples(&mut self, triples: &[Triple]) -> Result<()> {
+        let interner = &self.interner;
+        self.triples.par_extend(
+            triples
+                .par_iter()
+                .map_init(TermBufs::default, |bufs, triple| intern_triple(interner, triple.as_ref(), bufs))
+                .flatten(),
+        );
+        Ok(())
+    }
+
+    /// Load triples whose terms are already in the HDT dictionary format described
+    /// in [`Hdt::from_triples`], such as those returned by [`Hdt::triples_all`].
+    pub fn load_str_triples<S: AsRef<str>>(&mut self, triples: impl IntoIterator<Item = [S; 3]>) -> Result<()> {
+        let interner = &self.interner;
+        self.triples.extend(
+            triples
+                .into_iter()
+                .filter(|[s, p, o]| is_valid_triple(s.as_ref(), p.as_ref(), o.as_ref()))
+                .map(|t| t.map(|term| interner.get_or_intern(term.as_ref()))),
+        );
+        Ok(())
+    }
+
+    /// Add `bytes` to the original input size recorded in the HDT header.
+    /// [`load_nt_file`](Self::load_nt_file) and [`load_nt_reader`](Self::load_nt_reader)
+    /// count their input themselves.
+    pub fn add_original_size(&mut self, bytes: u64) {
+        self.original_size = Some(self.original_size.unwrap_or(0) + bytes);
+    }
+
+    /// Number of triples loaded so far, counting duplicates.
+    pub const fn len(&self) -> usize {
+        self.triples.len()
+    }
+
+    /// Build the HDT: dictionary, triples and header, with `base_iri` naming the
+    /// dataset in the header. Duplicate triples are removed here, and this is where
+    /// memory use peaks.
+    pub fn finish(self, base_iri: &str) -> Result<Hdt> {
+        let Self { interner, triples, original_size } = self;
+        Hdt::from_parsed_terms(ParsedTerms::new(interner, triples), &Id::Named(base_iri.to_owned()), original_size)
+    }
+
+    /// Append the triples of a successful load and count its input bytes.
+    fn commit(&mut self, mut triples: Vec<[u32; 3]>, bytes: u64) {
+        if self.triples.is_empty() {
+            self.triples = triples;
+        } else {
+            self.triples.append(&mut triples);
+        }
+        self.add_original_size(bytes);
+    }
+}
+
+/// N-Triples parser threads: two when the available parallelism cannot be
+/// determined, as a single thread is around 38% slower; 16 as a sane upper limit.
+fn num_parsers() -> usize {
+    std::cmp::min(16, thread::available_parallelism().map_or(2, std::num::NonZero::get))
+}
+
+/// Per-thread buffers for rendering a triple's subject and object, reused so
+/// that rendering a term does not allocate.
+type TermBufs = [String; 2];
+
+/// Intern `triple` in HDT dictionary form, or drop it (`None`) if a term holds
+/// a NUL character, which the dictionary cannot store.
+fn intern_triple(interner: &Interner, triple: TripleRef<'_>, bufs: &mut TermBufs) -> Option<[u32; 3]> {
+    let [s, o] = bufs;
+    write_dict_term(s, triple.subject.into());
+    write_dict_term(o, triple.object);
+    let p = triple.predicate.as_str();
+    is_valid_triple(s, p, o)
+        .then(|| [interner.get_or_intern(s), interner.get_or_intern(p), interner.get_or_intern(o)])
+}
+
+fn parse_error(error: impl Display) -> Error {
+    Error::new(InvalidData, format!("Error reading N-Triples: {error}"))
+}
+
+/// Prefix an error from loading `path` with the path.
+fn with_path(error: &Error, path: &Path) -> Error {
+    Error::new(error.kind(), format!("{}: {error}", path.display()))
+}
+
+/// Interned input handed from [`HdtBuilder::finish`] to [`Hdt::from_parsed_terms`].
 /// All term strings live inside the `Interner`; the triples hold `u32` term
 /// indices (4 bytes each) instead of full strings, and the three bitsets track
 /// which indices appear as subject / predicate / object.
@@ -183,19 +390,6 @@ fn is_valid_triple(s: &str, p: &str, o: &str) -> bool {
         return false;
     }
     true
-}
-
-/// Intern in-memory string triples into a [`ParsedTerms`]. Single-threaded — the
-/// input is one sequential iterator, so there is no parser-level parallelism to
-/// exploit here (dictionary compression below still runs on four threads).
-fn intern_terms<S: AsRef<str>>(triples: impl IntoIterator<Item = [S; 3]>) -> ParsedTerms {
-    let interner = Interner::new();
-    let triples: Vec<[u32; 3]> = triples
-        .into_iter()
-        .filter(|t| is_valid_triple(t[0].as_ref(), t[1].as_ref(), t[2].as_ref()))
-        .map(|t| t.map(|term| interner.get_or_intern(term.as_ref())))
-        .collect();
-    ParsedTerms::new(interner, triples)
 }
 
 /// Convert a parsed/interned term pool to a dictionary and encoded triple IDs.
@@ -252,8 +446,8 @@ fn dict_triples(pool: ParsedTerms, block_size: usize) -> Result<(FourSectDict, V
     Ok((dict, encoded_triples))
 }
 
-/// Render a parsed term in HDT dictionary form: an IRI unbracketed, a blank
-/// node as `_:id`, a literal quoted with its language tag or datatype.
+/// Render a parsed term into `buf` in HDT dictionary form: an IRI unbracketed,
+/// a blank node as `_:id`, a literal quoted with its language tag or datatype.
 ///
 /// A literal's body is its *decoded* value. N-Triples escapes are syntax,
 /// not part of the value: `"tab\there"` in a file denotes a string holding
@@ -266,57 +460,39 @@ fn dict_triples(pool: ParsedTerms, block_size: usize) -> Result<(FourSectDict, V
 /// de facto convention: hdt-cpp (through serd) and hdt-java (through Jena)
 /// both store them and escape only on serialization, as do
 /// [`Hdt::from_triples`] and the Sophia adapter in this crate.
-fn dict_string(term: &Term) -> String {
+fn write_dict_term(buf: &mut String, term: TermRef<'_>) {
+    buf.clear();
     match term {
-        Term::NamedNode(n) => n.as_str().to_owned(),
-        Term::BlankNode(b) => format!("_:{}", b.as_str()),
-        Term::Literal(l) => {
-            let value = l.value();
+        TermRef::NamedNode(n) => buf.push_str(n.as_str()),
+        TermRef::BlankNode(b) => {
+            buf.push_str("_:");
+            buf.push_str(b.as_str());
+        }
+        TermRef::Literal(l) => {
+            buf.push('"');
+            buf.push_str(l.value());
+            buf.push('"');
             match l.language() {
-                Some(language) => format!("\"{value}\"@{language}"),
+                Some(language) => {
+                    buf.push('@');
+                    buf.push_str(language);
+                }
                 // A simple literal is an xsd:string literal; both spell the
                 // same term and the bare form is canonical, which is what
                 // this path has always written.
-                None if l.datatype() == xsd::STRING => format!("\"{value}\""),
-                None => format!("\"{value}\"^^<{}>", l.datatype().as_str()),
+                None if l.datatype() == xsd::STRING => {}
+                None => {
+                    buf.push_str("^^<");
+                    buf.push_str(l.datatype().as_str());
+                    buf.push('>');
+                }
             }
         }
         // RDF-star quoted triples: oxrdf only builds these with its rdf-12
         // feature, which is not enabled here.
         #[allow(unreachable_patterns)]
-        other => other.to_string(),
+        other => write!(buf, "{other}").expect("formatting into a String cannot fail"),
     }
-}
-
-/// Parse N-Triples in parallel and collect terms into the interning pool + role bitsets.
-fn parse_nt_terms(path: &Path) -> Result<ParsedTerms> {
-    let interner: Arc<Interner> = Arc::new(Interner::new());
-    // use two threads when available parallelism cannot be determined as going to a single thread is around 38% slower
-    // 16 chosen as a sane upper limit
-    let num_parsers = std::cmp::min(16, thread::available_parallelism().map_or(2, std::num::NonZero::get));
-    // Store triple indices instead of strings
-    let readers = NTriplesParser::new().split_file_for_parallel_parsing(path, num_parsers)?;
-    let triples: Vec<[u32; 3]> = readers
-        .into_par_iter()
-        .flat_map_iter(|reader| {
-            reader.filter_map(|q| {
-                let q = match q.map_err(|e| Error::new(InvalidData, format!("Error reading N-Triples: {e}"))) {
-                    Ok(q) => q,
-                    Err(e) => return Some(Err(e)),
-                };
-                let [ss, ps, os] =
-                    [&dict_string(&q.subject.into()), q.predicate.as_str(), &dict_string(&q.object)];
-                if !is_valid_triple(ss, ps, os) {
-                    return None;
-                }
-                let triple = [interner.get_or_intern(ss), interner.get_or_intern(ps), interner.get_or_intern(os)];
-                Some(Ok(triple))
-            })
-        })
-        .collect::<Result<Vec<[u32; 3]>>>()?;
-
-    let interner = Arc::try_unwrap(interner).expect("interner Arc still has outstanding references");
-    Ok(ParsedTerms::new(interner, triples))
 }
 
 /// Enumerate the set-bit positions (term indices) of a bitset. Uses
@@ -458,14 +634,14 @@ fn build_dict_and_id_maps(
 pub mod tests {
     use super::super::StringTriple;
     use super::super::tests::snikmeta_check;
-    use super::Hdt;
+    use super::{Hdt, HdtBuilder};
     use crate::hdt::tests::snikmeta;
     use crate::tests::init;
     use color_eyre::Result;
     use fs_err::File;
     use pretty_assertions::assert_eq;
     use std::io::{Cursor, Write};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
     /// Regression test for #131. Escapes are N-Triples syntax, not part of a term's value,
@@ -565,6 +741,154 @@ pub mod tests {
         let mut buf = Vec::<u8>::new();
         hdt_empty.write(&mut buf)?;
         Hdt::read(Cursor::new(buf))?;
+        Ok(())
+    }
+
+    /// A scratch directory under the system temp dir, removed on drop.
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new(name: &str) -> Result<Self> {
+            let dir = std::env::temp_dir().join(format!("hdt-nt-{name}-{}", std::process::id()));
+            fs_err::create_dir_all(&dir)?;
+            Ok(Self(dir))
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// snikmeta as N-Triples: all of it in `whole`, and split at a line
+    /// boundary near the middle into `a` and `b`.
+    struct SnikmetaNt {
+        bytes: Vec<u8>,
+        whole: PathBuf,
+        a: PathBuf,
+        b: PathBuf,
+        /// The base IRI `read_nt` derives for `whole`.
+        base: String,
+    }
+
+    fn snikmeta_nt(dir: &Path) -> Result<SnikmetaNt> {
+        let mut bytes = Vec::new();
+        snikmeta()?.write_nt(&mut bytes)?;
+        let mid = bytes[..bytes.len() / 2].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        let [whole, a, b] = ["whole.nt", "a.nt", "b.nt"].map(|name| dir.join(name));
+        fs_err::write(&whole, &bytes)?;
+        fs_err::write(&a, &bytes[..mid])?;
+        fs_err::write(&b, &bytes[mid..])?;
+        let base = format!("file://{}", whole.canonicalize()?.display());
+        Ok(SnikmetaNt { bytes, whole, a, b, base })
+    }
+
+    fn hdt_bytes(hdt: &Hdt) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        hdt.write(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Loading snikmeta in pieces, through each kind of load, writes the same
+    /// bytes as `read_nt` on the whole file: ids follow sorted strings, not load
+    /// order, and the header has no timestamp.
+    #[test]
+    fn builder_matches_read_nt() -> Result<()> {
+        init();
+        let dir = ScratchDir::new("builder-matches")?;
+        let nt = snikmeta_nt(&dir.0)?;
+        let expected = hdt_bytes(&Hdt::read_nt(&nt.whole)?)?;
+
+        let mut files = HdtBuilder::new();
+        files.load_nt_file(&nt.a)?;
+        files.load_nt_file(&nt.b)?;
+        assert!(hdt_bytes(&files.finish(&nt.base)?)? == expected, "two N-Triples files");
+
+        let parsed: Vec<oxrdf::Triple> =
+            oxttl::NTriplesParser::new().for_slice(&nt.bytes).collect::<std::result::Result<_, _>>()?;
+        let mut chunks = HdtBuilder::new();
+        for chunk in parsed.chunks(parsed.len() / 3 + 1) {
+            chunks.load_triples(chunk)?;
+        }
+        chunks.add_original_size(nt.bytes.len() as u64);
+        assert!(hdt_bytes(&chunks.finish(&nt.base)?)? == expected, "parsed triples in chunks");
+
+        // 100-byte blocks force many cuts, and lines longer than a block.
+        let mut stream = HdtBuilder::new();
+        stream.load_nt_blocks(nt.bytes.as_slice(), 100)?;
+        assert!(hdt_bytes(&stream.finish(&nt.base)?)? == expected, "N-Triples stream");
+        Ok(())
+    }
+
+    /// Every way of loading the escapes fixture stores the same decoded values
+    /// and drops the same NUL-containing triples as `read_nt`.
+    #[test]
+    fn builder_matches_read_nt_escapes() -> Result<()> {
+        init();
+        let path = "tests/resources/escapes.nt";
+        let want: Vec<StringTriple> = Hdt::read_nt(path)?.triples_all().collect();
+        let bytes = fs_err::read(path)?;
+
+        let mut stream = HdtBuilder::new();
+        stream.load_nt_blocks(bytes.as_slice(), 16)?;
+        assert_eq!(stream.finish("urn:x:escapes")?.triples_all().collect::<Vec<_>>(), want, "N-Triples stream");
+
+        let parsed: Vec<oxrdf::Triple> =
+            oxttl::NTriplesParser::new().for_slice(&bytes).collect::<std::result::Result<_, _>>()?;
+        let mut triples = HdtBuilder::new();
+        triples.load_triples(&parsed)?;
+        assert_eq!(triples.finish("urn:x:escapes")?.triples_all().collect::<Vec<_>>(), want, "parsed triples");
+        Ok(())
+    }
+
+    #[test]
+    fn builder_removes_duplicate_triples() -> Result<()> {
+        init();
+        let dir = ScratchDir::new("builder-duplicates")?;
+        let nt = snikmeta_nt(&dir.0)?;
+        let once = Hdt::read_nt(&nt.whole)?;
+        let mut twice = HdtBuilder::new();
+        twice.load_nt_file(&nt.whole)?;
+        twice.load_nt_file(&nt.whole)?;
+        assert_eq!(twice.len(), 2 * once.triples_all().count());
+        let twice = twice.finish(&nt.base)?;
+        assert_eq!(twice.triples_all().collect::<Vec<_>>(), once.triples_all().collect::<Vec<_>>());
+        Ok(())
+    }
+
+    /// A failed load keeps none of its triples, even though it interned some
+    /// terms before reaching the bad line: the HDT matches one built without it.
+    #[test]
+    fn builder_failed_load_keeps_nothing() -> Result<()> {
+        init();
+        let dir = ScratchDir::new("builder-failed")?;
+        let nt = snikmeta_nt(&dir.0)?;
+        let mut bad_bytes = fs_err::read(&nt.b)?;
+        bad_bytes.extend_from_slice(b"this is not N-Triples\n");
+        let bad = dir.0.join("bad.nt");
+        fs_err::write(&bad, &bad_bytes)?;
+
+        let mut builder = HdtBuilder::new();
+        builder.load_nt_file(&nt.a)?;
+        let err = builder.load_nt_file(&bad).expect_err("malformed N-Triples file must fail");
+        assert!(err.to_string().contains("bad.nt"), "error should name the file: {err}");
+        assert!(builder.load_nt_reader(bad_bytes.as_slice()).is_err(), "malformed N-Triples stream must fail");
+
+        let mut good = HdtBuilder::new();
+        good.load_nt_file(&nt.a)?;
+        assert!(hdt_bytes(&builder.finish(&nt.base)?)? == hdt_bytes(&good.finish(&nt.base)?)?);
+        Ok(())
+    }
+
+    #[test]
+    fn builder_empty() -> Result<()> {
+        init();
+        let mut builder = HdtBuilder::new();
+        builder.load_triples(&[])?;
+        assert_eq!(builder.len(), 0);
+        let hdt = Hdt::read(Cursor::new(hdt_bytes(&builder.finish("http://example.org/empty")?)?))?;
+        assert_eq!(hdt.triples_all().count(), 0);
         Ok(())
     }
 }

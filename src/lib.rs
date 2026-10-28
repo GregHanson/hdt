@@ -97,6 +97,9 @@ pub mod dict_sect_pfc;
 pub mod four_sect_dict;
 /// Types for representing triple sections.
 pub mod hdt;
+#[cfg(feature = "nt")]
+/// The oxrdf whose types [`HdtBuilder::load_triples`] takes.
+pub use oxrdf;
 #[cfg(feature = "sophia")]
 pub use sophia;
 #[cfg(feature = "sophia")]
@@ -114,6 +117,8 @@ pub mod vocab;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
 
+#[cfg(feature = "nt")]
+pub use crate::hdt::HdtBuilder;
 #[cfg(feature = "cache")]
 pub use crate::hdt::HdtHybrid;
 pub use crate::hdt::{Cardinality, Hdt, HdtGeneric};
